@@ -3799,7 +3799,28 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         const sourceKind = nodeById.get(e.sourceId)?.data.kind;
         const targetKind = nodeById.get(e.targetId)?.data.kind;
         return (
-          <div className="pointer-events-auto absolute bottom-4 left-1/2 z-20 max-w-[92vw] -translate-x-1/2 rounded-lg border border-border bg-popover/95 px-3 py-2 font-mono text-xs text-popover-foreground shadow-lg backdrop-blur">
+          <div
+            className="pointer-events-auto absolute bottom-4 left-1/2 z-20 max-w-[92vw] -translate-x-1/2 rounded-lg border border-border bg-popover/95 px-3 py-2 font-mono text-xs text-popover-foreground shadow-lg backdrop-blur"
+            // Swallow mouse moves so the canvas's hover hit-tests don't
+            // fire while the cursor is on the focused-edge tooltip.
+            // Click is swallowed too so the canvas's onClick doesn't
+            // treat the X button click as "click on empty space" and
+            // double-clear the focus state.
+            onMouseMove={(ev) => ev.stopPropagation()}
+            onClick={(ev) => ev.stopPropagation()}
+            onMouseEnter={() => {
+              hoveredFieldRef.current = null;
+              hoveredNodeRef.current = null;
+              if (hoveredEdgeRef.current !== null) {
+                hoveredEdgeRef.current = null;
+                setHoveredEdgeInfo(null);
+              }
+              if (hoveredNodeForTipRef.current !== null) {
+                hoveredNodeForTipRef.current = null;
+                setHoveredNodeTip(null);
+              }
+            }}
+          >
             <div className="flex flex-wrap items-center gap-2">
               {sourceKind && (
                 <span
