@@ -182,6 +182,42 @@ export function TreePanel() {
     [graph.nodes],
   );
 
+  // Types that implement the currently-selected interface. Empty when
+  // the current type is not an Interface so the implementers section
+  // doesn't render.
+  const implementers = useMemo(() => {
+    if (!current || current.kind !== "Interface") return [];
+    return graph.nodes
+      .filter((n) => n.interfaces?.includes(current.id))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }, [current, graph.nodes]);
+
+  // Reverse map: which unions contain each type as a member. Used to
+  // annotate union-member rows with the other unions they participate
+  // in.
+  const unionsByMember = useMemo(() => {
+    const m = new Map<string, string[]>();
+    for (const n of graph.nodes) {
+      if (n.kind !== "Union" || !n.members) continue;
+      for (const member of n.members) {
+        const list = m.get(member);
+        if (list) list.push(n.id);
+        else m.set(member, [n.id]);
+      }
+    }
+    return m;
+  }, [graph.nodes]);
+
+  // Members of the currently-selected union, resolved to their full
+  // node data so we can render kind badges and other-union chips.
+  const unionMembers = useMemo(() => {
+    if (!current || current.kind !== "Union") return [];
+    return (current.members ?? [])
+      .map((m) => nodesById.get(m))
+      .filter((n): n is GraphNodeData => !!n)
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }, [current, nodesById]);
+
   interface SearchResult {
     typeId: string;
     typeName: string;
@@ -625,9 +661,126 @@ export function TreePanel() {
         </div>
       )}
 
-      {path.length > 0 && (
-        <div className="border-b border-border px-3 py-2">
-          <Breadcrumbs path={path} onJump={(i) => popTo(i - 1)} />
+      {implementers.length > 0 && (
+        <div className="border-b border-border">
+          <div className="flex w-full items-center gap-1 px-3 py-2 text-[10px] uppercase tracking-wider text-muted-foreground">
+            <span>Implemented by ({implementers.length})</span>
+          </div>
+          <ul className="max-h-48 overflow-auto border-t border-border">
+            {implementers.map((n) => {
+              const selected = n.id === currentId;
+              const style = KIND_STYLES[n.kind];
+              // Show the *other* interfaces this implementer also
+              // implements so the user can see when one type
+              // implements multiple interfaces at a glance. The
+              // current interface is implicit from the section header.
+              const otherIfaces = (n.interfaces ?? []).filter((i) => i !== current?.id);
+              return (
+                <li key={n.id}>
+                  <button
+                    type="button"
+                    onClick={() => jumpTo(n.id)}
+                    className={cn(
+                      "flex w-full items-center gap-2 px-3 py-1 text-left font-mono text-xs transition-colors",
+                      selected
+                        ? "bg-primary text-primary-foreground"
+                        : "text-foreground hover:bg-secondary/60",
+                    )}
+                  >
+                    <Badge
+                      className={cn(
+                        "shrink-0 px-1.5 py-0 text-[9px] leading-4",
+                        selected
+                          ? "bg-primary-foreground/20 text-primary-foreground"
+                          : style.badge,
+                      )}
+                    >
+                      {style.label}
+                    </Badge>
+                    <span className="truncate">{n.name}</span>
+                    {otherIfaces.length > 0 && (
+                      <span className="ml-auto flex shrink-0 flex-wrap items-center gap-1">
+                        {otherIfaces.map((i) => (
+                          <span
+                            key={i}
+                            className={cn(
+                              "rounded px-1 py-0 text-[9px] leading-4",
+                              selected
+                                ? "bg-primary-foreground/20 text-primary-foreground"
+                                : "bg-secondary text-muted-foreground",
+                            )}
+                          >
+                            {i}
+                          </span>
+                        ))}
+                      </span>
+                    )}
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      )}
+
+      {unionMembers.length > 0 && (
+        <div className="border-b border-border">
+          <div className="flex w-full items-center gap-1 px-3 py-2 text-[10px] uppercase tracking-wider text-muted-foreground">
+            <span>Members ({unionMembers.length})</span>
+          </div>
+          <ul className="max-h-48 overflow-auto border-t border-border">
+            {unionMembers.map((n) => {
+              const selected = n.id === currentId;
+              const style = KIND_STYLES[n.kind];
+              // Show the *other* unions this member also participates
+              // in. The current union is implicit from the section
+              // header.
+              const otherUnions = (unionsByMember.get(n.id) ?? []).filter((u) => u !== current?.id);
+              return (
+                <li key={n.id}>
+                  <button
+                    type="button"
+                    onClick={() => jumpTo(n.id)}
+                    className={cn(
+                      "flex w-full items-center gap-2 px-3 py-1 text-left font-mono text-xs transition-colors",
+                      selected
+                        ? "bg-primary text-primary-foreground"
+                        : "text-foreground hover:bg-secondary/60",
+                    )}
+                  >
+                    <Badge
+                      className={cn(
+                        "shrink-0 px-1.5 py-0 text-[9px] leading-4",
+                        selected
+                          ? "bg-primary-foreground/20 text-primary-foreground"
+                          : style.badge,
+                      )}
+                    >
+                      {style.label}
+                    </Badge>
+                    <span className="truncate">{n.name}</span>
+                    {otherUnions.length > 0 && (
+                      <span className="ml-auto flex shrink-0 flex-wrap items-center gap-1">
+                        {otherUnions.map((u) => (
+                          <span
+                            key={u}
+                            className={cn(
+                              "rounded px-1 py-0 text-[9px] leading-4",
+                              selected
+                                ? "bg-primary-foreground/20 text-primary-foreground"
+                                : "bg-secondary text-muted-foreground",
+                            )}
+                          >
+                            {u}
+                          </span>
+                        ))}
+                      </span>
+                    )}
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
         </div>
       )}
 
@@ -646,37 +799,6 @@ export function TreePanel() {
         )}
       </div>
       </>}
-    </div>
-  );
-}
-
-function Breadcrumbs({
-  path,
-  onJump,
-}: {
-  path: string[];
-  onJump: (index: number) => void;
-}) {
-  return (
-    <div className="flex flex-wrap items-center gap-1 text-xs">
-      {path.map((name, i) => (
-        <span key={`${i}-${name}`} className="flex items-center gap-1">
-          {i > 0 && (
-            <ChevronRight className="h-3 w-3 text-muted-foreground/60" />
-          )}
-          <button
-            className={cn(
-              "truncate rounded px-1.5 py-0.5 font-mono",
-              i === path.length - 1
-                ? "bg-secondary text-secondary-foreground"
-                : "text-muted-foreground hover:bg-secondary/60 hover:text-foreground",
-            )}
-            onClick={() => onJump(i)}
-          >
-            {name}
-          </button>
-        </span>
-      ))}
     </div>
   );
 }

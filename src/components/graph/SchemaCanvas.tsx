@@ -3551,7 +3551,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
                 if (item.kind === "node") {
                   const style = KIND_STYLES[item.nodeKind];
                   return (
-                    <li key={`${item.id}:${item.ts}`} className="group flex items-center transition-colors hover:bg-secondary/60">
+                    <li key={`${item.id}:${item.ts}`} className="group flex items-center px-2 py-0.5">
                       <button
                         type="button"
                         onClick={() => {
@@ -3566,12 +3566,12 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
                           setHoveredHistoryPos({ x: ev.clientX, y: ev.clientY })
                         }
                         onMouseLeave={() => setHoveredHistoryItem(null)}
-                        className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 px-3 py-1.5 text-left"
+                        className={cn(
+                          "flex min-w-0 flex-1 cursor-pointer items-center gap-2 rounded px-2 py-1 text-left transition-colors hover:brightness-110",
+                          style.header,
+                        )}
                       >
-                        <span
-                          className="rounded px-1 py-0 text-[9px] uppercase tracking-wide text-white"
-                          style={{ backgroundColor: KIND_COLORS[item.nodeKind] }}
-                        >
+                        <span className={cn("rounded px-1 py-0 text-[9px] uppercase tracking-wide", style.badge)}>
                           {style.label}
                         </span>
                         <span className="truncate">{item.name}</span>
@@ -3592,8 +3592,10 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
                 }
                 const sourceKind = nodeById.get(item.sourceId)?.data.kind;
                 const targetKind = nodeById.get(item.targetId)?.data.kind;
+                const sourceStyle = sourceKind ? KIND_STYLES[sourceKind] : null;
+                const targetStyle = targetKind ? KIND_STYLES[targetKind] : null;
                 return (
-                  <li key={`${item.id}:${item.ts}`} className="group flex items-center transition-colors hover:bg-secondary/60">
+                  <li key={`${item.id}:${item.ts}`} className="group flex items-center px-2 py-0.5">
                     <button
                       type="button"
                       onMouseEnter={(ev) => {
@@ -3619,14 +3621,11 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
                         if (live) focusOnEdge(live);
                         else onNavigate?.(item.sourceId);
                       }}
-                      className="flex min-w-0 flex-1 cursor-pointer items-center gap-1 px-3 py-1.5 text-left"
+                      className="flex min-w-0 flex-1 cursor-pointer items-center gap-1 rounded px-2 py-1 text-left transition-colors hover:bg-secondary/60"
                     >
-                      {sourceKind && (
-                        <span
-                          className="rounded px-1 py-0 text-[9px] uppercase tracking-wide text-white"
-                          style={{ backgroundColor: KIND_COLORS[sourceKind] }}
-                        >
-                          {KIND_STYLES[sourceKind].label}
+                      {sourceStyle && (
+                        <span className={cn("rounded px-1 py-0 text-[9px] uppercase tracking-wide", sourceStyle.badge)}>
+                          {sourceStyle.label}
                         </span>
                       )}
                       <span className="min-w-0 flex-1 truncate">
@@ -3652,12 +3651,9 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
                         )}
                       </span>
                       <ArrowRight className="h-3 w-3 shrink-0 text-muted-foreground" />
-                      {targetKind && (
-                        <span
-                          className="rounded px-1 py-0 text-[9px] uppercase tracking-wide text-white"
-                          style={{ backgroundColor: KIND_COLORS[targetKind] }}
-                        >
-                          {KIND_STYLES[targetKind].label}
+                      {targetStyle && (
+                        <span className={cn("rounded px-1 py-0 text-[9px] uppercase tracking-wide", targetStyle.badge)}>
+                          {targetStyle.label}
                         </span>
                       )}
                     </button>
