@@ -218,6 +218,23 @@ export function TreePanel() {
       .sort((a, b) => a.name.localeCompare(b.name));
   }, [current, nodesById]);
 
+  // Types that reference the currently-selected type as a field type
+  // (incoming edges). Each entry also carries the field names that
+  // make the reference so users can see *how* a type is consumed.
+  const referencedBy = useMemo(() => {
+    if (!current) return [];
+    const results: { node: GraphNodeData; fields: string[] }[] = [];
+    for (const n of graph.nodes) {
+      if (!n.fields) continue;
+      const fields: string[] = [];
+      for (const f of n.fields) {
+        if (f.typeName === current.id) fields.push(f.name);
+      }
+      if (fields.length > 0) results.push({ node: n, fields });
+    }
+    return results.sort((a, b) => a.node.name.localeCompare(b.node.name));
+  }, [current, graph.nodes]);
+
   interface SearchResult {
     typeId: string;
     typeName: string;
@@ -776,6 +793,61 @@ export function TreePanel() {
                         ))}
                       </span>
                     )}
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      )}
+
+      {referencedBy.length > 0 && (
+        <div className="border-b border-border">
+          <div className="flex w-full items-center gap-1 px-3 py-2 text-[10px] uppercase tracking-wider text-muted-foreground">
+            <span>Referenced by ({referencedBy.length})</span>
+          </div>
+          <ul className="max-h-48 overflow-auto border-t border-border">
+            {referencedBy.map(({ node: n, fields }) => {
+              const selected = n.id === currentId;
+              const style = KIND_STYLES[n.kind];
+              return (
+                <li key={n.id}>
+                  <button
+                    type="button"
+                    onClick={() => jumpTo(n.id)}
+                    className={cn(
+                      "flex w-full items-center gap-2 px-3 py-1 text-left font-mono text-xs transition-colors",
+                      selected
+                        ? "bg-primary text-primary-foreground"
+                        : "text-foreground hover:bg-secondary/60",
+                    )}
+                  >
+                    <Badge
+                      className={cn(
+                        "shrink-0 px-1.5 py-0 text-[9px] leading-4",
+                        selected
+                          ? "bg-primary-foreground/20 text-primary-foreground"
+                          : style.badge,
+                      )}
+                    >
+                      {style.label}
+                    </Badge>
+                    <span className="truncate">{n.name}</span>
+                    <span className="ml-auto flex shrink-0 flex-wrap items-center gap-1">
+                      {fields.map((f) => (
+                        <span
+                          key={f}
+                          className={cn(
+                            "rounded px-1 py-0 text-[9px] leading-4",
+                            selected
+                              ? "bg-primary-foreground/20 text-primary-foreground"
+                              : "bg-secondary text-muted-foreground",
+                          )}
+                        >
+                          .{f}
+                        </span>
+                      ))}
+                    </span>
                   </button>
                 </li>
               );
