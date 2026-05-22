@@ -247,6 +247,49 @@ function spriteDprForLod(lod: SpriteLOD): number {
   return Math.min(2, Math.max(1, Math.ceil(monitorDpr)));
 }
 
+// Probe WebGL `MAX_TEXTURE_SIZE` once so we can cap per-node textures
+// to whatever the GPU/browser actually accepts. Firefox in particular
+// will silently drop the upload (rendering nothing) when a sprite
+// texture exceeds this — a 250-value enum at full LOD reaches
+// ~7000 px tall at DPR=2, which clears Chrome's typical 16384 ceiling
+// but blows past Firefox's commonly-reported 8192 on integrated GPUs.
+// Subtract a small margin so we stay well under whatever Pixi's own
+// pre-upload allocation also reserves.
+let _maxTexDimCache: number | null = null;
+function getMaxTextureDim(): number {
+  if (_maxTexDimCache != null) return _maxTexDimCache;
+  if (typeof document === "undefined") return 4096;
+  try {
+    const c = document.createElement("canvas");
+    const gl =
+      (c.getContext("webgl2") as WebGL2RenderingContext | null) ??
+      (c.getContext("webgl") as WebGLRenderingContext | null);
+    if (gl) {
+      const max = gl.getParameter(gl.MAX_TEXTURE_SIZE) as number;
+      if (typeof max === "number" && max > 0) {
+        _maxTexDimCache = Math.max(2048, Math.floor(max * 0.95));
+        return _maxTexDimCache;
+      }
+    }
+  } catch {
+    // ignore — fall through to fallback
+  }
+  _maxTexDimCache = 4096;
+  return _maxTexDimCache;
+}
+
+// Returns a DPR ≤ baseDpr such that w*dpr and h*dpr both fit under the
+// GPU's max texture dimension. The sprite still displays at w×h (Pixi
+// scales the texture to the sprite bounds), so the only visible cost is
+// slightly less crisp text on extremely tall nodes — strictly better
+// than rendering nothing.
+function fitDprToMaxTexture(w: number, h: number, dpr: number): number {
+  const limit = getMaxTextureDim();
+  const worst = Math.max(w, h);
+  if (worst * dpr <= limit) return dpr;
+  return Math.max(0.5, limit / worst);
+}
+
 // LOD-aware live texture cache caps. "bar" is cheap (48 KB/texture at
 // DPR=1) so we let a 1,400-node grid fully populate; "full" costs 4×
 // more per texture so we keep the ceiling tight. When the cap is hit
@@ -2784,14 +2827,15 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
                   // the motion-settle gate and the build queue so the
                   // selection feels immediate.
                   syncBuildCountRef.current++;
-                  const pw = Math.ceil(node.w * effDpr);
-                  const ph = Math.ceil(node.h * effDpr);
+                  const drawDpr = fitDprToMaxTexture(node.w, node.h, effDpr);
+                  const pw = Math.ceil(node.w * drawDpr);
+                  const ph = Math.ceil(node.h * drawDpr);
                   const can = document.createElement("canvas");
                   can.width = pw;
                   can.height = ph;
                   const c2d = can.getContext("2d");
                   if (c2d) {
-                    c2d.setTransform(effDpr, 0, 0, effDpr, 0, 0);
+                    c2d.setTransform(drawDpr, 0, 0, drawDpr, 0, 0);
                     drawNodeSprite(c2d, node, spriteCtx, "full");
                     const tex = Texture.from(can);
                     textureCacheRef.current.set(key, tex);
@@ -2874,14 +2918,15 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
             const key = `${n.id}:${buildQ.lod}`;
             if (textureCacheRef.current.has(key)) continue;
 
-            const pw = Math.ceil(n.w * buildQ.dpr);
-            const ph = Math.ceil(n.h * buildQ.dpr);
+            const drawDpr = fitDprToMaxTexture(n.w, n.h, buildQ.dpr);
+            const pw = Math.ceil(n.w * drawDpr);
+            const ph = Math.ceil(n.h * drawDpr);
             const can = document.createElement("canvas");
             can.width = pw;
             can.height = ph;
             const c2d = can.getContext("2d");
             if (c2d) {
-              c2d.setTransform(buildQ.dpr, 0, 0, buildQ.dpr, 0, 0);
+              c2d.setTransform(drawDpr, 0, 0, drawDpr, 0, 0);
               drawNodeSprite(c2d, n, buildQ.spriteCtx, buildQ.lod);
               const tex = Texture.from(can);
               textureCacheRef.current.set(key, tex);
