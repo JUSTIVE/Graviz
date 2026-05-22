@@ -313,11 +313,40 @@ export function sdlToGraph(sdl: string, options: SdlToGraphOptions = {}): Parsed
             (tn) => !BUILTIN_SCALARS.has(tn) && nodeKindById.get(tn) === "Input",
           );
 
+        // Enum-typed args. Enums are leaf types (no fields to drill into),
+        // so they don't belong in the navigation chain — but they still
+        // need an edge from the source so reachability traversal doesn't
+        // misclassify them as orphans when they're only referenced via
+        // a field's argument list.
+        const enumArgTypeNames = [
+          ...new Set(
+            (field.args ?? [])
+              .map((a) => a.typeName)
+              .filter(
+                (tn) => !BUILTIN_SCALARS.has(tn) && nodeKindById.get(tn) === "Enum",
+              ),
+          ),
+        ];
+
         const returnIsScalar = BUILTIN_SCALARS.has(field.typeName);
 
-        // Skip fields that have neither a non-scalar return type nor any
-        // Input-typed args — there is nothing useful to connect in the graph.
-        if (returnIsScalar && inputArgTypeNames.length === 0) continue;
+        // Skip fields with no graph-relevant target at all (scalar return,
+        // no Input args, no Enum args).
+        if (
+          returnIsScalar &&
+          inputArgTypeNames.length === 0 &&
+          enumArgTypeNames.length === 0
+        )
+          continue;
+
+        for (const tn of enumArgTypeNames) {
+          rawEdges.push({
+            id: `${n.name}.${field.name}:enumArg->${tn}`,
+            source: n.name,
+            target: tn,
+            kind: "arg",
+          });
+        }
 
         if (inputArgTypeNames.length > 0) {
           // Chain: parent → input0 → … → returnType.
@@ -343,7 +372,7 @@ export function sdlToGraph(sdl: string, options: SdlToGraphOptions = {}): Parsed
               nullable: ci === 0 ? field.nullable : false,
             });
           }
-        } else {
+        } else if (!returnIsScalar) {
           rawEdges.push({
             id: `${n.name}.${field.name}->${field.typeName}`,
             source: n.name,
