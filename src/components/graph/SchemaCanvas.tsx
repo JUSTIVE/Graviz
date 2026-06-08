@@ -1585,9 +1585,17 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   // Auto-fit + focus pan (merged into one effect to reduce effect count).
   // Auto-fit runs once per unique (nodeCount, viewport size) to center the
   // whole graph. Focus pan runs on explicit type selection in the tree.
+  //
+  // useLayoutEffect (not useEffect): `laidNodesRef` is updated during render,
+  // so the Pixi ticker (an rAF loop) can paint a frame using the freshly-laid
+  // nodes before a *passive* effect would run. With useEffect the first such
+  // frame renders at the initial view (k=1) and the initial LOD ("full") —
+  // a flash of giant full-detail cards at the origin before the fit lands.
+  // A layout effect runs synchronously after commit, before paint and before
+  // the next rAF, so viewRef + currentLodRef are correct on the first frame.
   const fittedKey = useRef("");
   const FOCUS_MIN_ZOOM = 0.9;
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (laidNodes.length === 0 || size.w <= 1) return;
     // Auto-fit: only fires when the key changes (new layout or resize)
     const key = `${laidNodes.length}:${Math.round(size.w)}:${Math.round(size.h)}`;
@@ -1600,6 +1608,30 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       const cx = (bounds.minX + bounds.maxX) / 2;
       const cy = (bounds.minY + bounds.maxY) / 2;
       viewRef.current = { x: size.w / 2 - cx * k, y: size.h / 2 - cy * k, k };
+      // Seed the LOD to match the fitted zoom *now*, before the first
+      // sprite build. `currentLodRef` starts at "full", so without this
+      // the freshly-laid nodes get built once at full detail and only
+      // get corrected a frame later when the ticker notices the fit.
+      // Use clean boundaries (no hysteresis bias) — this is the initial
+      // framing, not a transition between adjacent LODs.
+      const fitLod: SpriteLOD =
+        k >= LOD_FULL ? "full" : k >= LOD_BAR ? "bar" : "chrome";
+      if (fitLod !== currentLodRef.current) {
+        currentLodRef.current = fitLod;
+        setLodTick((t) => t + 1);
+      }
+      // Arm the focus-jump bypass for the initial framing, exactly as
+      // the focus-pan branch below does. The view settles to the fit on
+      // frame 1 and never moves again, so without this the sprite sweep
+      // runs only once: it discovers the in-view nodes, queues them for
+      // *creation*, and returns. The sprites materialize on frame 2 — but
+      // nothing re-enters the sweep to queue their full-LOD textures, so
+      // at "full" LOD they sit on the kind placeholder forever (empty
+      // card bodies). Keeping the flag set drains the create→build
+      // handoff and bypasses the motion-settle gate so text appears at
+      // once. (Masked at bar/chrome LOD, where the placeholder *is* the
+      // intended render — which is why this only bit small schemas.)
+      focusJumpPendingRef.current = true;
     }
     // Focus pan: centers + zooms to the focused type
     if (focusId && focusId !== rootId) {
