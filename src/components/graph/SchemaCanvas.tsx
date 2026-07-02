@@ -2931,12 +2931,42 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
               ? new Set(queue.nodes.map((n) => n.id))
               : new Set<string>();
 
-            // Iterate laidNodes (not sparse sprite map) so in-view
-            // nodes without a sprite get one lazily and off-view ones
-            // go away. Upfront Sprite allocation for all 1,400 nodes
-            // stalled the Pixi renderer hard enough to crash the tab.
+            // Gather in-view candidates via the node tile index so a
+            // pan/zoom frame only examines nodes whose tiles intersect
+            // the viewport instead of every laid node. When the
+            // viewport spans more cells than the index holds (fully
+            // zoomed out) a full scan is cheaper — fall back to it.
+            // Sprites are still created lazily per sweep; upfront
+            // allocation for all 1,400 nodes stalled the Pixi renderer
+            // hard enough to crash the tab.
+            const nodeIndex = nodeTileIndexRef.current;
+            const tminC = Math.floor(vpMinX / TILE_SIZE);
+            const tmaxC = Math.floor(vpMaxX / TILE_SIZE);
+            const tminR = Math.floor(vpMinY / TILE_SIZE);
+            const tmaxR = Math.floor(vpMaxY / TILE_SIZE);
+            const cellCount = (tmaxC - tminC + 1) * (tmaxR - tminR + 1);
+            let candidates: LaidNode[];
+            if (cellCount < nodeIndex.size) {
+              candidates = [];
+              const seenIds = new Set<string>();
+              for (let c = tminC; c <= tmaxC; c++) {
+                for (let r = tminR; r <= tmaxR; r++) {
+                  const bucket = nodeIndex.get(`${c},${r}`);
+                  if (!bucket) continue;
+                  for (const node of bucket) {
+                    if (!seenIds.has(node.id)) {
+                      seenIds.add(node.id);
+                      candidates.push(node);
+                    }
+                  }
+                }
+              }
+            } else {
+              candidates = laidNodesLive;
+            }
+
             const idsToEvict = new Set<string>();
-            for (const node of laidNodesLive) {
+            for (const node of candidates) {
               const inView = !(
                 node.cx + node.w / 2 < vpMinX ||
                 node.cx - node.w / 2 > vpMaxX ||
@@ -2944,7 +2974,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
                 node.cy - node.h / 2 > vpMaxY
               );
               const id = node.id;
-              let sprite = nodeSpritesRef.current.get(id);
+              const sprite = nodeSpritesRef.current.get(id);
 
               if (inView) {
                 if (!sprite) {
@@ -3046,15 +3076,22 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
                   spriteBuildQueueRef.current.nodes.push(node);
                   queuedIds.add(id);
                 }
-              } else if (sprite) {
-                const last = spriteLastSeenFrameRef.current.get(id) ?? 0;
-                if (frameCounterRef.current - last > SPRITE_EVICT_FRAMES) {
-                  idsToEvict.add(id);
-                  nodeContainer.removeChild(sprite);
-                  sprite.destroy();
-                  nodeSpritesRef.current.delete(id);
-                  spriteLastSeenFrameRef.current.delete(id);
-                }
+              }
+            }
+
+            // Eviction pass over the sprite map. It can't live in the
+            // candidate loop above — a sprite whose tile left the
+            // viewport never appears in `candidates`. Sprites visited
+            // in-view this frame have lastSeen == current frame.
+            for (const [id, sprite] of nodeSpritesRef.current) {
+              const last = spriteLastSeenFrameRef.current.get(id) ?? 0;
+              if (last === frameCounterRef.current) continue;
+              if (frameCounterRef.current - last > SPRITE_EVICT_FRAMES) {
+                idsToEvict.add(id);
+                nodeContainer.removeChild(sprite);
+                sprite.destroy();
+                nodeSpritesRef.current.delete(id);
+                spriteLastSeenFrameRef.current.delete(id);
               }
             }
 
@@ -3272,6 +3309,10 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   // Keep nodeById accessible in the ticker
   const nodeByIdRef = useRef(nodeById);
   nodeByIdRef.current = nodeById;
+
+  // Keep the node spatial index accessible in the ticker's sweep
+  const nodeTileIndexRef = useRef(nodeTileIndex);
+  nodeTileIndexRef.current = nodeTileIndex;
 
   // Keep `laidNodes` accessible in the ticker without re-adding the
   // ticker callback each render — the ticker is registered once and
