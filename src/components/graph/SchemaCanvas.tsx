@@ -795,6 +795,29 @@ function cubicBezier(
   };
 }
 
+// Flattened-polyline cache for edge hover hit-testing. Keyed weakly by
+// the LaidEdge object so entries are collected when a layout replaces
+// the edge list.
+const edgePolylineCache = new WeakMap<LaidEdge, Float64Array>();
+const EDGE_SAMPLE_STEPS = 10;
+
+function edgePolyline(edge: LaidEdge): Float64Array {
+  let pts = edgePolylineCache.get(edge);
+  if (pts) return pts;
+  const out: number[] = [edge.start.x, edge.start.y];
+  let prev = edge.start;
+  for (const seg of edge.segments) {
+    for (let i = 1; i <= EDGE_SAMPLE_STEPS; i++) {
+      const pt = cubicBezier(prev, seg.c1, seg.c2, seg.end, i / EDGE_SAMPLE_STEPS);
+      out.push(pt.x, pt.y);
+    }
+    prev = seg.end;
+  }
+  pts = new Float64Array(out);
+  edgePolylineCache.set(edge, pts);
+  return pts;
+}
+
 /** Draw a solid bezier edge path on a Pixi Graphics object */
 function drawSolidBezierEdge(g: Graphics, edge: LaidEdge) {
   g.moveTo(edge.start.x, edge.start.y);
@@ -1373,6 +1396,34 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     return m;
   }, [laidNodes]);
 
+  // Spatial grid for node hit-testing — same TILE_SIZE cells as the
+  // edge tiles. Nodes spanning multiple cells are registered in each,
+  // so a point lookup only ever needs its own cell. Keeps the
+  // per-mousemove hit tests O(nodes in cell) instead of O(all nodes).
+  const nodeTileIndex = useMemo(() => {
+    const m = new Map<string, LaidNode[]>();
+    for (const n of laidNodes) {
+      const minCol = Math.floor((n.cx - n.w / 2) / TILE_SIZE);
+      const maxCol = Math.floor((n.cx + n.w / 2) / TILE_SIZE);
+      const minRow = Math.floor((n.cy - n.h / 2) / TILE_SIZE);
+      const maxRow = Math.floor((n.cy + n.h / 2) / TILE_SIZE);
+      for (let c = minCol; c <= maxCol; c++) {
+        for (let r = minRow; r <= maxRow; r++) {
+          const key = `${c},${r}`;
+          const list = m.get(key);
+          if (list) list.push(n);
+          else m.set(key, [n]);
+        }
+      }
+    }
+    return m;
+  }, [laidNodes]);
+
+  const nodesAt = (worldX: number, worldY: number): LaidNode[] =>
+    nodeTileIndex.get(
+      `${Math.floor(worldX / TILE_SIZE)},${Math.floor(worldY / TILE_SIZE)}`,
+    ) ?? [];
+
   const laidEdges = useMemo<LaidEdge[]>(() => {
     const byEdgeId = new Map<string, (typeof layoutResult.edgePaths)[number]>();
     for (const p of layoutResult.edgePaths) byEdgeId.set(p.edgeId, p);
@@ -1754,7 +1805,10 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   /**
    * Returns the squared distance from (px, py) to the polyline
    * sampled from the edge's bezier segments. Early-exits via bbox
-   * test so far-away edges cost a couple of comparisons.
+   * test so far-away edges cost a couple of comparisons. The sampled
+   * polyline is cached per edge (WeakMap, so it dies with the edge)
+   * — re-sampling the beziers on every mousemove allocated dozens of
+   * Point objects per candidate edge per event.
    */
   const edgeDistSq = (px: number, py: number, edge: LaidEdge): number => {
     const pad = 16;
@@ -1766,19 +1820,15 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     ) {
       return Infinity;
     }
-    const STEPS = 10;
+    const pts = edgePolyline(edge);
     let best = Infinity;
-    let prev = edge.start;
-    for (const seg of edge.segments) {
-      let segPrev = prev;
-      for (let i = 1; i <= STEPS; i++) {
-        const t = i / STEPS;
-        const pt = cubicBezier(prev, seg.c1, seg.c2, seg.end, t);
-        const d = pointSegmentDistSq(px, py, segPrev.x, segPrev.y, pt.x, pt.y);
-        if (d < best) best = d;
-        segPrev = pt;
-      }
-      prev = seg.end;
+    for (let i = 2; i < pts.length; i += 2) {
+      const d = pointSegmentDistSq(
+        px, py,
+        pts[i - 2]!, pts[i - 1]!,
+        pts[i]!, pts[i + 1]!,
+      );
+      if (d < best) best = d;
     }
     return best;
   };
@@ -1836,7 +1886,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     returnTypeRect: { x: number; y: number; w: number; h: number } | null;
   }
   const hitTestField = (worldX: number, worldY: number): FieldHit | null => {
-    for (const n of laidNodes) {
+    for (const n of nodesAt(worldX, worldY)) {
       const left = n.cx - n.w / 2;
       const right = n.cx + n.w / 2;
       const top = n.cy - n.h / 2;
@@ -1932,7 +1982,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   };
 
   const hitTestNodeHeader = (worldX: number, worldY: number): string | null => {
-    for (const n of laidNodes) {
+    for (const n of nodesAt(worldX, worldY)) {
       const left = n.cx - n.w / 2;
       const right = n.cx + n.w / 2;
       const top = n.cy - n.h / 2;
@@ -1944,7 +1994,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   };
 
   const hitTestNode = (worldX: number, worldY: number): string | null => {
-    for (const n of laidNodes) {
+    for (const n of nodesAt(worldX, worldY)) {
       if (
         worldX >= n.cx - n.w / 2 &&
         worldX <= n.cx + n.w / 2 &&
