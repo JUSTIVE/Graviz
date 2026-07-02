@@ -2979,6 +2979,22 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
                   continue;
                 }
                 spriteLastSeenFrameRef.current.set(id, frameCounterRef.current);
+                // Defensive: a sprite must never sit on a destroyed
+                // texture (rendering one crashes Pixi with a null
+                // source). Should be unreachable now that the texture
+                // purge detaches sprites first, but a placeholder swap
+                // is cheap insurance against future purge paths.
+                if (sprite.texture.destroyed) {
+                  const kindTex = kindTextureCacheRef.current.get(node.data.kind);
+                  sprite.texture = kindTex ?? Texture.WHITE;
+                  if (kindTex) {
+                    sprite.tint = 0xffffff;
+                    sprite.leftWidth = PLACEHOLDER_CORNER;
+                    sprite.topHeight = PLACEHOLDER_HEADER_H;
+                    sprite.rightWidth = PLACEHOLDER_CORNER;
+                    sprite.bottomHeight = PLACEHOLDER_CORNER;
+                  }
+                }
                 // Endpoints of the currently-focused edge AND the
                 // currently-focused node (the navigation target) are
                 // always rendered at full LOD so the user can read
@@ -3155,10 +3171,16 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
           if (buildQ.nodes.length === 0) {
             // Drain complete: every sprite currently in view has a
             // texture for `buildQ.lod` at `buildQ.dpr`. Any cached
-            // texture keyed to a different LOD or DPR bucket is unused
-            // by live sprites, so release it to cap GPU memory during
-            // LOD/zoom zigzags. The viewport sweep handles the
-            // orthogonal case — sprites that stayed off-screen.
+            // texture keyed to a different LOD or DPR bucket can be
+            // released to cap GPU memory during LOD/zoom zigzags.
+            //
+            // CAUTION: "different key" does NOT mean "unreferenced" —
+            // off-screen sprites keep their last texture until the
+            // evict window (SPRITE_EVICT_FRAMES) passes, and Pixi
+            // renders a destroyed texture as a null source, crashing
+            // with "Cannot read properties of null (reading
+            // 'alphaMode')". Detach any sprite still holding a purged
+            // texture back to its kind placeholder before destroying.
             const keepSuffix = `:${buildQ.lod}:${buildQ.dpr}`;
             const toDelete: string[] = [];
             for (const key of textureCacheRef.current.keys()) {
@@ -3166,7 +3188,25 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
             }
             for (const key of toDelete) {
               const tex = textureCacheRef.current.get(key);
-              if (tex) tex.destroy(true);
+              if (tex) {
+                const ownerId = key.slice(0, key.indexOf(":"));
+                const spr = nodeSpritesRef.current.get(ownerId);
+                if (spr && spr.texture === tex) {
+                  const kind = nodeByIdRef.current.get(ownerId)?.data.kind;
+                  const kindTex = kind
+                    ? kindTextureCacheRef.current.get(kind)
+                    : undefined;
+                  spr.texture = kindTex ?? Texture.WHITE;
+                  if (kindTex) {
+                    spr.tint = 0xffffff;
+                    spr.leftWidth = PLACEHOLDER_CORNER;
+                    spr.topHeight = PLACEHOLDER_HEADER_H;
+                    spr.rightWidth = PLACEHOLDER_CORNER;
+                    spr.bottomHeight = PLACEHOLDER_CORNER;
+                  }
+                }
+                tex.destroy(true);
+              }
               textureCacheRef.current.delete(key);
             }
             spriteBuildQueueRef.current = null;
