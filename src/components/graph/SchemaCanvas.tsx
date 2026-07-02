@@ -1,4 +1,4 @@
-import { Application, Container, Graphics, NineSliceSprite, Sprite, Texture, TilingSprite } from "pixi.js";
+import { Application, Container, Geometry, Graphics, Mesh, NineSliceSprite, Shader, Sprite, Texture, TilingSprite, UniformGroup } from "pixi.js";
 import { ArrowRight, ChevronDown, ChevronUp, Filter, History, Loader2, Microscope, Trash2, X } from "lucide-react";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { BezierSegment, LayoutResult } from "@/lib/layout";
@@ -167,7 +167,7 @@ interface EdgeTile {
   /** Edge Graphics broken into ≤ EDGES_PER_BATCH-edge sub-batches.
    *  Each Graphics has bounded vertex count so a single tile never
    *  uploads a multi-MB vertex buffer in one frame. */
-  edgeBatches: Graphics[];
+  edgeBatches: Container[];
   /** Number of batches built so far. The remaining batches are
    *  appended progressively across subsequent frames. */
   builtBatches: number;
@@ -823,7 +823,7 @@ function cubicBezier(
 // the LaidEdge object so entries are collected when a layout replaces
 // the edge list.
 const edgePolylineCache = new WeakMap<LaidEdge, Float64Array>();
-const EDGE_SAMPLE_STEPS = 10;
+const EDGE_SAMPLE_STEPS = 16;
 
 function edgePolyline(edge: LaidEdge): Float64Array {
   let pts = edgePolylineCache.get(edge);
@@ -840,17 +840,6 @@ function edgePolyline(edge: LaidEdge): Float64Array {
   pts = new Float64Array(out);
   edgePolylineCache.set(edge, pts);
   return pts;
-}
-
-/** Draw a solid bezier edge path on a Pixi Graphics object */
-function drawSolidBezierEdge(g: Graphics, edge: LaidEdge) {
-  g.moveTo(edge.start.x, edge.start.y);
-  for (const seg of edge.segments) {
-    g.bezierCurveTo(seg.c1.x, seg.c1.y, seg.c2.x, seg.c2.y, seg.end.x, seg.end.y);
-  }
-  if (edge.arrowTip) {
-    g.lineTo(edge.arrowTip.x, edge.arrowTip.y);
-  }
 }
 
 const DIM_ALPHA = 0.1;
@@ -881,59 +870,205 @@ function edgeGroupIndex(e: LaidEdge): number {
   return 0;
 }
 
+// ─── Feathered edge mesh ──────────────────────────────────────────────
+//
+// Edges are rendered as triangle-strip ribbons with analytic anti-
+// aliasing in the fragment shader (screen-space smoothstep across the
+// stroke), instead of Pixi Graphics strokes + framebuffer MSAA. The
+// feather is computed from the live zoom uniform, so one static
+// world-space geometry stays crisp at every zoom level; sub-pixel
+// strokes fade out via coverage compensation instead of shimmering.
+// The ribbon carries EDGE_FEATHER_PAD world-units of transparent
+// margin so the ~1 screen-px feather has geometry to land on for any
+// zoom where edges are legible.
+const EDGE_FEATHER_PAD = 2.0;
+
+let _edgeShader: Shader | null = null;
+let _edgeUniforms: UniformGroup | null = null;
+
+function getEdgeShader(): Shader {
+  if (_edgeShader) return _edgeShader;
+  _edgeUniforms = new UniformGroup({
+    uZoom: { value: 1, type: "f32" },
+    uHalfW: { value: STROKE_W / 2, type: "f32" },
+  });
+  _edgeShader = Shader.from({
+    gl: {
+      vertex: `
+        attribute vec2 aPosition;
+        attribute float aDist;
+        attribute vec4 aColor;
+        varying float vDist;
+        varying vec4 vColor;
+        uniform mat3 uProjectionMatrix;
+        uniform mat3 uWorldTransformMatrix;
+        uniform mat3 uTransformMatrix;
+        void main() {
+          mat3 mvp = uProjectionMatrix * uWorldTransformMatrix * uTransformMatrix;
+          gl_Position = vec4((mvp * vec3(aPosition, 1.0)).xy, 0.0, 1.0);
+          vDist = aDist;
+          vColor = aColor;
+        }
+      `,
+      fragment: `
+        precision mediump float;
+        varying float vDist;
+        varying vec4 vColor;
+        uniform vec4 uColor;
+        uniform float uZoom;
+        uniform float uHalfW;
+        void main() {
+          float dScreen = abs(vDist) * uZoom;
+          float halfPx = max(0.5, uHalfW * uZoom);
+          float alpha = 1.0 - smoothstep(halfPx - 0.75, halfPx + 0.75, dScreen);
+          // Sub-pixel strokes: clamp rendered width to ~1px above and
+          // scale alpha down by true coverage so thin lines dim out
+          // smoothly instead of aliasing.
+          alpha *= min(1.0, (uHalfW * uZoom) / 0.5);
+          float a = vColor.a * alpha;
+          // uColor is the premultiplied world color+alpha from the
+          // mesh pipe — this is what makes container.alpha dimming
+          // (focus mode) apply to the custom shader output.
+          gl_FragColor = vec4(vColor.rgb * a, a) * uColor;
+        }
+      `,
+    },
+    resources: { edgeUniforms: _edgeUniforms },
+  });
+  return _edgeShader;
+}
+
+/** Ticker hook: keeps the shader's screen-space feather in sync with
+ *  the current zoom. Cheap no-op until the first batch is built. */
+function updateEdgeZoom(k: number) {
+  if (!_edgeUniforms) return;
+  (_edgeUniforms.uniforms as { uZoom: number }).uZoom = k;
+  _edgeUniforms.update();
+}
+
 /**
- * Build a single batch Graphics for a slice of edges belonging to one
- * group (same color + alphaScale). Tile-build code calls this once
- * per sub-batch so no individual Graphics ever holds more than
- * EDGES_PER_BATCH worth of geometry — the GPU then never sees a
- * single multi-megabyte vertex upload.
- *
- * Edge strokes and arrowhead fills share one Graphics (arrows drawn
- * after strokes within the batch). This halves the scene-graph object
- * count vs the old separate arrow layer; the tradeoff is that the
- * "arrows above all edges" guarantee now only holds within a batch,
- * which is imperceptible at DIM/hub alpha levels.
+ * Build a single batch for a slice of edges belonging to one group
+ * (same color + alphaScale): one feathered ribbon Mesh for the edge
+ * bodies plus one Graphics for the arrowhead fills. Bounded to
+ * EDGES_PER_BATCH edges so no single GPU upload is ever huge.
  */
-function buildEdgeBatchGraphics(
+function buildEdgeBatchMesh(
   slice: LaidEdge[],
   group: { colorHex: number; alphaScale: number },
   alpha: number,
-): Graphics {
-  const g = new Graphics();
-  const colorHex = group.colorHex;
-  const effAlpha = alpha * group.alphaScale;
+): Container {
+  const batch = new Container();
+  const hw = STROKE_W / 2 + EDGE_FEATHER_PAD;
+  const cr = ((group.colorHex >> 16) & 0xff) / 255;
+  const cg = ((group.colorHex >> 8) & 0xff) / 255;
+  const cb = (group.colorHex & 0xff) / 255;
 
-  // Split this slice into normal vs hub-faded edges so each gets its
-  // own stroke/fill call with the right alpha. Pixi Graphics supports
-  // multiple stroke styles in the same object via repeated
-  // beginPath / stroke pairs — keeps draw-call count low while still
-  // letting hub-incident edges render at a softer opacity.
+  let vcount = 0;
+  let icount = 0;
+  const polys: (Float64Array | null)[] = [];
+  for (const e of slice) {
+    const pts = edgePolyline(e);
+    const n = pts.length / 2;
+    if (n < 2) {
+      polys.push(null);
+      continue;
+    }
+    polys.push(pts);
+    vcount += 2 * n;
+    icount += 6 * (n - 1);
+  }
+
+  if (vcount > 0) {
+    const positions = new Float32Array(vcount * 2);
+    const dists = new Float32Array(vcount);
+    const colors = new Float32Array(vcount * 4);
+    const indices = new Uint32Array(icount);
+    let vi = 0;
+    let ii = 0;
+    for (let si = 0; si < slice.length; si++) {
+      const pts = polys[si];
+      if (!pts) continue;
+      const e = slice[si]!;
+      const n = pts.length / 2;
+      const ea =
+        alpha * group.alphaScale * ((e.hubFade ?? 1) < 1 ? HUB_FADE_ALPHA : 1);
+      const base = vi;
+      for (let i = 0; i < n; i++) {
+        const x = pts[2 * i]!;
+        const y = pts[2 * i + 1]!;
+        // Averaged tangent of the two adjacent segments — polylines
+        // sampled from beziers are smooth, so no miter correction
+        // is needed.
+        const iPrev = Math.max(0, i - 1);
+        const iNext = Math.min(n - 1, i + 1);
+        let dx = pts[2 * iNext]! - pts[2 * iPrev]!;
+        let dy = pts[2 * iNext + 1]! - pts[2 * iPrev + 1]!;
+        const len = Math.hypot(dx, dy) || 1;
+        dx /= len;
+        dy /= len;
+        const nx = -dy;
+        const ny = dx;
+        for (let side = 0; side < 2; side++) {
+          const sgn = side === 0 ? 1 : -1;
+          positions[vi * 2] = x + nx * hw * sgn;
+          positions[vi * 2 + 1] = y + ny * hw * sgn;
+          dists[vi] = hw * sgn;
+          colors[vi * 4] = cr;
+          colors[vi * 4 + 1] = cg;
+          colors[vi * 4 + 2] = cb;
+          colors[vi * 4 + 3] = ea;
+          vi++;
+        }
+      }
+      for (let i = 0; i < n - 1; i++) {
+        const v0 = base + 2 * i;
+        indices[ii++] = v0;
+        indices[ii++] = v0 + 1;
+        indices[ii++] = v0 + 2;
+        indices[ii++] = v0 + 1;
+        indices[ii++] = v0 + 3;
+        indices[ii++] = v0 + 2;
+      }
+    }
+    const geometry = new Geometry({
+      attributes: {
+        aPosition: { buffer: positions, format: "float32x2" },
+        aDist: { buffer: dists, format: "float32" },
+        aColor: { buffer: colors, format: "float32x4" },
+      },
+      indexBuffer: indices,
+    });
+    const mesh = new Mesh({ geometry, shader: getEdgeShader() });
+    // The shader is shared across every batch; the geometry is not —
+    // make sure its GPU buffers go away with the mesh (Mesh.destroy
+    // does not own the geometry).
+    mesh.once("destroyed", () => geometry.destroy());
+    batch.addChild(mesh);
+  }
+
+  // Arrowheads stay as filled Graphics — tiny solid triangles that
+  // the framebuffer MSAA already smooths; per-triangle feathering
+  // isn't worth the geometry complexity.
+  const arrow = new Graphics();
+  const effAlpha = alpha * group.alphaScale;
   const normal: LaidEdge[] = [];
   const faded: LaidEdge[] = [];
   for (const e of slice) {
     if ((e.hubFade ?? 1) < 1) faded.push(e);
     else normal.push(e);
   }
-
   if (normal.length > 0) {
-    g.beginPath();
-    for (const e of normal) drawSolidBezierEdge(g, e);
-    g.stroke({ width: STROKE_W, color: colorHex, alpha: effAlpha });
-    g.beginPath();
-    for (const e of normal) drawArrowHead(g, e);
-    g.fill({ color: colorHex, alpha: effAlpha });
+    arrow.beginPath();
+    for (const e of normal) drawArrowHead(arrow, e);
+    arrow.fill({ color: group.colorHex, alpha: effAlpha });
   }
   if (faded.length > 0) {
-    const fadeAlpha = effAlpha * HUB_FADE_ALPHA;
-    g.beginPath();
-    for (const e of faded) drawSolidBezierEdge(g, e);
-    g.stroke({ width: STROKE_W, color: colorHex, alpha: fadeAlpha });
-    g.beginPath();
-    for (const e of faded) drawArrowHead(g, e);
-    g.fill({ color: colorHex, alpha: fadeAlpha });
+    arrow.beginPath();
+    for (const e of faded) drawArrowHead(arrow, e);
+    arrow.fill({ color: group.colorHex, alpha: effAlpha * HUB_FADE_ALPHA });
   }
-
-  return g;
+  batch.addChild(arrow);
+  return batch;
 }
 
 /**
@@ -958,7 +1093,7 @@ function plannedBatchCount(tile: EdgeTile): number {
 function buildEdgeTileBatch(
   tile: EdgeTile,
   batchIdx: number,
-): Graphics | null {
+): Container | null {
   let idx = batchIdx;
   for (let gi = 0; gi < EDGE_GROUP_DEFS.length; gi++) {
     const list = tile.groupLists[gi];
@@ -967,7 +1102,7 @@ function buildEdgeTileBatch(
     if (idx < batches) {
       const start = idx * EDGES_PER_BATCH;
       const end = Math.min(start + EDGES_PER_BATCH, list.length);
-      return buildEdgeBatchGraphics(list.slice(start, end), EDGE_GROUP_DEFS[gi]!, 1);
+      return buildEdgeBatchMesh(list.slice(start, end), EDGE_GROUP_DEFS[gi]!, 1);
     }
     idx -= batches;
   }
@@ -2610,6 +2745,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         // Sync world transform
         scene.world.position.set(v.x, v.y);
         scene.world.scale.set(v.k, v.k);
+        updateEdgeZoom(v.k);
 
         // Detect LOD change → trigger node/edge rebuild. Whenever
         // the LOD steps up into "full" (most often: right after the
@@ -2839,7 +2975,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
                 tile.edgeBatches.length > 0 &&
                 frame - tile.lastSeenFrame > TILE_EVICT_FRAMES
               ) {
-                for (const g of tile.edgeBatches) g.destroy();
+                for (const g of tile.edgeBatches) g.destroy({ children: true });
                 tile.edgeBatches = [];
                 tile.builtBatches = 0;
                 // Mark for re-planning on next visibility — the group
@@ -3509,7 +3645,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     // Drop old tile Graphics. New grouping means existing vertex
     // buffers are invalid.
     for (const tile of edgeTilesRef.current.values()) {
-      for (const g of tile.edgeBatches) g.destroy();
+      for (const g of tile.edgeBatches) g.destroy({ children: true });
     }
     edgeTilesRef.current.clear();
     scene.edgeTileContainer.removeChildren();
@@ -3568,12 +3704,12 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     const dimming = edgeGroups.groups.some((g) => g.dim.length > 0);
     scene.edgeTileContainer.alpha = dimming ? DIM_ALPHA : 1;
 
-    for (const c of scene.activeEdgeContainer.removeChildren()) c.destroy();
+    for (const c of scene.activeEdgeContainer.removeChildren()) c.destroy({ children: true });
     if (!dimming) return;
 
     for (const g of edgeGroups.groups) {
       for (let i = 0; i < g.active.length; i += EDGES_PER_BATCH) {
-        const built = buildEdgeBatchGraphics(
+        const built = buildEdgeBatchMesh(
           g.active.slice(i, i + EDGES_PER_BATCH),
           g,
           1,
