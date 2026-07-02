@@ -213,29 +213,54 @@ export function SchemaProvider({ children }: { children: React.ReactNode }) {
     setFocusStack((s) => (index < 0 ? [] : s.slice(0, index + 1)));
   }, []);
 
-  const value: SchemaContextValue = {
-    sdl,
-    name,
-    graph,
-    hasSchema: graph.nodes.length > 0,
-    visibleNodes,
-    visibleEdges,
-    orphanedNodes,
-    orphanedEdges,
-    setSchema,
-    clearSchema,
-    rootType: effectiveRoot,
-    setRootType,
-    focusStack,
-    pushFocus,
-    popTo,
-    hidePrimitiveFields,
-    setHidePrimitiveFields,
-    hideRelayBoilerplate,
-    setHideRelayBoilerplate,
-    pinnedField,
-    setPinnedField,
-  };
+  // Memoize the context value — without this every provider render
+  // (any state change) hands out a fresh object identity, forcing all
+  // consumers (TreePanel, SchemaCanvas, AppShell…) to re-render even
+  // when nothing they read has changed.
+  const value = useMemo<SchemaContextValue>(
+    () => ({
+      sdl,
+      name,
+      graph,
+      hasSchema: graph.nodes.length > 0,
+      visibleNodes,
+      visibleEdges,
+      orphanedNodes,
+      orphanedEdges,
+      setSchema,
+      clearSchema,
+      rootType: effectiveRoot,
+      setRootType,
+      focusStack,
+      pushFocus,
+      popTo,
+      hidePrimitiveFields,
+      setHidePrimitiveFields,
+      hideRelayBoilerplate,
+      setHideRelayBoilerplate,
+      pinnedField,
+      setPinnedField,
+    }),
+    [
+      sdl,
+      name,
+      graph,
+      visibleNodes,
+      visibleEdges,
+      orphanedNodes,
+      orphanedEdges,
+      setSchema,
+      clearSchema,
+      effectiveRoot,
+      setRootType,
+      focusStack,
+      pushFocus,
+      popTo,
+      hidePrimitiveFields,
+      hideRelayBoilerplate,
+      pinnedField,
+    ],
+  );
 
   return <SchemaContext.Provider value={value}>{children}</SchemaContext.Provider>;
 }
