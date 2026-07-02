@@ -2551,6 +2551,12 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       const IDLE_STOP_FRAMES = 60;
       let idleFrames = 0;
       let lastView = { x: NaN, y: NaN, k: NaN };
+      // Frame pacing state — EMA of the real display interval so the
+      // per-frame work budgets below scale to the refresh rate (a
+      // 120 Hz frame is ~8.3 ms; budgets tuned for 60 Hz would
+      // guarantee dropped frames whenever queues are draining).
+      let lastFrameAt = 0;
+      let frameIntervalEma = 16.7;
       wakeRef.current = () => {
         idleFrames = 0;
         if (!app.ticker.started) app.ticker.start();
@@ -2569,6 +2575,28 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         lastView = { x: v.x, y: v.y, k: v.k };
         let tileWork = false;
         let animActive = false;
+
+        // Shared work deadline for all progressive builders this
+        // frame (tile tessellation, sprite creation, texture draws):
+        // ~35% of the measured frame interval, leaving the rest for
+        // Pixi's render pass. At 60 Hz this is ~5 ms (close to the
+        // old fixed budgets); at 120 Hz it tightens to ~3 ms so the
+        // same work spreads over more frames instead of blowing the
+        // 8.3 ms budget. The texel budget separately caps GPU upload
+        // volume — canvas draw time is bounded by the deadline, but
+        // upload cost at render time scales with texture area.
+        const frameStart = performance.now();
+        if (lastFrameAt > 0) {
+          const dt = Math.min(50, frameStart - lastFrameAt);
+          frameIntervalEma = frameIntervalEma * 0.9 + dt * 0.1;
+        }
+        lastFrameAt = frameStart;
+        const workDeadline =
+          frameStart + Math.min(5, Math.max(1, frameIntervalEma * 0.35));
+        const texelBudget = Math.min(
+          4_000_000,
+          Math.max(1_000_000, frameIntervalEma * 150_000),
+        );
 
         // Sync world transform
         scene.world.position.set(v.x, v.y);
@@ -2745,17 +2773,17 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
           const viewMaxY = (sh - v.y) / v.k + TILE_VIEW_PADDING;
 
           const frame = frameCounterRef.current;
-          // Cap tile lazy-build time per frame. A zoom-out or sudden
-          // pan can pull many tiles into view at once; without this
-          // budget they'd all tessellate in the same frame and drop
-          // 30–60 ms. Also gated on motion settle — the same mobile
-          // GPU driver that dies from rapid texture uploads also
-          // dies from rapid vertex-buffer uploads during a fast pan.
-          const TILE_BUILD_BUDGET_MS = 2;
+          // Tile lazy-builds share the frame's work deadline. A
+          // zoom-out or sudden pan can pull many tiles into view at
+          // once; without the cap they'd all tessellate in the same
+          // frame and drop 30–60 ms. Also gated on motion settle —
+          // the same mobile GPU driver that dies from rapid texture
+          // uploads also dies from rapid vertex-buffer uploads during
+          // a fast pan.
           const tileStable =
             focusJumpPendingRef.current ||
             performance.now() - lastViewChangeAtRef.current >= MOTION_SETTLE_MS;
-          const buildDeadline = performance.now() + TILE_BUILD_BUDGET_MS;
+          const buildDeadline = workDeadline;
           let batchesBuiltThisFrame = 0;
 
           for (const tile of tiles.values()) {
@@ -2827,7 +2855,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
           scene.nodeContainer
         ) {
           const nodeContainer = scene.nodeContainer;
-          const createDeadline = performance.now() + 2;
+          const createDeadline = workDeadline;
           while (
             spriteCreateQueue.length > 0 &&
             performance.now() < createDeadline
@@ -3137,10 +3165,17 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
           focusJumping ||
           performance.now() - lastViewChangeAtRef.current >= MOTION_SETTLE_MS;
         if (buildQ && buildQ.nodes.length > 0 && motionStable) {
-          const deadline = performance.now() + (focusJumping ? 30 : 4);
+          // Focus jumps keep their deliberate one-frame 30 ms burst so
+          // navigation feels immediate; steady-state builds share the
+          // frame work deadline and are additionally capped by upload
+          // volume (texels) so one batch of huge enum nodes can't
+          // queue tens of MB of texImage2D in a single frame.
+          const deadline = focusJumping ? performance.now() + 30 : workDeadline;
           const lodCap = maxTextureCacheFor(buildQ.lod, buildQ.dpr);
+          let texelsThisFrame = 0;
           while (buildQ.nodes.length > 0 && performance.now() < deadline) {
             if (textureCacheRef.current.size >= lodCap) break;
+            if (!focusJumping && texelsThisFrame >= texelBudget) break;
             const n = buildQ.nodes.pop()!;
             const key = `${n.id}:${buildQ.lod}:${buildQ.dpr}`;
             if (textureCacheRef.current.has(key)) continue;
@@ -3148,6 +3183,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
             const drawDpr = fitDprToMaxTexture(n.w, n.h, buildQ.dpr);
             const pw = Math.ceil(n.w * drawDpr);
             const ph = Math.ceil(n.h * drawDpr);
+            texelsThisFrame += pw * ph;
             const can = document.createElement("canvas");
             can.width = pw;
             can.height = ph;
@@ -3253,12 +3289,18 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
             const cctx = cc.getContext("2d");
             if (cctx) {
               cctx.clearRect(0, 0, cw, ch);
-              const maxFps = 65;
+              // Scale the chart to the observed peak so a 120 Hz
+              // display isn't clipped at the old 60-ish ceiling.
+              let peak = 65;
+              for (const f of hist) if (f > peak) peak = f;
+              const maxFps = peak + 5;
               const barW = cw / hist.length;
               for (let i = 0; i < hist.length; i++) {
                 const v = hist[i]!;
                 const bh = Math.max(1, (v / maxFps) * ch);
-                const isLow = v < 30;
+                // "Low" is relative to the observed peak (≈ display
+                // refresh) so dips read correctly on 120 Hz too.
+                const isLow = v < peak * 0.5;
                 cctx.fillStyle = isLow ? "rgba(248,113,113,0.7)" : "rgba(148,163,184,0.35)";
                 cctx.fillRect(i * barW, ch - bh, Math.max(1, barW - 1), bh);
               }
