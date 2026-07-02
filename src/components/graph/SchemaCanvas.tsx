@@ -986,6 +986,9 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   const pixiContainerRef = useRef<HTMLDivElement>(null);
   const [size, setSize] = useState({ w: 1, h: 1 });
   const viewRef = useRef({ x: 0, y: 0, k: 1 });
+  // Restarts the (possibly idle-stopped) Pixi ticker. Assigned once
+  // the Application is initialized; safe to call before that (no-op).
+  const wakeRef = useRef<() => void>(() => {});
 
   const dragRef = useRef({
     active: false,
@@ -1752,6 +1755,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     if (!el) return;
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
+      wakeRef.current();
       const rect = el.getBoundingClientRect();
       const mx = e.clientX - rect.left;
       const my = e.clientY - rect.top;
@@ -2006,6 +2010,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   };
 
   const onMouseDown = (e: React.MouseEvent) => {
+    wakeRef.current();
     dragRef.current = {
       active: true,
       lastX: e.clientX,
@@ -2017,6 +2022,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   };
 
   const onMouseMove = (e: React.MouseEvent) => {
+    wakeRef.current();
     const drag = dragRef.current;
     if (drag.active) {
       const dx = e.clientX - drag.lastX;
@@ -2120,6 +2126,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   };
 
   const endDrag = () => {
+    wakeRef.current();
     dragRef.current.active = false;
     hoveredFieldRef.current = null;
     hoveredNodeRef.current = null;
@@ -2290,6 +2297,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
 
     const onTouchStart = (e: TouchEvent) => {
       if (e.cancelable) e.preventDefault();
+      wakeRef.current();
       for (let i = 0; i < e.changedTouches.length; i++) {
         const t = e.changedTouches[i]!;
         points.set(t.identifier, { x: t.clientX, y: t.clientY, startX: t.clientX, startY: t.clientY });
@@ -2300,6 +2308,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
 
     const onTouchMove = (e: TouchEvent) => {
       if (e.cancelable) e.preventDefault();
+      wakeRef.current();
       const before = new Map<number, { x: number; y: number }>();
       for (const [id, p] of points) before.set(id, { x: p.x, y: p.y });
       for (let i = 0; i < e.changedTouches.length; i++) {
@@ -2340,6 +2349,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     };
 
     const onTouchEnd = (e: TouchEvent) => {
+      wakeRef.current();
       const ended: Touch[] = [];
       for (let i = 0; i < e.changedTouches.length; i++) {
         const t = e.changedTouches[i]!;
@@ -2517,6 +2527,21 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       let fpsTimes: number[] = [];
       let lastFpsSampleAt = 0;
 
+      // Render-on-demand: after IDLE_STOP_FRAMES consecutive frames
+      // with no pending work (no view change, no queued sprite/tile
+      // builds, no running animation) the ticker stops entirely — a
+      // fully static canvas costs zero GPU/CPU per frame. Anything
+      // that can change the scene calls `wake()`: every React render
+      // (see the deps-less effect below) plus the raw pointer/wheel/
+      // touch handlers that mutate viewRef without rendering.
+      const IDLE_STOP_FRAMES = 60;
+      let idleFrames = 0;
+      let lastView = { x: NaN, y: NaN, k: NaN };
+      wakeRef.current = () => {
+        idleFrames = 0;
+        if (!app.ticker.started) app.ticker.start();
+      };
+
       app.ticker.add(() => {
         const scene = sceneRef.current;
         if (!scene.world) return;
@@ -2524,6 +2549,12 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         const v = viewRef.current;
         const sw = app.screen.width;
         const sh = app.screen.height;
+
+        const viewChanged =
+          v.x !== lastView.x || v.y !== lastView.y || v.k !== lastView.k;
+        lastView = { x: v.x, y: v.y, k: v.k };
+        let tileWork = false;
+        let animActive = false;
 
         // Sync world transform
         scene.world.position.set(v.x, v.y);
@@ -2654,15 +2685,25 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
               const colorStr = KIND_COLORS[n.data.kind];
               const colorHex = cssColorToHex(colorStr);
 
-              const t = (performance.now() % 1600) / 1600;
-              const ripplePad = t * 18;
-              const rippleAlpha = (1 - t) * 0.6;
+              // Ripple animation is time-limited (a few cycles after the
+              // focus change) so a parked focus doesn't keep the ticker
+              // alive forever — after it finishes only the static ring
+              // remains and the canvas can go idle.
+              const RIPPLE_CYCLE_MS = 1600;
+              const RIPPLE_TOTAL_MS = 4800;
+              const elapsed = performance.now() - focusChangedAtRef.current;
+              if (elapsed < RIPPLE_TOTAL_MS) {
+                animActive = true;
+                const t = (elapsed % RIPPLE_CYCLE_MS) / RIPPLE_CYCLE_MS;
+                const ripplePad = t * 18;
+                const rippleAlpha = (1 - t) * 0.6;
 
-              scene.focusGraphics.roundRect(
-                n.cx - n.w / 2 - ripplePad, n.cy - n.h / 2 - ripplePad,
-                n.w + ripplePad * 2, n.h + ripplePad * 2, 6 + ripplePad,
-              );
-              scene.focusGraphics.stroke({ width: 2, color: colorHex, alpha: rippleAlpha });
+                scene.focusGraphics.roundRect(
+                  n.cx - n.w / 2 - ripplePad, n.cy - n.h / 2 - ripplePad,
+                  n.w + ripplePad * 2, n.h + ripplePad * 2, 6 + ripplePad,
+                );
+                scene.focusGraphics.stroke({ width: 2, color: colorHex, alpha: rippleAlpha });
+              }
 
               const pad = 3;
               scene.focusGraphics.roundRect(
@@ -2763,6 +2804,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
               }
             }
           }
+          if (batchesBuiltThisFrame > 0) tileWork = true;
         }
 
         // Progressive sprite creation drain. The sweep below can
@@ -3138,6 +3180,17 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
             }
           }
         }
+
+        // Idle-stop bookkeeping — see wake() above.
+        const anyWork =
+          viewChanged ||
+          tileWork ||
+          animActive ||
+          focusJumpPendingRef.current ||
+          (spriteCreateQueueRef.current?.length ?? 0) > 0 ||
+          (spriteBuildQueueRef.current?.nodes.length ?? 0) > 0;
+        if (anyWork) idleFrames = 0;
+        else if (++idleFrames >= IDLE_STOP_FRAMES) app.ticker.stop();
       });
     });
 
@@ -3178,6 +3231,22 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   // Keep focusId accessible in the ticker without re-init
   const focusIdRef = useRef(focusId ?? null);
   focusIdRef.current = focusId ?? null;
+
+  // Timestamp of the last focus change — bounds the focus-ring ripple
+  // animation so an idle canvas with a parked focus can stop rendering.
+  const focusChangedAtRef = useRef(0);
+  useEffect(() => {
+    focusChangedAtRef.current = performance.now();
+  }, [focusId]);
+
+  // Wake the render loop on every React render. Any state- or prop-
+  // driven scene mutation (focus, dim, pin, investigate, layout,
+  // theme, resize…) flows through a render, so this single effect
+  // covers them all; only the raw pointer/wheel/touch handlers that
+  // mutate viewRef without rendering need explicit wake() calls.
+  useEffect(() => {
+    wakeRef.current();
+  });
 
   // Keep nodeById accessible in the ticker
   const nodeByIdRef = useRef(nodeById);
