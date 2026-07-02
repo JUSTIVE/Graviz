@@ -1,4 +1,4 @@
-import { Application, Container, Graphics, NineSliceSprite, Sprite, Texture, TilingSprite } from "pixi.js";
+import { AlphaFilter, Application, Container, Graphics, NineSliceSprite, Sprite, Texture, TilingSprite } from "pixi.js";
 import { ArrowRight, ChevronDown, ChevronUp, Filter, History, Loader2, Microscope, Trash2, X } from "lucide-react";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { BezierSegment, LayoutResult } from "@/lib/layout";
@@ -2443,7 +2443,12 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       height: size.h,
       resolution: dpr,
       autoDensity: true,
-      antialias: true,
+      // Framebuffer-wide MSAA is off: node cards are pre-rendered
+      // textures (already smooth) and the dot grid is a texture too,
+      // so paying multisample fill-rate for the whole canvas only
+      // benefits the edge strokes. Those get selective MSAA via the
+      // edgeLayer passthrough filter below instead.
+      antialias: false,
       backgroundAlpha: 1,
       backgroundColor: initBgHex,
       preference: "webgl",
@@ -2485,17 +2490,32 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       const hoverGraphics = new Graphics();
       const focusGraphics = new Graphics();
 
-      world.addChild(edgeTileContainer);
-      world.addChild(activeEdgeContainer);
+      // Edge layers are the only vector geometry that visibly aliases
+      // (thin bezier strokes at arbitrary angles), so they get MSAA
+      // selectively: a passthrough AlphaFilter with antialiasing
+      // forced on renders just this subtree into a multisampled
+      // texture and resolves it, while the main framebuffer stays
+      // non-MSAA. filterArea pins the intermediate texture to the
+      // screen rect (app.screen is mutated in place on resize) so the
+      // filter never tries to allocate a world-bounds-sized surface.
+      const edgeLayer = new Container();
+      edgeLayer.addChild(edgeTileContainer);
+      edgeLayer.addChild(activeEdgeContainer);
       // Focused-edge bold stroke sits above the edge tiles so the
       // selected line reads thicker than its neighbors. Hover overlay
       // goes on top of focus so hovering still paints the brighter
       // emphasis even when an edge is already focused.
-      world.addChild(focusEdgeGraphics);
+      edgeLayer.addChild(focusEdgeGraphics);
       // Highlight is between edges and nodes — drawn on top of every
       // other edge in the tiles but covered by node cards, so the
       // emphasized line reads cleanly without spilling onto nodes.
-      world.addChild(hoverEdgeGraphics);
+      edgeLayer.addChild(hoverEdgeGraphics);
+      const edgeAAFilter = new AlphaFilter();
+      edgeAAFilter.antialias = "on";
+      edgeAAFilter.resolution = "inherit";
+      edgeLayer.filters = [edgeAAFilter];
+      edgeLayer.filterArea = app.screen;
+      world.addChild(edgeLayer);
       world.addChild(nodeContainer);
       // Investigate overlay sits above nodes so its orange outlines
       // pop over the (possibly dimmed) cards.
