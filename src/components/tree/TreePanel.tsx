@@ -1,5 +1,5 @@
 import { ChevronDown, ChevronRight, Clock, Search, TriangleAlert, X } from "lucide-react";
-import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { KIND_STYLES } from "@/components/graph/node-style";
 import { Badge } from "@/components/ui/badge";
 import { useSchema } from "@/lib/schema-context";
@@ -84,6 +84,46 @@ function fuzzyScore(
   }
   score += Math.round((query.length / target.length) * 8);
   return { score, indices };
+}
+
+// ─── Windowed list ─────────────────────────────────────────────────────
+//
+// Minimal fixed-row-height virtualization for the capped (max-h-48)
+// type lists. A 5k-type schema would otherwise mount 5k <li> rows the
+// moment "All types" opens even though only ~8 are visible. Row height
+// matches the px-3 py-1 text-xs rows (16px line + 8px padding).
+
+const VLIST_ROW_H = 24;
+const VLIST_MAX_H = 192; // == max-h-48
+const VLIST_OVERSCAN = 10;
+
+function VirtualList<T>({
+  items,
+  className,
+  renderRow,
+}: {
+  items: T[];
+  className?: string;
+  renderRow: (item: T) => ReactNode;
+}) {
+  const [scrollTop, setScrollTop] = useState(0);
+  const start = Math.max(0, Math.floor(scrollTop / VLIST_ROW_H) - VLIST_OVERSCAN);
+  const end = Math.min(
+    items.length,
+    Math.ceil((scrollTop + VLIST_MAX_H) / VLIST_ROW_H) + VLIST_OVERSCAN,
+  );
+  return (
+    <ul
+      className={className}
+      onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}
+    >
+      {start > 0 && <li style={{ height: start * VLIST_ROW_H }} aria-hidden />}
+      {items.slice(start, end).map(renderRow)}
+      {end < items.length && (
+        <li style={{ height: (items.length - end) * VLIST_ROW_H }} aria-hidden />
+      )}
+    </ul>
+  );
 }
 
 function HighlightedText({ text, indices, className }: { text: string; indices: number[]; className?: string }) {
@@ -642,8 +682,10 @@ export function TreePanel() {
             <span>All types ({graph.nodes.length})</span>
           </button>
           {allTypesOpen && (
-            <ul className="max-h-48 overflow-auto border-t border-border">
-              {allTypesSorted.map((n) => {
+            <VirtualList
+              items={allTypesSorted}
+              className="max-h-48 overflow-auto border-t border-border"
+              renderRow={(n) => {
                 const selected = n.id === currentId;
                 const style = KIND_STYLES[n.kind];
                 return (
@@ -672,8 +714,8 @@ export function TreePanel() {
                     </button>
                   </li>
                 );
-              })}
-            </ul>
+              }}
+            />
           )}
         </div>
       )}
