@@ -237,19 +237,27 @@ const BAR_TYPE_FRACS = [0.24, 0.30, 0.20, 0.27, 0.22, 0.28];
 // pan and the renderer process dies ("Aw, Snap!"). Bar LOD is just
 // fake-bar hints, DPR 1 is indistinguishable at zoom.
 //
-// Full LOD scales with the actual zoom: a node displayed at k×w CSS
-// px only needs ~k×monitorDpr texels per world px, so building at a
-// flat DPR 2 while zoomed to k=0.1 oversamples ~20×. Bucketed to
-// {0.5, 1, cap-2} so ordinary zoom jitter doesn't re-key textures;
-// crossing a bucket boundary rebuilds visible textures, same
-// tradeoff as a LOD tier crossing.
+// Full LOD scales with the actual zoom so a node's texture always
+// matches the physical pixels it covers on screen: a node displayed
+// at k×w CSS px covers k×w×renderDpr device px (renderDpr = the
+// renderer's resolution, capped at 2 — texels beyond that can't be
+// displayed anyway). Bucketed to a ×2 ladder {0.5, 1, 2, 4, 8} with
+// √2 midpoint thresholds so ordinary zoom jitter doesn't re-key
+// textures; crossing a boundary rebuilds visible textures (text
+// progressively sharpens as you zoom in), same tradeoff as a LOD
+// tier crossing. Extreme node sizes are still clamped by
+// fitDprToMaxTexture against the GPU's max texture dimension, and
+// the in-view node count shrinks as k grows, so high buckets stay
+// cheap in aggregate.
 function spriteDprForLod(lod: SpriteLOD, viewK: number): number {
-  const monitorDpr =
-    typeof window !== "undefined" ? Math.max(1, window.devicePixelRatio || 1) : 1;
+  const renderDpr =
+    typeof window !== "undefined" ? Math.min(2, Math.max(1, window.devicePixelRatio || 1)) : 1;
   if (lod === "chrome") return 1;
   if (lod === "bar") return 1;
-  const eff = viewK * monitorDpr;
-  if (eff >= 1.4) return Math.min(2, Math.max(1, Math.ceil(monitorDpr)));
+  const eff = viewK * renderDpr;
+  if (eff >= 5.6) return 8;
+  if (eff >= 2.8) return 4;
+  if (eff >= 1.4) return 2;
   if (eff >= 0.7) return 1;
   return 0.5;
 }
@@ -311,13 +319,14 @@ const MAX_TEXTURE_CACHE_FULL = 400;
 
 function maxTextureCacheFor(lod: SpriteLOD, dpr: number): number {
   if (lod === "bar") return MAX_TEXTURE_CACHE_BAR;
-  // The full-LOD cap was tuned for DPR-2 textures; lower-DPR buckets
-  // cost dpr²-proportionally less memory, so let the cache hold
-  // proportionally more of them (bounded by the bar cap so object
-  // count stays sane).
+  // The full-LOD cap was tuned for DPR-2 textures; other buckets cost
+  // dpr²-proportionally more/less memory, so scale the entry count
+  // inversely (bounded by the bar cap so object count stays sane,
+  // floored so the handful of nodes visible at deep zoom — where the
+  // high-DPR buckets apply — never starves the build queue).
   return Math.min(
     MAX_TEXTURE_CACHE_BAR,
-    Math.round(MAX_TEXTURE_CACHE_FULL * (2 / dpr) ** 2),
+    Math.max(32, Math.round(MAX_TEXTURE_CACHE_FULL * (2 / dpr) ** 2)),
   );
 }
 
