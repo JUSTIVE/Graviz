@@ -1844,6 +1844,9 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
    * which keeps the cost bounded on huge schemas.
    */
   const EDGE_HOVER_PX = 6;
+  // Reused between calls — hitTestEdge runs per mousemove and a fresh
+  // Set allocation per event is avoidable garbage.
+  const seenEdgesRef = useRef(new Set<LaidEdge>());
   const hitTestEdge = (worldX: number, worldY: number): LaidEdge | null => {
     const v = viewRef.current;
     const thresholdWorld = EDGE_HOVER_PX / v.k;
@@ -1852,7 +1855,8 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     const trow = Math.floor(worldY / TILE_SIZE);
     let best: LaidEdge | null = null;
     let bestD = threshSq;
-    const seen = new Set<LaidEdge>();
+    const seen = seenEdgesRef.current;
+    seen.clear();
     for (let dc = -1; dc <= 1; dc++) {
       for (let dr = -1; dr <= 1; dr++) {
         const tile = edgeTilesRef.current.get(`${tcol + dc},${trow + dr}`);

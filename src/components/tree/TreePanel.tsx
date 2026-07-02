@@ -4,7 +4,7 @@ import { KIND_STYLES } from "@/components/graph/node-style";
 import { Badge } from "@/components/ui/badge";
 import { useSchema } from "@/lib/schema-context";
 import type { GraphNodeData, NodeKind } from "@/lib/sdl-to-graph";
-import { tooltipStyle } from "@/lib/tooltip-pos";
+import { applyTooltipStyle, tooltipStyle } from "@/lib/tooltip-pos";
 import { ColoredType } from "@/lib/type-colors";
 import { cn } from "@/lib/utils";
 
@@ -1082,7 +1082,15 @@ function FieldRow({
   onPin?: () => void;
 }) {
   const [hovered, setHovered] = useState(false);
-  const [tipPos, setTipPos] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  // Tooltip position lives in a ref + direct DOM style writes so a
+  // mousemove over the row doesn't re-render the row per event; only
+  // hover enter/leave (which mounts/unmounts the tooltip) uses state.
+  const tipPosRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  const tipElRef = useRef<HTMLDivElement | null>(null);
+  const moveTip = (x: number, y: number) => {
+    tipPosRef.current = { x, y };
+    if (tipElRef.current) applyTooltipStyle(tipElRef.current, x, y);
+  };
   const requiredArgCount = args?.filter((a) => a.type.endsWith("!")).length ?? 0;
   const hasArgs = (args?.length ?? 0) > 0;
 
@@ -1092,8 +1100,9 @@ function FieldRow({
   // colored type segments rather than plain text.
   const tooltipEl = hovered ? (
     <div
+      ref={tipElRef}
       className="pointer-events-none fixed z-50 whitespace-nowrap rounded-lg border border-border bg-popover/95 px-3 py-2 font-mono text-xs text-popover-foreground shadow-lg backdrop-blur"
-      style={tooltipStyle(tipPos.x, tipPos.y)}
+      style={tooltipStyle(tipPosRef.current.x, tipPosRef.current.y)}
     >
       <span className="font-semibold">{label}</span>
       {chain.length > 0 && (
@@ -1188,9 +1197,9 @@ function FieldRow({
       className={cn("flex w-full cursor-pointer flex-col gap-0.5 rounded px-2 py-1 hover:bg-secondary/60", isDeprecated && "opacity-60")}
       onMouseEnter={(ev) => {
         setHovered(true);
-        setTipPos({ x: ev.clientX, y: ev.clientY });
+        moveTip(ev.clientX, ev.clientY);
       }}
-      onMouseMove={(ev) => setTipPos({ x: ev.clientX, y: ev.clientY })}
+      onMouseMove={(ev) => moveTip(ev.clientX, ev.clientY)}
       onMouseLeave={() => setHovered(false)}
       onClick={() => onPin?.()}
     >
