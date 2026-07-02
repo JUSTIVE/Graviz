@@ -161,10 +161,12 @@ test.describe("Canvas LOD refresh on long-distance navigation", () => {
     // left newly-in-view sprites stranded on their per-kind
     // placeholder textures because the sweep only re-ran on
     // explicit view-move events.
+    // Keys are `${id}:${lod}:${dprBucket}` — GraphQL type names can't
+    // contain ":", so the id is everything before the first colon.
     const cachedFullIds = new Set(
       after.textureKeys
-        .filter((k) => k.endsWith(":full"))
-        .map((k) => k.slice(0, k.length - ":full".length)),
+        .filter((k) => k.includes(":full:"))
+        .map((k) => k.slice(0, k.indexOf(":"))),
     );
 
     const inViewWithSprite = after.inView.filter((id) =>
@@ -242,8 +244,8 @@ test.describe("Canvas LOD refresh on long-distance navigation", () => {
     expect(after.lod).toBe("full");
     expect(after.focusId).toBe(target);
     expect(
-      after.keys,
+      after.keys.some((k) => k.startsWith(`${target}:full:`)),
       `texture cache missing focused node. sprites=${after.sprites.length}, keys=${after.keys.length}, lod=${after.lod}`,
-    ).toContain(`${target}:full`);
+    ).toBe(true);
   });
 });

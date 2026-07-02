@@ -237,14 +237,23 @@ const BAR_TYPE_FRACS = [0.24, 0.30, 0.20, 0.27, 0.22, 0.28];
 // 500 MB even on desktop; at bar DPR=2 a 1,400-sprite schema plus
 // framebuffer and internal Pixi state overruns that on an active
 // pan and the renderer process dies ("Aw, Snap!"). Bar LOD is just
-// fake-bar hints, DPR 1 is indistinguishable at zoom. Full LOD gets
-// DPR 2 so text is still crisp for zoomed-in inspection.
-function spriteDprForLod(lod: SpriteLOD): number {
+// fake-bar hints, DPR 1 is indistinguishable at zoom.
+//
+// Full LOD scales with the actual zoom: a node displayed at k×w CSS
+// px only needs ~k×monitorDpr texels per world px, so building at a
+// flat DPR 2 while zoomed to k=0.1 oversamples ~20×. Bucketed to
+// {0.5, 1, cap-2} so ordinary zoom jitter doesn't re-key textures;
+// crossing a bucket boundary rebuilds visible textures, same
+// tradeoff as a LOD tier crossing.
+function spriteDprForLod(lod: SpriteLOD, viewK: number): number {
   const monitorDpr =
     typeof window !== "undefined" ? Math.max(1, window.devicePixelRatio || 1) : 1;
   if (lod === "chrome") return 1;
   if (lod === "bar") return 1;
-  return Math.min(2, Math.max(1, Math.ceil(monitorDpr)));
+  const eff = viewK * monitorDpr;
+  if (eff >= 1.4) return Math.min(2, Math.max(1, Math.ceil(monitorDpr)));
+  if (eff >= 0.7) return 1;
+  return 0.5;
 }
 
 // Probe WebGL `MAX_TEXTURE_SIZE` once so we can cap per-node textures
@@ -302,8 +311,16 @@ function fitDprToMaxTexture(w: number, h: number, dpr: number): number {
 const MAX_TEXTURE_CACHE_BAR = 1600;
 const MAX_TEXTURE_CACHE_FULL = 400;
 
-function maxTextureCacheFor(lod: SpriteLOD): number {
-  return lod === "bar" ? MAX_TEXTURE_CACHE_BAR : MAX_TEXTURE_CACHE_FULL;
+function maxTextureCacheFor(lod: SpriteLOD, dpr: number): number {
+  if (lod === "bar") return MAX_TEXTURE_CACHE_BAR;
+  // The full-LOD cap was tuned for DPR-2 textures; lower-DPR buckets
+  // cost dpr²-proportionally less memory, so let the cache hold
+  // proportionally more of them (bounded by the bar cap so object
+  // count stays sane).
+  return Math.min(
+    MAX_TEXTURE_CACHE_BAR,
+    Math.round(MAX_TEXTURE_CACHE_FULL * (2 / dpr) ** 2),
+  );
 }
 
 function getComputedCssVar(name: string, fallback: string): string {
@@ -2874,7 +2891,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
           const nodeContainer = scene.nodeContainer;
           const spriteCtx = spriteCtxRef.current;
           const lod = currentLodRef.current;
-          const dpr = spriteDprForLod(lod);
+          const dpr = spriteDprForLod(lod, v.k);
           spriteDprRef.current = dpr;
 
           const prev = lastSpriteSweepViewRef.current;
@@ -2980,8 +2997,8 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
                   continue;
                 }
                 const effLod: SpriteLOD = forceFull ? "full" : lod;
-                const effDpr = forceFull ? spriteDprForLod("full") : dpr;
-                const key = `${id}:${effLod}`;
+                const effDpr = forceFull ? spriteDprForLod("full", v.k) : dpr;
+                const key = `${id}:${effLod}:${effDpr}`;
                 const cachedTex = textureCacheRef.current.get(key);
                 if (cachedTex) {
                   if (sprite.texture !== cachedTex) {
@@ -3081,11 +3098,11 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
           performance.now() - lastViewChangeAtRef.current >= MOTION_SETTLE_MS;
         if (buildQ && buildQ.nodes.length > 0 && motionStable) {
           const deadline = performance.now() + (focusJumping ? 30 : 4);
-          const lodCap = maxTextureCacheFor(buildQ.lod);
+          const lodCap = maxTextureCacheFor(buildQ.lod, buildQ.dpr);
           while (buildQ.nodes.length > 0 && performance.now() < deadline) {
             if (textureCacheRef.current.size >= lodCap) break;
             const n = buildQ.nodes.pop()!;
-            const key = `${n.id}:${buildQ.lod}`;
+            const key = `${n.id}:${buildQ.lod}:${buildQ.dpr}`;
             if (textureCacheRef.current.has(key)) continue;
 
             const drawDpr = fitDprToMaxTexture(n.w, n.h, buildQ.dpr);
@@ -3113,12 +3130,12 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
           }
           if (buildQ.nodes.length === 0) {
             // Drain complete: every sprite currently in view has a
-            // texture for `buildQ.lod`. Any cached texture keyed to a
-            // different LOD is unused by live sprites, so release it
-            // to cap GPU memory during LOD zigzags (zoom-in, zoom-out,
-            // zoom-in again without pause). The viewport sweep handles
-            // the orthogonal case — sprites that stayed off-screen.
-            const keepSuffix = `:${buildQ.lod}`;
+            // texture for `buildQ.lod` at `buildQ.dpr`. Any cached
+            // texture keyed to a different LOD or DPR bucket is unused
+            // by live sprites, so release it to cap GPU memory during
+            // LOD/zoom zigzags. The viewport sweep handles the
+            // orthogonal case — sprites that stayed off-screen.
+            const keepSuffix = `:${buildQ.lod}:${buildQ.dpr}`;
             const toDelete: string[] = [];
             for (const key of textureCacheRef.current.keys()) {
               if (!key.endsWith(keepSuffix)) toDelete.push(key);
