@@ -85,7 +85,7 @@ async function navigateToView(page: Page) {
 test.describe("Show-descriptions toggle on the graph", () => {
   test.setTimeout(240_000);
 
-  test("toggling expands rowH / headerH on every laid node", async ({
+  test("toggling collapses rowH / headerH on every laid node", async ({
     page,
   }) => {
     await navigateToView(page);
@@ -93,10 +93,11 @@ test.describe("Show-descriptions toggle on the graph", () => {
 
     const before = await readDimensions(page);
     expect(before.length).toBeGreaterThan(0);
-    // Sanity: every node starts at the base ROW_H (14) and HEADER_H (42).
+    // Sanity: "Show descriptions" is ON by default, so every node
+    // starts at the with-description ROW_H (26) and HEADER_H (56).
     for (const n of before) {
-      expect(n.rowH).toBe(14);
-      expect(n.headerH).toBe(42);
+      expect(n.rowH).toBe(26);
+      expect(n.headerH).toBe(56);
     }
     const baseHeights = new Map(before.map((n) => [n.id, n.h]));
 
@@ -119,32 +120,32 @@ test.describe("Show-descriptions toggle on the graph", () => {
 
     const after = await readDimensions(page);
     expect(after.length).toBeGreaterThan(0);
-    // Every node should now carry the with-description row + header heights.
+    // Every node should now carry the base (no-description) heights.
     for (const n of after) {
-      expect(n.rowH).toBe(26);
-      expect(n.headerH).toBe(56);
+      expect(n.rowH).toBe(14);
+      expect(n.headerH).toBe(42);
     }
     // And the total card height of every body-bearing node should
-    // be strictly larger than before (or equal for empty Scalars,
-    // which have no rows to grow).
-    let anyTaller = false;
+    // be strictly smaller than before (or equal for empty Scalars,
+    // which have no rows to shrink).
+    let anySmaller = false;
     for (const n of after) {
       const prevH = baseHeights.get(n.id);
       if (prevH == null) continue;
-      expect(n.h).toBeGreaterThanOrEqual(prevH);
-      if (n.h > prevH) anyTaller = true;
+      expect(n.h).toBeLessThanOrEqual(prevH);
+      if (n.h < prevH) anySmaller = true;
     }
-    expect(anyTaller).toBe(true);
+    expect(anySmaller).toBe(true);
   });
 
-  test("toggling back collapses rowH / headerH to the base sizes", async ({
+  test("toggling twice restores rowH / headerH to the default sizes", async ({
     page,
   }) => {
     await navigateToView(page);
     await page.waitForTimeout(2_000);
     const toggle = page.getByRole("button", { name: /Show descriptions/i });
 
-    // Toggle ON
+    // Toggle OFF (descriptions are on by default)
     await toggle.click({ timeout: 10_000, force: true });
     await page
       .getByText(/Laying out/i)
@@ -153,7 +154,7 @@ test.describe("Show-descriptions toggle on the graph", () => {
       .catch(() => {});
     await page.waitForTimeout(1_000);
 
-    // Toggle OFF
+    // Toggle back ON
     await toggle.click({ timeout: 10_000, force: true });
     await page
       .getByText(/Laying out/i)
@@ -165,8 +166,8 @@ test.describe("Show-descriptions toggle on the graph", () => {
     const dims = await readDimensions(page);
     expect(dims.length).toBeGreaterThan(0);
     for (const n of dims) {
-      expect(n.rowH).toBe(14);
-      expect(n.headerH).toBe(42);
+      expect(n.rowH).toBe(26);
+      expect(n.headerH).toBe(56);
     }
   });
 });
