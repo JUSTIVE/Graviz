@@ -34,8 +34,7 @@ import {
  *   Application.stage
  *    ├── gridTiling (TilingSprite) — dot grid, screen-space
  *    └── world (Container) — pan/zoom transform
- *         ├── edgeTileContainer (Container) — batched per-tile edge Graphics
- *         ├── arrowTileContainer (Container) — batched per-tile arrow Graphics
+ *         ├── edgeTileContainer (Container) — batched per-tile edge+arrow Graphics
  *         ├── nodeContainer (Container) — one Sprite per node
  *         ├── hoverGraphics (Graphics) — field row highlight
  *         └── focusGraphics (Graphics) — focus ring + hover ring
@@ -169,7 +168,6 @@ interface EdgeTile {
    *  Each Graphics has bounded vertex count so a single tile never
    *  uploads a multi-MB vertex buffer in one frame. */
   edgeBatches: Graphics[];
-  arrowBatches: Graphics[];
   /** Number of batches built so far. The remaining batches are
    *  appended progressively across subsequent frames. */
   builtBatches: number;
@@ -880,14 +878,19 @@ function edgeGroupIndex(e: LaidEdge): number {
  * per sub-batch so no individual Graphics ever holds more than
  * EDGES_PER_BATCH worth of geometry — the GPU then never sees a
  * single multi-megabyte vertex upload.
+ *
+ * Edge strokes and arrowhead fills share one Graphics (arrows drawn
+ * after strokes within the batch). This halves the scene-graph object
+ * count vs the old separate arrow layer; the tradeoff is that the
+ * "arrows above all edges" guarantee now only holds within a batch,
+ * which is imperceptible at DIM/hub alpha levels.
  */
 function buildEdgeBatchGraphics(
   slice: LaidEdge[],
   group: { colorHex: number; alphaScale: number },
   alpha: number,
-): { edge: Graphics; arrow: Graphics } {
-  const edge = new Graphics();
-  const arrow = new Graphics();
+): Graphics {
+  const g = new Graphics();
   const colorHex = group.colorHex;
   const effAlpha = alpha * group.alphaScale;
 
@@ -904,24 +907,24 @@ function buildEdgeBatchGraphics(
   }
 
   if (normal.length > 0) {
-    edge.beginPath();
-    for (const e of normal) drawSolidBezierEdge(edge, e);
-    edge.stroke({ width: STROKE_W, color: colorHex, alpha: effAlpha });
-    arrow.beginPath();
-    for (const e of normal) drawArrowHead(arrow, e);
-    arrow.fill({ color: colorHex, alpha: effAlpha });
+    g.beginPath();
+    for (const e of normal) drawSolidBezierEdge(g, e);
+    g.stroke({ width: STROKE_W, color: colorHex, alpha: effAlpha });
+    g.beginPath();
+    for (const e of normal) drawArrowHead(g, e);
+    g.fill({ color: colorHex, alpha: effAlpha });
   }
   if (faded.length > 0) {
     const fadeAlpha = effAlpha * HUB_FADE_ALPHA;
-    edge.beginPath();
-    for (const e of faded) drawSolidBezierEdge(edge, e);
-    edge.stroke({ width: STROKE_W, color: colorHex, alpha: fadeAlpha });
-    arrow.beginPath();
-    for (const e of faded) drawArrowHead(arrow, e);
-    arrow.fill({ color: colorHex, alpha: fadeAlpha });
+    g.beginPath();
+    for (const e of faded) drawSolidBezierEdge(g, e);
+    g.stroke({ width: STROKE_W, color: colorHex, alpha: fadeAlpha });
+    g.beginPath();
+    for (const e of faded) drawArrowHead(g, e);
+    g.fill({ color: colorHex, alpha: fadeAlpha });
   }
 
-  return { edge, arrow };
+  return g;
 }
 
 /**
@@ -946,7 +949,7 @@ function plannedBatchCount(tile: EdgeTile): number {
 function buildEdgeTileBatch(
   tile: EdgeTile,
   batchIdx: number,
-): { edge: Graphics; arrow: Graphics } | null {
+): Graphics | null {
   let idx = batchIdx;
   for (let gi = 0; gi < EDGE_GROUP_DEFS.length; gi++) {
     const list = tile.groupLists[gi];
@@ -1203,9 +1206,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     gridTiling: TilingSprite | null;
     world: Container | null;
     edgeTileContainer: Container | null;
-    arrowTileContainer: Container | null;
     activeEdgeContainer: Container | null;
-    activeArrowContainer: Container | null;
     focusEdgeGraphics: Graphics | null;
     hoverEdgeGraphics: Graphics | null;
     nodeContainer: Container | null;
@@ -1217,9 +1218,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     gridTiling: null,
     world: null,
     edgeTileContainer: null,
-    arrowTileContainer: null,
     activeEdgeContainer: null,
-    activeArrowContainer: null,
     focusEdgeGraphics: null,
     hoverEdgeGraphics: null,
     nodeContainer: null,
@@ -2472,13 +2471,11 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       world.cullable = true;
 
       const edgeTileContainer = new Container();
-      const arrowTileContainer = new Container();
       // Full-alpha copies of the currently-"active" (focused) edges.
       // The tile containers get dimmed wholesale via alpha when a
       // focus is set, and the few active edges are redrawn here on
       // top — so focus changes never rebuild tile geometry.
       const activeEdgeContainer = new Container();
-      const activeArrowContainer = new Container();
       const focusEdgeGraphics = new Graphics();
       const hoverEdgeGraphics = new Graphics();
       const nodeContainer = new Container();
@@ -2489,9 +2486,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       const focusGraphics = new Graphics();
 
       world.addChild(edgeTileContainer);
-      world.addChild(arrowTileContainer);
       world.addChild(activeEdgeContainer);
-      world.addChild(activeArrowContainer);
       // Focused-edge bold stroke sits above the edge tiles so the
       // selected line reads thicker than its neighbors. Hover overlay
       // goes on top of focus so hovering still paints the brighter
@@ -2521,9 +2516,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         gridTiling,
         world,
         edgeTileContainer,
-        arrowTileContainer,
         activeEdgeContainer,
-        activeArrowContainer,
         focusEdgeGraphics,
         hoverEdgeGraphics,
         nodeContainer,
@@ -2745,7 +2738,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         // vertex budgets on low-end devices.
         frameCounterRef.current++;
         const tiles = edgeTilesRef.current;
-        if (tiles.size > 0 && scene.edgeTileContainer && scene.arrowTileContainer) {
+        if (tiles.size > 0 && scene.edgeTileContainer) {
           const viewMinX = -v.x / v.k - TILE_VIEW_PADDING;
           const viewMinY = -v.y / v.k - TILE_VIEW_PADDING;
           const viewMaxX = (sw - v.x) / v.k + TILE_VIEW_PADDING;
@@ -2799,24 +2792,18 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
                 tile.builtBatches += 1;
                 batchesBuiltThisFrame += 1;
                 if (!built) continue;
-                tile.edgeBatches.push(built.edge);
-                tile.arrowBatches.push(built.arrow);
-                scene.edgeTileContainer.addChild(built.edge);
-                scene.arrowTileContainer.addChild(built.arrow);
+                tile.edgeBatches.push(built);
+                scene.edgeTileContainer.addChild(built);
               }
               for (const g of tile.edgeBatches) g.visible = true;
-              for (const g of tile.arrowBatches) g.visible = true;
             } else {
               for (const g of tile.edgeBatches) g.visible = false;
-              for (const g of tile.arrowBatches) g.visible = false;
               if (
                 tile.edgeBatches.length > 0 &&
                 frame - tile.lastSeenFrame > TILE_EVICT_FRAMES
               ) {
                 for (const g of tile.edgeBatches) g.destroy();
-                for (const g of tile.arrowBatches) g.destroy();
                 tile.edgeBatches = [];
-                tile.arrowBatches = [];
                 tile.builtBatches = 0;
                 // Mark for re-planning on next visibility — the group
                 // lists could change before the tile comes back into
@@ -3263,10 +3250,8 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         gridTiling: null,
         world: null,
         edgeTileContainer: null,
-        arrowTileContainer: null,
-        activeEdgeContainer: null,
-        activeArrowContainer: null,
-        focusEdgeGraphics: null,
+            activeEdgeContainer: null,
+            focusEdgeGraphics: null,
         hoverEdgeGraphics: null,
         nodeContainer: null,
         investigateOverlay: null,
@@ -3428,17 +3413,15 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   // so navigating never destroys and re-tessellates tile Graphics.
   useEffect(() => {
     const scene = sceneRef.current;
-    if (!scene.edgeTileContainer || !scene.arrowTileContainer) return;
+    if (!scene.edgeTileContainer) return;
 
     // Drop old tile Graphics. New grouping means existing vertex
     // buffers are invalid.
     for (const tile of edgeTilesRef.current.values()) {
       for (const g of tile.edgeBatches) g.destroy();
-      for (const g of tile.arrowBatches) g.destroy();
     }
     edgeTilesRef.current.clear();
     scene.edgeTileContainer.removeChildren();
-    scene.arrowTileContainer.removeChildren();
 
     const lod = currentLodRef.current;
     if (lod === "chrome") return;
@@ -3459,7 +3442,6 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
               row: r,
               groupLists: EDGE_GROUP_DEFS.map(() => []),
               edgeBatches: [],
-              arrowBatches: [],
               builtBatches: 0,
               totalBatches: -1,
               lastSeenFrame: 0,
@@ -3490,19 +3472,12 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   // change.
   useEffect(() => {
     const scene = sceneRef.current;
-    if (
-      !scene.edgeTileContainer ||
-      !scene.arrowTileContainer ||
-      !scene.activeEdgeContainer ||
-      !scene.activeArrowContainer
-    ) return;
+    if (!scene.edgeTileContainer || !scene.activeEdgeContainer) return;
 
     const dimming = edgeGroups.groups.some((g) => g.dim.length > 0);
     scene.edgeTileContainer.alpha = dimming ? DIM_ALPHA : 1;
-    scene.arrowTileContainer.alpha = dimming ? DIM_ALPHA : 1;
 
     for (const c of scene.activeEdgeContainer.removeChildren()) c.destroy();
-    for (const c of scene.activeArrowContainer.removeChildren()) c.destroy();
     if (!dimming) return;
 
     for (const g of edgeGroups.groups) {
@@ -3512,8 +3487,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
           g,
           1,
         );
-        scene.activeEdgeContainer.addChild(built.edge);
-        scene.activeArrowContainer.addChild(built.arrow);
+        scene.activeEdgeContainer.addChild(built);
       }
     }
   }, [edgeGroups]);
@@ -3522,12 +3496,10 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   // the root tile containers — no per-tile destroy/rebuild needed.
   useEffect(() => {
     const scene = sceneRef.current;
-    if (!scene.edgeTileContainer || !scene.arrowTileContainer) return;
+    if (!scene.edgeTileContainer) return;
     const show = currentLodRef.current !== "chrome";
     scene.edgeTileContainer.visible = show;
-    scene.arrowTileContainer.visible = show;
     if (scene.activeEdgeContainer) scene.activeEdgeContainer.visible = show;
-    if (scene.activeArrowContainer) scene.activeArrowContainer.visible = show;
   }, [lodTick]);
 
   // Effect A: sprite lifecycle reset. Runs only when the node set or
