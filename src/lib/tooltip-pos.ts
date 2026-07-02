@@ -24,3 +24,17 @@ export function tooltipStyle(clientX: number, clientY: number): CSSProperties {
     maxWidth: `calc(100vw - ${EDGE * 2}px)`,
   };
 }
+
+/**
+ * Imperative variant of `tooltipStyle` — mutates the element's inline
+ * style directly so a mousemove can reposition an already-mounted
+ * tooltip without going through a React state update (and thus a
+ * re-render of the owning component on every pointer move).
+ */
+export function applyTooltipStyle(el: HTMLElement, clientX: number, clientY: number): void {
+  const s = tooltipStyle(clientX, clientY);
+  el.style.left = s.left != null ? `${s.left}px` : "";
+  el.style.right = s.right != null ? `${s.right}px` : "";
+  el.style.top = s.top != null ? `${s.top}px` : "";
+  el.style.bottom = s.bottom != null ? `${s.bottom}px` : "";
+}

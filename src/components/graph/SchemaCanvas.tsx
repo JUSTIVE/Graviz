@@ -11,7 +11,7 @@ import {
 import type { GraphEdgeData, GraphNodeData, NodeKind } from "@/lib/sdl-to-graph";
 import { useSchema } from "@/lib/schema-context";
 import { useTheme } from "@/lib/theme";
-import { tooltipStyle } from "@/lib/tooltip-pos";
+import { applyTooltipStyle, tooltipStyle } from "@/lib/tooltip-pos";
 import { cn } from "@/lib/utils";
 import {
   HEADER_H,
@@ -155,16 +155,16 @@ const SPRITE_EVICT_FRAMES = 180;
 // we resume progressive builds.
 const MOTION_SETTLE_MS = 150;
 
-interface EdgeTileGroupLists {
-  dim: LaidEdge[];
-  active: LaidEdge[];
-}
-
 interface EdgeTile {
   key: string;
   col: number;
   row: number;
-  groupLists: EdgeTileGroupLists[];
+  /** Per-group edge lists (indexed like EDGE_GROUP_DEFS). Deliberately
+   *  independent of the focus dim/active partition — tiles are static
+   *  geometry built once per layout, and focus dimming is applied via
+   *  container alpha + a separate active-edge overlay so navigating
+   *  never re-tessellates the whole edge set. */
+  groupLists: LaidEdge[][];
   /** Edge Graphics broken into ≤ EDGES_PER_BATCH-edge sub-batches.
    *  Each Graphics has bounded vertex count so a single tile never
    *  uploads a multi-MB vertex buffer in one frame. */
@@ -312,7 +312,21 @@ function getComputedCssVar(name: string, fallback: string): string {
   return val || fallback;
 }
 
+// Memoized by input string — the ticker asks for the same handful of
+// colors every frame, and the hsl()/rgb() fallback below allocates a
+// canvas + getImageData per call, which is far too expensive to run
+// per frame.
+const cssColorHexCache = new Map<string, number>();
+
 function cssColorToHex(color: string): number {
+  const cached = cssColorHexCache.get(color);
+  if (cached !== undefined) return cached;
+  const hex = computeCssColorHex(color);
+  cssColorHexCache.set(color, hex);
+  return hex;
+}
+
+function computeCssColorHex(color: string): number {
   // Handle #rrggbb
   if (color.startsWith("#") && color.length === 7) {
     return parseInt(color.slice(1), 16);
@@ -795,6 +809,31 @@ function drawSolidBezierEdge(g: Graphics, edge: LaidEdge) {
 const DIM_ALPHA = 0.1;
 const STROKE_W = 1.4;
 
+// Static edge-group definitions. Groups that were previously dashed
+// get a reduced alphaScale (~0.55) so they read as "softer" /
+// secondary against the solid groups — visually mirrors the old
+// dashed-vs-solid contrast without per-dash vertex spam in Pixi.
+interface EdgeGroupDef {
+  color: string;
+  colorHex: number;
+  alphaScale: number;
+}
+const EDGE_GROUP_DEFS: EdgeGroupDef[] = [
+  { color: "#3b82f6", colorHex: 0x3b82f6, alphaScale: 1 },    // [0] non-null field — solid blue
+  { color: "#3b82f6", colorHex: 0x3b82f6, alphaScale: 0.45 }, // [1] nullable field — soft blue
+  { color: "#eab308", colorHex: 0xeab308, alphaScale: 1 },    // [2] union member — solid amber
+  { color: "#8b5cf6", colorHex: 0x8b5cf6, alphaScale: 0.55 }, // [3] implements — soft violet
+  { color: "#f97316", colorHex: 0xf97316, alphaScale: 0.55 }, // [4] arg — soft orange
+];
+
+function edgeGroupIndex(e: LaidEdge): number {
+  if (e.kind === "implements") return 3;
+  if (e.kind === "union") return 2;
+  if (e.kind === "arg") return 4;
+  if (e.kind === "field" && e.nullable) return 1;
+  return 0;
+}
+
 /**
  * Build a single batch Graphics for a slice of edges belonging to one
  * group (same color + alphaScale). Tile-build code calls this once
@@ -804,7 +843,7 @@ const STROKE_W = 1.4;
  */
 function buildEdgeBatchGraphics(
   slice: LaidEdge[],
-  group: EdgeGroupSpec,
+  group: { colorHex: number; alphaScale: number },
   alpha: number,
 ): { edge: Graphics; arrow: Graphics } {
   const edge = new Graphics();
@@ -847,18 +886,12 @@ function buildEdgeBatchGraphics(
 
 /**
  * Total number of batches the tile will produce when fully built.
- * Each group contributes ⌈dim/N⌉ + ⌈active/N⌉ batches.
+ * Each group contributes ⌈edges/N⌉ batches.
  */
-function plannedBatchCount(
-  tile: EdgeTile,
-  groups: EdgeGroupSpec[],
-): number {
+function plannedBatchCount(tile: EdgeTile): number {
   let total = 0;
-  for (let gi = 0; gi < groups.length; gi++) {
-    const lists = tile.groupLists[gi];
-    if (!lists) continue;
-    total += Math.ceil(lists.dim.length / EDGES_PER_BATCH);
-    total += Math.ceil(lists.active.length / EDGES_PER_BATCH);
+  for (const list of tile.groupLists) {
+    total += Math.ceil(list.length / EDGES_PER_BATCH);
   }
   return total;
 }
@@ -866,34 +899,25 @@ function plannedBatchCount(
 /**
  * Build the `batchIdx`-th batch of the tile. Returns null when the
  * index is past the tile's planned batches (defensive — the caller
- * should already be gating on `totalBatches`).
+ * should already be gating on `totalBatches`). Tiles are always built
+ * at full (non-dim) alpha; focus dimming is applied wholesale via the
+ * tile containers' alpha so it never invalidates tile geometry.
  */
 function buildEdgeTileBatch(
   tile: EdgeTile,
-  groups: EdgeGroupSpec[],
   batchIdx: number,
 ): { edge: Graphics; arrow: Graphics } | null {
   let idx = batchIdx;
-  for (let gi = 0; gi < groups.length; gi++) {
-    const group = groups[gi]!;
-    const lists = tile.groupLists[gi];
-    if (!lists) continue;
-
-    const dimBatches = Math.ceil(lists.dim.length / EDGES_PER_BATCH);
-    if (idx < dimBatches) {
+  for (let gi = 0; gi < EDGE_GROUP_DEFS.length; gi++) {
+    const list = tile.groupLists[gi];
+    if (!list) continue;
+    const batches = Math.ceil(list.length / EDGES_PER_BATCH);
+    if (idx < batches) {
       const start = idx * EDGES_PER_BATCH;
-      const end = Math.min(start + EDGES_PER_BATCH, lists.dim.length);
-      return buildEdgeBatchGraphics(lists.dim.slice(start, end), group, DIM_ALPHA);
+      const end = Math.min(start + EDGES_PER_BATCH, list.length);
+      return buildEdgeBatchGraphics(list.slice(start, end), EDGE_GROUP_DEFS[gi]!, 1);
     }
-    idx -= dimBatches;
-
-    const activeBatches = Math.ceil(lists.active.length / EDGES_PER_BATCH);
-    if (idx < activeBatches) {
-      const start = idx * EDGES_PER_BATCH;
-      const end = Math.min(start + EDGES_PER_BATCH, lists.active.length);
-      return buildEdgeBatchGraphics(lists.active.slice(start, end), group, 1);
-    }
-    idx -= activeBatches;
+    idx -= batches;
   }
   return null;
 }
@@ -989,7 +1013,17 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   const [clickHistory, setClickHistory] = useState<HistoryItem[]>([]);
   const [historyOpen, setHistoryOpen] = useState(true);
   const [hoveredHistoryItem, setHoveredHistoryItem] = useState<HistoryItem | null>(null);
-  const [hoveredHistoryPos, setHoveredHistoryPos] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  // Tooltip positions live in refs (not state) — a mousemove over a
+  // node/edge/history row repositions the already-mounted tooltip DOM
+  // node directly instead of re-rendering this whole component per
+  // pointer event. Only the tooltip *content* (which changes rarely,
+  // on hover-target change) goes through React state.
+  const hoveredHistoryPosRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  const historyTipElRef = useRef<HTMLDivElement | null>(null);
+  const moveHistoryTip = (x: number, y: number) => {
+    hoveredHistoryPosRef.current = { x, y };
+    if (historyTipElRef.current) applyTooltipStyle(historyTipElRef.current, x, y);
+  };
 
   // Investigate mode — when active, only items matching the
   // predicate render at full opacity in orange; everything else
@@ -1080,7 +1114,8 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       ts: Date.now(),
     });
   };
-  const [hoveredEdgeScreen, setHoveredEdgeScreen] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const hoveredEdgeScreenRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  const edgeTipElRef = useRef<HTMLDivElement | null>(null);
   // Node-name tooltip — only rendered at low LODs (bar / chrome)
   // where the sprite no longer paints the type name.
   const hoveredNodeForTipRef = useRef<string | null>(null);
@@ -1088,7 +1123,8 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     name: string;
     kind: NodeKind;
   } | null>(null);
-  const [hoveredNodeScreen, setHoveredNodeScreen] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const hoveredNodeScreenRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  const nodeTipElRef = useRef<HTMLDivElement | null>(null);
   const [cursor, setCursor] = useState<"grab" | "pointer">("grab");
   const { resolved: themeResolved } = useTheme();
   const {
@@ -1125,6 +1161,8 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     world: Container | null;
     edgeTileContainer: Container | null;
     arrowTileContainer: Container | null;
+    activeEdgeContainer: Container | null;
+    activeArrowContainer: Container | null;
     focusEdgeGraphics: Graphics | null;
     hoverEdgeGraphics: Graphics | null;
     nodeContainer: Container | null;
@@ -1137,6 +1175,8 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     world: null,
     edgeTileContainer: null,
     arrowTileContainer: null,
+    activeEdgeContainer: null,
+    activeArrowContainer: null,
     focusEdgeGraphics: null,
     hoverEdgeGraphics: null,
     nodeContainer: null,
@@ -1205,8 +1245,10 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   }
   const spriteBuildQueueRef = useRef<SpriteBuildQueue | null>(null);
 
-  // FPS state for overlay
-  const [fpsDisplay, setFpsDisplay] = useState(0);
+  // FPS overlay — written straight to the DOM from the ticker (like
+  // the chart canvas) so the 200 ms sampling doesn't re-render this
+  // whole component 5×/sec forever.
+  const fpsTextRef = useRef<HTMLSpanElement>(null);
   const fpsHistoryRef = useRef<number[]>(new Array(60).fill(0));
   const chartCanvasRef = useRef<HTMLCanvasElement>(null);
 
@@ -1469,26 +1511,17 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     return { nodeIds, nodeOutline, rowsByNode };
   }, [investigateMode, nodes]);
 
+  // Static per-group edge buckets — depends only on the laid-out edge
+  // set, never on focus state. This is what the edge tiles are built
+  // from, so navigating (focus changes) doesn't invalidate any tile
+  // geometry.
+  const edgeBuckets = useMemo<LaidEdge[][]>(() => {
+    const buckets: LaidEdge[][] = EDGE_GROUP_DEFS.map(() => []);
+    for (const e of laidEdges) buckets[edgeGroupIndex(e)]!.push(e);
+    return buckets;
+  }, [laidEdges]);
+
   const edgeGroups = useMemo((): EdgeGroups => {
-    // Each bucket: [edges, hex string, hex int, alphaScale]. Groups
-    // that were previously dashed get a reduced alphaScale (~0.55) so
-    // they read as "softer" / secondary against the solid groups —
-    // visually mirrors the old dashed-vs-solid contrast without
-    // generating per-dash vertex spam in Pixi.
-    const buckets: [LaidEdge[], string, number, number][] = [
-      [[], "#3b82f6", 0x3b82f6, 1],     // [0] non-null field — solid blue
-      [[], "#3b82f6", 0x3b82f6, 0.45],  // [1] nullable field — soft blue
-      [[], "#eab308", 0xeab308, 1],     // [2] union member — solid amber
-      [[], "#8b5cf6", 0x8b5cf6, 0.55],  // [3] implements — soft violet
-      [[], "#f97316", 0xf97316, 0.55],  // [4] arg — soft orange
-    ];
-    for (const e of laidEdges) {
-      if (e.kind === "implements") buckets[3]![0].push(e);
-      else if (e.kind === "union") buckets[2]![0].push(e);
-      else if (e.kind === "arg") buckets[4]![0].push(e);
-      else if (e.kind === "field" && e.nullable) buckets[1]![0].push(e);
-      else buckets[0]![0].push(e);
-    }
     // Dim mode precedence: an explicit edge selection (click) takes
     // priority over the tree-panel node focus. Both keep the same
     // dim-vs-active partition; only the predicate differs.
@@ -1515,7 +1548,8 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       }
     }
 
-    const groups: EdgeGroupSpec[] = buckets.map(([edgeList, color, colorHex, alphaScale]) => {
+    const groups: EdgeGroupSpec[] = edgeBuckets.map((edgeList, gi) => {
+      const { color, colorHex, alphaScale } = EDGE_GROUP_DEFS[gi]!;
       if (!activePred) return { color, colorHex, alphaScale, dim: [], active: edgeList };
       const pred = activePred;
       return {
@@ -1544,7 +1578,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     }
 
     return { groups, dimNodeIds };
-  }, [laidEdges, laidNodes, focusId, rootId, focusedEdge, investigateMatch]);
+  }, [edgeBuckets, laidEdges, laidNodes, focusId, rootId, focusedEdge, investigateMatch]);
 
   // The focused-edge reference becomes stale when laidEdges rebuilds
   // (new layout / schema change). Clear it so the dim state doesn't
@@ -1769,14 +1803,8 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       for (let dr = -1; dr <= 1; dr++) {
         const tile = edgeTilesRef.current.get(`${tcol + dc},${trow + dr}`);
         if (!tile) continue;
-        for (const lists of tile.groupLists) {
-          for (const e of lists.active) {
-            if (seen.has(e)) continue;
-            seen.add(e);
-            const d = edgeDistSq(worldX, worldY, e);
-            if (d < bestD) { bestD = d; best = e; }
-          }
-          for (const e of lists.dim) {
+        for (const list of tile.groupLists) {
+          for (const e of list) {
             if (seen.has(e)) continue;
             seen.add(e);
             const d = edgeDistSq(worldX, worldY, e);
@@ -2009,7 +2037,10 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       }
     }
     if (hoveredNode) {
-      setHoveredNodeScreen({ x: e.clientX, y: e.clientY });
+      hoveredNodeScreenRef.current = { x: e.clientX, y: e.clientY };
+      if (nodeTipElRef.current) {
+        applyTooltipStyle(nodeTipElRef.current, e.clientX, e.clientY);
+      }
     }
 
     // Edge hover — only check when the cursor isn't already over a
@@ -2031,7 +2062,10 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       }
     }
     if (edge && edge.label) {
-      setHoveredEdgeScreen({ x: e.clientX, y: e.clientY });
+      hoveredEdgeScreenRef.current = { x: e.clientX, y: e.clientY };
+      if (edgeTipElRef.current) {
+        applyTooltipStyle(edgeTipElRef.current, e.clientX, e.clientY);
+      }
     }
   };
 
@@ -2358,6 +2392,12 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
 
       const edgeTileContainer = new Container();
       const arrowTileContainer = new Container();
+      // Full-alpha copies of the currently-"active" (focused) edges.
+      // The tile containers get dimmed wholesale via alpha when a
+      // focus is set, and the few active edges are redrawn here on
+      // top — so focus changes never rebuild tile geometry.
+      const activeEdgeContainer = new Container();
+      const activeArrowContainer = new Container();
       const focusEdgeGraphics = new Graphics();
       const hoverEdgeGraphics = new Graphics();
       const nodeContainer = new Container();
@@ -2369,6 +2409,8 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
 
       world.addChild(edgeTileContainer);
       world.addChild(arrowTileContainer);
+      world.addChild(activeEdgeContainer);
+      world.addChild(activeArrowContainer);
       // Focused-edge bold stroke sits above the edge tiles so the
       // selected line reads thicker than its neighbors. Hover overlay
       // goes on top of focus so hovering still paints the brighter
@@ -2399,6 +2441,8 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         world,
         edgeTileContainer,
         arrowTileContainer,
+        activeEdgeContainer,
+        activeArrowContainer,
         focusEdgeGraphics,
         hoverEdgeGraphics,
         nodeContainer,
@@ -2469,7 +2513,10 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
           if (hoveredField) {
             const n = nodeByIdRef.current.get(hoveredField.nodeId);
             if (n) {
-              const fgHex = cssColorToHex(getComputedCssVar("--foreground", "#0f172a"));
+              // Theme-resolved foreground color, cached per theme change
+              // — calling getComputedStyle here forced a style recalc
+              // every frame while a field was hovered.
+              const fgHex = fgHexRef.current;
               const nodeLeft = n.cx - n.w / 2;
               const nodeTop = n.cy - n.h / 2;
               const bodyTop = n.headerH + TOP_BODY_PAD - 2;
@@ -2592,7 +2639,6 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
           const viewMaxX = (sw - v.x) / v.k + TILE_VIEW_PADDING;
           const viewMaxY = (sh - v.y) / v.k + TILE_VIEW_PADDING;
 
-          const liveGroups = edgeGroupsRef.current.groups;
           const frame = frameCounterRef.current;
           // Cap tile lazy-build time per frame. A zoom-out or sudden
           // pan can pull many tiles into view at once; without this
@@ -2625,7 +2671,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
               // shows up — saves the count work for tiles that never
               // become visible.
               if (tile.totalBatches < 0) {
-                tile.totalBatches = plannedBatchCount(tile, liveGroups);
+                tile.totalBatches = plannedBatchCount(tile);
               }
               // Build outstanding batches under the shared per-frame
               // budget. Each iteration appends one Graphics; partial
@@ -2637,11 +2683,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
                 performance.now() < buildDeadline &&
                 batchesBuiltThisFrame < TILE_BATCH_BUDGET_PER_FRAME
               ) {
-                const built = buildEdgeTileBatch(
-                  tile,
-                  liveGroups,
-                  tile.builtBatches,
-                );
+                const built = buildEdgeTileBatch(tile, tile.builtBatches);
                 tile.builtBatches += 1;
                 batchesBuiltThisFrame += 1;
                 if (!built) continue;
@@ -3022,7 +3064,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         if (now - lastFpsSampleAt >= 200) {
           lastFpsSampleAt = now;
           const fps = fpsTimes.length;
-          setFpsDisplay(fps);
+          if (fpsTextRef.current) fpsTextRef.current.textContent = `${fps} fps`;
           const hist = fpsHistoryRef.current;
           hist.push(fps);
           if (hist.length > 60) hist.shift();
@@ -3061,6 +3103,8 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         world: null,
         edgeTileContainer: null,
         arrowTileContainer: null,
+        activeEdgeContainer: null,
+        activeArrowContainer: null,
         focusEdgeGraphics: null,
         hoverEdgeGraphics: null,
         nodeContainer: null,
@@ -3172,6 +3216,14 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     }
   }, [size]);
 
+  // Ticker-accessible foreground color, refreshed when the theme
+  // changes (and once the app is ready, since the .dark class may
+  // toggle after the first effect pass).
+  const fgHexRef = useRef(0x0f172a);
+  useEffect(() => {
+    fgHexRef.current = cssColorToHex(getComputedCssVar("--foreground", "#0f172a"));
+  }, [themeResolved, appReady]);
+
   // Rebuild dot grid texture when theme changes
   useEffect(() => {
     const scene = sceneRef.current;
@@ -3189,10 +3241,10 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   const edgeGroupsRef = useRef(edgeGroups);
   edgeGroupsRef.current = edgeGroups;
 
-  // Rebuild tile assignments when the edge set or focus-dim state
-  // changes. This only touches the in-memory grouping structure —
-  // Graphics objects themselves are destroyed and recreated lazily by
-  // the ticker as tiles come into view.
+  // Rebuild tile assignments when the edge set changes (new layout /
+  // schema). Focus-dim state is deliberately NOT a dependency — dim is
+  // applied via container alpha and the active overlay effect below,
+  // so navigating never destroys and re-tessellates tile Graphics.
   useEffect(() => {
     const scene = sceneRef.current;
     if (!scene.edgeTileContainer || !scene.arrowTileContainer) return;
@@ -3210,8 +3262,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     const lod = currentLodRef.current;
     if (lod === "chrome") return;
 
-    const groupCount = edgeGroups.groups.length;
-    const assign = (edge: LaidEdge, gi: number, isActive: boolean) => {
+    const assign = (edge: LaidEdge, gi: number) => {
       const minCol = Math.floor(edge.bbox.minX / TILE_SIZE);
       const maxCol = Math.floor(edge.bbox.maxX / TILE_SIZE);
       const minRow = Math.floor(edge.bbox.minY / TILE_SIZE);
@@ -3225,10 +3276,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
               key,
               col: c,
               row: r,
-              groupLists: Array.from({ length: groupCount }, () => ({
-                dim: [],
-                active: [],
-              })),
+              groupLists: EDGE_GROUP_DEFS.map(() => []),
               edgeBatches: [],
               arrowBatches: [],
               builtBatches: 0,
@@ -3237,16 +3285,13 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
             };
             edgeTilesRef.current.set(key, tile);
           }
-          const list = tile.groupLists[gi]!;
-          if (isActive) list.active.push(edge);
-          else list.dim.push(edge);
+          tile.groupLists[gi]!.push(edge);
         }
       }
     };
 
-    edgeGroups.groups.forEach((group, gi) => {
-      for (const e of group.dim) assign(e, gi, false);
-      for (const e of group.active) assign(e, gi, true);
+    edgeBuckets.forEach((list, gi) => {
+      for (const e of list) assign(e, gi);
     });
     // Deliberately omit `lodTick`: rebuilding tile assignments (and
     // destroying all live tile Graphics) on every LOD crossing was the
@@ -3254,7 +3299,43 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     // lazy-rebuild on the next frame. The tile structure is
     // LOD-independent; only the container visibility toggles below
     // react to LOD changes.
-  }, [laidEdges, edgeGroups]);
+  }, [edgeBuckets]);
+
+  // Focus-dim application. Dimming fades the *entire* tile containers
+  // via alpha (no geometry invalidation), then redraws the handful of
+  // active edges at full alpha into the overlay containers on top.
+  // This replaces the old approach of partitioning every tile's edge
+  // list into dim/active and re-tessellating all tiles per focus
+  // change.
+  useEffect(() => {
+    const scene = sceneRef.current;
+    if (
+      !scene.edgeTileContainer ||
+      !scene.arrowTileContainer ||
+      !scene.activeEdgeContainer ||
+      !scene.activeArrowContainer
+    ) return;
+
+    const dimming = edgeGroups.groups.some((g) => g.dim.length > 0);
+    scene.edgeTileContainer.alpha = dimming ? DIM_ALPHA : 1;
+    scene.arrowTileContainer.alpha = dimming ? DIM_ALPHA : 1;
+
+    for (const c of scene.activeEdgeContainer.removeChildren()) c.destroy();
+    for (const c of scene.activeArrowContainer.removeChildren()) c.destroy();
+    if (!dimming) return;
+
+    for (const g of edgeGroups.groups) {
+      for (let i = 0; i < g.active.length; i += EDGES_PER_BATCH) {
+        const built = buildEdgeBatchGraphics(
+          g.active.slice(i, i + EDGES_PER_BATCH),
+          g,
+          1,
+        );
+        scene.activeEdgeContainer.addChild(built.edge);
+        scene.activeArrowContainer.addChild(built.arrow);
+      }
+    }
+  }, [edgeGroups]);
 
   // chrome LOD hides edges entirely. Toggle container visibility on
   // the root tile containers — no per-tile destroy/rebuild needed.
@@ -3264,6 +3345,8 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     const show = currentLodRef.current !== "chrome";
     scene.edgeTileContainer.visible = show;
     scene.arrowTileContainer.visible = show;
+    if (scene.activeEdgeContainer) scene.activeEdgeContainer.visible = show;
+    if (scene.activeArrowContainer) scene.activeArrowContainer.visible = show;
   }, [lodTick]);
 
   // Effect A: sprite lifecycle reset. Runs only when the node set or
@@ -3637,11 +3720,9 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
                         }}
                         onMouseEnter={(ev) => {
                           setHoveredHistoryItem(item);
-                          setHoveredHistoryPos({ x: ev.clientX, y: ev.clientY });
+                          moveHistoryTip(ev.clientX, ev.clientY);
                         }}
-                        onMouseMove={(ev) =>
-                          setHoveredHistoryPos({ x: ev.clientX, y: ev.clientY })
-                        }
+                        onMouseMove={(ev) => moveHistoryTip(ev.clientX, ev.clientY)}
                         onMouseLeave={() => setHoveredHistoryItem(null)}
                         className={cn(
                           "flex min-w-0 flex-1 cursor-pointer items-center gap-2 rounded px-2 py-1 text-left transition-colors hover:brightness-110",
@@ -3677,11 +3758,9 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
                       type="button"
                       onMouseEnter={(ev) => {
                         setHoveredHistoryItem(item);
-                        setHoveredHistoryPos({ x: ev.clientX, y: ev.clientY });
+                        moveHistoryTip(ev.clientX, ev.clientY);
                       }}
-                      onMouseMove={(ev) =>
-                        setHoveredHistoryPos({ x: ev.clientX, y: ev.clientY })
-                      }
+                      onMouseMove={(ev) => moveHistoryTip(ev.clientX, ev.clientY)}
                       onMouseLeave={() => setHoveredHistoryItem(null)}
                       onClick={() => {
                         // Re-locate the edge in the current layout
@@ -3758,8 +3837,9 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         if (item.kind === "node") {
           return (
             <div
+              ref={historyTipElRef}
               className="pointer-events-none fixed z-50 whitespace-nowrap rounded-lg border border-border bg-popover/95 px-3 py-2 font-mono text-xs text-popover-foreground shadow-lg backdrop-blur"
-              style={tooltipStyle(hoveredHistoryPos.x, hoveredHistoryPos.y)}
+              style={tooltipStyle(hoveredHistoryPosRef.current.x, hoveredHistoryPosRef.current.y)}
             >
               <div className="flex items-center gap-2">
                 <span
@@ -3777,8 +3857,9 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         const targetKind = nodeById.get(item.targetId)?.data.kind;
         return (
           <div
+            ref={historyTipElRef}
             className="pointer-events-none fixed z-50 whitespace-nowrap rounded-lg border border-border bg-popover/95 px-3 py-2 font-mono text-xs text-popover-foreground shadow-lg backdrop-blur"
-            style={tooltipStyle(hoveredHistoryPos.x, hoveredHistoryPos.y)}
+            style={tooltipStyle(hoveredHistoryPosRef.current.x, hoveredHistoryPosRef.current.y)}
           >
             <div className="flex items-center gap-2">
               {sourceKind && (
@@ -3824,8 +3905,9 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         const targetKind = nodeById.get(hoveredEdgeInfo.targetId)?.data.kind;
         return (
           <div
+            ref={edgeTipElRef}
             className="pointer-events-none fixed z-50 whitespace-nowrap rounded-lg border border-border bg-popover/95 px-3 py-2 font-mono text-xs text-popover-foreground shadow-lg backdrop-blur"
-            style={tooltipStyle(hoveredEdgeScreen.x, hoveredEdgeScreen.y)}
+            style={tooltipStyle(hoveredEdgeScreenRef.current.x, hoveredEdgeScreenRef.current.y)}
           >
             <div className="flex items-center gap-2">
               {sourceKind && (
@@ -3945,8 +4027,9 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         (currentLodRef.current !== "full" ||
           viewRef.current.k < FIELD_CLICK_MIN_ZOOM) && (
         <div
+          ref={nodeTipElRef}
           className="pointer-events-none fixed z-50 flex items-center gap-1.5 whitespace-nowrap rounded-md border border-border bg-popover px-2 py-1 font-mono text-[11px] text-popover-foreground shadow-md"
-          style={tooltipStyle(hoveredNodeScreen.x, hoveredNodeScreen.y)}
+          style={tooltipStyle(hoveredNodeScreenRef.current.x, hoveredNodeScreenRef.current.y)}
         >
           <span
             className="rounded px-1 py-0 text-[9px] uppercase tracking-wide"
@@ -4022,7 +4105,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
           style={{ width: 260, height: 48, display: "block" }}
         />
         <div className="flex items-baseline justify-between gap-4">
-          <span>{fpsDisplay} fps</span>
+          <span ref={fpsTextRef}>0 fps</span>
           <span>{laidNodes.length} nodes · {laidEdges.length} edges</span>
         </div>
         {lastTiming && (
