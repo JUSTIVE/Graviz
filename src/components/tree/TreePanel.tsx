@@ -969,7 +969,10 @@ function TypeDetail({
       {node.kind === "Enum" ? (
         <ul className="space-y-0.5 font-mono text-xs text-muted-foreground">
           {node.values?.map((v) => (
-            <li key={v.name} className="rounded px-2 py-1">
+            <li
+              key={v.name}
+              className={cn("rounded px-2 py-1", v.isDeprecated && "bg-amber-400/10")}
+            >
               <div className="flex flex-col gap-0.5">
                 <span className={cn("flex items-center gap-1", v.isDeprecated && "text-muted-foreground/60")}>
                   {v.isDeprecated && <TriangleAlert className="h-2.5 w-2.5 shrink-0 text-amber-500/70" />}
@@ -1194,7 +1197,10 @@ function FieldRow({
     <>
     {tooltipEl}
     <div
-      className={cn("flex w-full cursor-pointer flex-col gap-0.5 rounded px-2 py-1 hover:bg-secondary/60", isDeprecated && "opacity-60")}
+      className={cn(
+        "flex w-full cursor-pointer flex-col gap-0.5 rounded px-2 py-1 hover:bg-secondary/60",
+        isDeprecated && "bg-amber-400/10 opacity-60 hover:bg-amber-400/20",
+      )}
       onMouseEnter={(ev) => {
         setHovered(true);
         moveTip(ev.clientX, ev.clientY);
