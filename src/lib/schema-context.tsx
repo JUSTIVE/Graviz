@@ -37,7 +37,13 @@ interface SchemaContextValue {
   setPinnedField: (v: { typeId: string; fieldName: string; fieldIndex: number } | null) => void;
 }
 
-const EMPTY: ParsedGraph = { nodes: [], edges: [], error: null, warnings: [] };
+const EMPTY: ParsedGraph = {
+  nodes: [],
+  edges: [],
+  error: null,
+  warnings: [],
+  rootTypes: { query: null, mutation: null, subscription: null },
+};
 const STORAGE_KEY = "gompassql:current";
 const BUILTIN_SCALARS = new Set(["String", "Int", "Float", "Boolean", "ID"]);
 
@@ -79,18 +85,28 @@ export function SchemaProvider({ children }: { children: React.ReactNode }) {
     [sdl, hideRelayBoilerplate],
   );
 
+  // The schema's resolved root operation types, honoring any
+  // `schema { query: QueryRoot }` override. Ordered query → mutation →
+  // subscription and filtered to roots that actually exist as nodes.
+  const rootCandidates = useMemo(() => {
+    const { query, mutation, subscription } = graph.rootTypes;
+    return [query, mutation, subscription].filter(
+      (c): c is string => c != null && graph.nodes.some((n) => n.id === c),
+    );
+  }, [graph]);
+
+  const rootOps = useMemo(() => new Set(rootCandidates), [rootCandidates]);
+
   const effectiveRoot = useMemo(() => {
     if (rootType && graph.nodes.some((n) => n.id === rootType)) return rootType;
-    const candidates = ["Query", "Mutation", "Subscription"];
-    const found = candidates.find((c) => graph.nodes.some((n) => n.id === c));
-    if (found) return found;
+    if (rootCandidates.length > 0) return rootCandidates[0]!;
     return graph.nodes[0]?.id ?? null;
-  }, [graph, rootType]);
+  }, [graph, rootType, rootCandidates]);
 
   const visible = useMemo(() => {
     if (!effectiveRoot) return { nodes: graph.nodes, edges: graph.edges };
-    return reachableFrom(graph.nodes, graph.edges, effectiveRoot);
-  }, [graph, effectiveRoot]);
+    return reachableFrom(graph.nodes, graph.edges, effectiveRoot, rootOps);
+  }, [graph, effectiveRoot, rootOps]);
 
   const { visibleNodes, visibleEdges } = useMemo(() => {
     if (!hidePrimitiveFields) {
@@ -132,9 +148,9 @@ export function SchemaProvider({ children }: { children: React.ReactNode }) {
     // Use reachability from ALL root operations so that types reachable
     // from Mutation/Subscription don't appear orphaned when root=Query.
     // Falls back to effectiveRoot for schemas without standard root ops.
-    const reachableIds = allReachableIds(graph.nodes, graph.edges);
+    const reachableIds = allReachableIds(graph.nodes, graph.edges, rootOps);
     if (reachableIds.size === 0 && effectiveRoot) {
-      const { nodes: r } = reachableFrom(graph.nodes, graph.edges, effectiveRoot);
+      const { nodes: r } = reachableFrom(graph.nodes, graph.edges, effectiveRoot, rootOps);
       for (const n of r) reachableIds.add(n.id);
     }
     const rawNodes = graph.nodes.filter((n) => !reachableIds.has(n.id));
@@ -167,7 +183,7 @@ export function SchemaProvider({ children }: { children: React.ReactNode }) {
       return newIdx != null ? { ...e, sourceFieldIndex: newIdx } : e;
     });
     return { orphanedNodes: nodes, orphanedEdges: edges };
-  }, [graph.nodes, graph.edges, effectiveRoot, hidePrimitiveFields]);
+  }, [graph.nodes, graph.edges, effectiveRoot, hidePrimitiveFields, rootOps]);
 
   const setSchema = useCallback(
     ({ sdl: nextSdl, name: nextName }: { sdl: string; name?: string }) => {

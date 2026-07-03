@@ -1,18 +1,21 @@
 import type { GraphEdgeData, GraphNodeData } from "./sdl-to-graph";
 
-export const ROOT_OPS = new Set(["Query", "Mutation", "Subscription"]);
+/** Default root operation type names, used when a schema declares no
+ *  explicit `schema { query: ... }` overrides. */
+export const ROOT_OPS: ReadonlySet<string> = new Set(["Query", "Mutation", "Subscription"]);
 
 export function reachableFrom(
   nodes: GraphNodeData[],
   edges: GraphEdgeData[],
   rootId: string,
+  rootOps: ReadonlySet<string> = ROOT_OPS,
 ): { nodes: GraphNodeData[]; edges: GraphEdgeData[] } {
   if (!nodes.some((n) => n.id === rootId)) {
     return { nodes: [], edges: [] };
   }
 
   const excluded = new Set<string>();
-  for (const r of ROOT_OPS) {
+  for (const r of rootOps) {
     if (r !== rootId && nodes.some((n) => n.id === r)) excluded.add(r);
   }
 
@@ -64,11 +67,12 @@ export function reachableFrom(
 export function allReachableIds(
   nodes: GraphNodeData[],
   edges: GraphEdgeData[],
+  rootOps: ReadonlySet<string> = ROOT_OPS,
 ): Set<string> {
   const ids = new Set<string>();
-  for (const root of ROOT_OPS) {
+  for (const root of rootOps) {
     if (!nodes.some((n) => n.id === root)) continue;
-    const { nodes: reached } = reachableFrom(nodes, edges, root);
+    const { nodes: reached } = reachableFrom(nodes, edges, root, rootOps);
     for (const n of reached) ids.add(n.id);
   }
   return ids;

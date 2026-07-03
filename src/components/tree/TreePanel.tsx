@@ -17,8 +17,6 @@ function RelayIcon({ className }: { className?: string }) {
     </svg>
   );
 }
-const ROOT_CANDIDATES = ["Query", "Mutation", "Subscription"];
-
 // ─── Search history ────────────────────────────────────────────────────
 
 const SEARCH_HISTORY_KEY = "graviz:search-history";
@@ -193,18 +191,22 @@ export function TreePanel() {
     () => new Map(graph.nodes.map((n) => [n.id, n])),
     [graph.nodes],
   );
-  const roots = useMemo(
-    () => ROOT_CANDIDATES.filter((r) => graph.nodes.some((n) => n.id === r)),
-    [graph.nodes],
-  );
-  const otherRoots = useMemo(
-    () =>
-      graph.nodes
-        .filter((n) => !ROOT_CANDIDATES.includes(n.id))
-        .map((n) => n.id)
-        .sort(),
-    [graph.nodes],
-  );
+  // Root operation buttons, honoring any `schema { query: QueryRoot }`
+  // override. Ordered query → mutation → subscription, filtered to roots
+  // that actually exist as nodes.
+  const roots = useMemo(() => {
+    const { query, mutation, subscription } = graph.rootTypes;
+    return [query, mutation, subscription].filter(
+      (r): r is string => r != null && graph.nodes.some((n) => n.id === r),
+    );
+  }, [graph.nodes, graph.rootTypes]);
+  const otherRoots = useMemo(() => {
+    const rootSet = new Set(roots);
+    return graph.nodes
+      .filter((n) => !rootSet.has(n.id))
+      .map((n) => n.id)
+      .sort();
+  }, [graph.nodes, roots]);
 
   const path: string[] = useMemo(() => {
     if (!rootType) return [];

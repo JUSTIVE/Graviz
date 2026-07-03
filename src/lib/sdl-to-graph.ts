@@ -43,11 +43,56 @@ export interface GraphEdgeData {
   nullable?: boolean;
 }
 
+/**
+ * Resolved names of the three root operation types. By default these are
+ * `Query` / `Mutation` / `Subscription`, but a `schema { query: QueryRoot }`
+ * definition (or `extend schema`) can rename any of them — those overrides
+ * are honored here. A slot is `null` when the schema declares no such root.
+ */
+export interface RootTypeMap {
+  query: string | null;
+  mutation: string | null;
+  subscription: string | null;
+}
+
 export interface ParsedGraph {
   nodes: GraphNodeData[];
   edges: GraphEdgeData[];
   error: string | null;
   warnings: string[];
+  rootTypes: RootTypeMap;
+}
+
+const EMPTY_ROOT_TYPES: RootTypeMap = { query: null, mutation: null, subscription: null };
+
+/**
+ * Determines the root operation type names. An explicit `schema { ... }`
+ * definition (or `extend schema { ... }`) wins outright: only the operations
+ * it lists become roots. With no schema definition, GraphQL's default naming
+ * applies — `Query` / `Mutation` / `Subscription` are roots iff a type with
+ * that exact name exists.
+ */
+function resolveRootTypes(
+  definitions: readonly { kind: string }[],
+  nodeNames: Set<string>,
+): RootTypeMap {
+  const map: RootTypeMap = { query: null, mutation: null, subscription: null };
+  let explicit = false;
+  for (const def of definitions) {
+    if (def.kind !== Kind.SCHEMA_DEFINITION && def.kind !== Kind.SCHEMA_EXTENSION) continue;
+    const operationTypes = (def as { operationTypes?: readonly { operation: string; type: { name: { value: string } } }[] }).operationTypes;
+    for (const op of operationTypes ?? []) {
+      explicit = true;
+      const key = op.operation as keyof RootTypeMap;
+      if (key in map) map[key] = op.type.name.value;
+    }
+  }
+  if (!explicit) {
+    if (nodeNames.has("Query")) map.query = "Query";
+    if (nodeNames.has("Mutation")) map.mutation = "Mutation";
+    if (nodeNames.has("Subscription")) map.subscription = "Subscription";
+  }
+  return map;
 }
 
 export interface SdlToGraphOptions {
@@ -112,14 +157,14 @@ export function sdlToGraph(sdl: string, options: SdlToGraphOptions = {}): Parsed
   const { hideRelayBoilerplate = true } = options;
   const nodes: GraphNodeData[] = [];
 
-  if (!sdl.trim()) return { nodes: [], edges: [], error: null, warnings: [] };
+  if (!sdl.trim()) return { nodes: [], edges: [], error: null, warnings: [], rootTypes: EMPTY_ROOT_TYPES };
 
   let doc;
   try {
     doc = parse(sdl);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    return { nodes: [], edges: [], error: msg, warnings: [] };
+    return { nodes: [], edges: [], error: msg, warnings: [], rootTypes: EMPTY_ROOT_TYPES };
   }
 
   // Detect duplicate / conflicting type-system declarations before
@@ -424,5 +469,7 @@ export function sdlToGraph(sdl: string, options: SdlToGraphOptions = {}): Parsed
   const keptIds = new Set(keptNodes.map((n) => n.id));
   const edges = rawEdges.filter((e) => keptIds.has(e.target) && keptIds.has(e.source));
 
-  return { nodes: keptNodes, edges, error: null, warnings: duplicateWarnings };
+  const rootTypes = resolveRootTypes(doc.definitions, new Set(keptNodes.map((n) => n.name)));
+
+  return { nodes: keptNodes, edges, error: null, warnings: duplicateWarnings, rootTypes };
 }
