@@ -890,15 +890,16 @@ function getEdgeShader(): Shader {
   if (_edgeShader) return _edgeShader;
   _edgeUniforms = new UniformGroup({
     uZoom: { value: 1, type: "f32" },
-    uHalfW: { value: STROKE_W / 2, type: "f32" },
   });
   _edgeShader = Shader.from({
     gl: {
       vertex: `
         attribute vec2 aPosition;
         attribute float aDist;
+        attribute float aHalfW;
         attribute vec4 aColor;
         varying float vDist;
+        varying float vHalfW;
         varying vec4 vColor;
         uniform mat3 uProjectionMatrix;
         uniform mat3 uWorldTransformMatrix;
@@ -907,24 +908,25 @@ function getEdgeShader(): Shader {
           mat3 mvp = uProjectionMatrix * uWorldTransformMatrix * uTransformMatrix;
           gl_Position = vec4((mvp * vec3(aPosition, 1.0)).xy, 0.0, 1.0);
           vDist = aDist;
+          vHalfW = aHalfW;
           vColor = aColor;
         }
       `,
       fragment: `
         precision mediump float;
         varying float vDist;
+        varying float vHalfW;
         varying vec4 vColor;
         uniform vec4 uColor;
         uniform float uZoom;
-        uniform float uHalfW;
         void main() {
           float dScreen = abs(vDist) * uZoom;
-          float halfPx = max(0.5, uHalfW * uZoom);
+          float halfPx = max(0.5, vHalfW * uZoom);
           float alpha = 1.0 - smoothstep(halfPx - 0.75, halfPx + 0.75, dScreen);
           // Sub-pixel strokes: clamp rendered width to ~1px above and
           // scale alpha down by true coverage so thin lines dim out
           // smoothly instead of aliasing.
-          alpha *= min(1.0, (uHalfW * uZoom) / 0.5);
+          alpha *= min(1.0, (vHalfW * uZoom) / 0.5);
           float a = vColor.a * alpha;
           // uColor is the premultiplied world color+alpha from the
           // mesh pipe — this is what makes container.alpha dimming
@@ -946,6 +948,57 @@ function updateEdgeZoom(k: number) {
   _edgeUniforms.update();
 }
 
+// Shared arrowhead texture: a white right-pointing triangle drawn once
+// at 64px with canvas AA (plus mipmaps for minification), then tinted
+// per sprite. Replaces per-arrow Graphics fills so arrowheads stay
+// smooth without framebuffer MSAA and batch through Pixi's sprite
+// batcher. Geometry: tip at x=60, base at x=4, half-height 22.4 —
+// matching the old drawArrowHead proportions (length 7, half 2.8) at
+// 8 texels per world unit.
+const ARROW_TEX_SIZE = 64;
+const ARROW_TIP_X = 60;
+const ARROW_BASE_X = 4;
+const ARROW_HALF_H = 22.4;
+const ARROW_WORLD_LEN = 7;
+// Sprite size in world units so the 64px texture maps 1:1 onto the
+// old arrow proportions.
+const ARROW_SPRITE_W = (ARROW_TEX_SIZE / (ARROW_TIP_X - ARROW_BASE_X)) * ARROW_WORLD_LEN;
+
+let _arrowTexture: Texture | null = null;
+
+function getArrowTexture(): Texture {
+  if (_arrowTexture) return _arrowTexture;
+  const canvas = document.createElement("canvas");
+  canvas.width = ARROW_TEX_SIZE;
+  canvas.height = ARROW_TEX_SIZE;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return Texture.WHITE;
+  const cy = ARROW_TEX_SIZE / 2;
+  ctx.fillStyle = "#ffffff";
+  ctx.beginPath();
+  ctx.moveTo(ARROW_TIP_X, cy);
+  ctx.lineTo(ARROW_BASE_X, cy - ARROW_HALF_H);
+  ctx.lineTo(ARROW_BASE_X, cy + ARROW_HALF_H);
+  ctx.closePath();
+  ctx.fill();
+  const tex = Texture.from(canvas);
+  tex.source.autoGenerateMipmaps = true;
+  _arrowTexture = tex;
+  return tex;
+}
+
+/** Tip position + direction angle for an edge's arrowhead, or null
+ *  when the final segment is degenerate. */
+function arrowPose(edge: LaidEdge): { x: number; y: number; angle: number } | null {
+  const lastSeg = edge.segments[edge.segments.length - 1]!;
+  const tangentFrom = edge.arrowTip ? lastSeg.end : lastSeg.c2;
+  const tangentTo = edge.arrowTip ?? lastSeg.end;
+  const adx = tangentTo.x - tangentFrom.x;
+  const ady = tangentTo.y - tangentFrom.y;
+  if (adx * adx + ady * ady <= 0) return null;
+  return { x: tangentTo.x, y: tangentTo.y, angle: Math.atan2(ady, adx) };
+}
+
 /**
  * Build a single batch for a slice of edges belonging to one group
  * (same color + alphaScale): one feathered ribbon Mesh for the edge
@@ -956,9 +1009,11 @@ function buildEdgeBatchMesh(
   slice: LaidEdge[],
   group: { colorHex: number; alphaScale: number },
   alpha: number,
+  width: number = STROKE_W,
 ): Container {
   const batch = new Container();
-  const hw = STROKE_W / 2 + EDGE_FEATHER_PAD;
+  const halfW = width / 2;
+  const hw = halfW + EDGE_FEATHER_PAD;
   const cr = ((group.colorHex >> 16) & 0xff) / 255;
   const cg = ((group.colorHex >> 8) & 0xff) / 255;
   const cb = (group.colorHex & 0xff) / 255;
@@ -981,6 +1036,7 @@ function buildEdgeBatchMesh(
   if (vcount > 0) {
     const positions = new Float32Array(vcount * 2);
     const dists = new Float32Array(vcount);
+    const halfWs = new Float32Array(vcount).fill(halfW);
     const colors = new Float32Array(vcount * 4);
     const indices = new Uint32Array(icount);
     let vi = 0;
@@ -1034,6 +1090,7 @@ function buildEdgeBatchMesh(
       attributes: {
         aPosition: { buffer: positions, format: "float32x2" },
         aDist: { buffer: dists, format: "float32" },
+        aHalfW: { buffer: halfWs, format: "float32" },
         aColor: { buffer: colors, format: "float32x4" },
       },
       indexBuffer: indices,
@@ -1046,28 +1103,23 @@ function buildEdgeBatchMesh(
     batch.addChild(mesh);
   }
 
-  // Arrowheads stay as filled Graphics — tiny solid triangles that
-  // the framebuffer MSAA already smooths; per-triangle feathering
-  // isn't worth the geometry complexity.
-  const arrow = new Graphics();
+  // Arrowheads: tinted sprites sharing one feathered triangle texture
+  // — smooth without MSAA and coalesced by Pixi's sprite batcher.
+  const arrowTex = getArrowTexture();
   const effAlpha = alpha * group.alphaScale;
-  const normal: LaidEdge[] = [];
-  const faded: LaidEdge[] = [];
   for (const e of slice) {
-    if ((e.hubFade ?? 1) < 1) faded.push(e);
-    else normal.push(e);
+    const pose = arrowPose(e);
+    if (!pose) continue;
+    const spr = new Sprite(arrowTex);
+    spr.anchor.set(ARROW_TIP_X / ARROW_TEX_SIZE, 0.5);
+    spr.width = ARROW_SPRITE_W;
+    spr.height = ARROW_SPRITE_W;
+    spr.position.set(pose.x, pose.y);
+    spr.rotation = pose.angle;
+    spr.tint = group.colorHex;
+    spr.alpha = effAlpha * ((e.hubFade ?? 1) < 1 ? HUB_FADE_ALPHA : 1);
+    batch.addChild(spr);
   }
-  if (normal.length > 0) {
-    arrow.beginPath();
-    for (const e of normal) drawArrowHead(arrow, e);
-    arrow.fill({ color: group.colorHex, alpha: effAlpha });
-  }
-  if (faded.length > 0) {
-    arrow.beginPath();
-    for (const e of faded) drawArrowHead(arrow, e);
-    arrow.fill({ color: group.colorHex, alpha: effAlpha * HUB_FADE_ALPHA });
-  }
-  batch.addChild(arrow);
   return batch;
 }
 
@@ -1109,23 +1161,7 @@ function buildEdgeTileBatch(
   return null;
 }
 
-/** Draw arrowhead for an edge onto a Pixi Graphics already set up for fill */
-function drawArrowHead(g: Graphics, edge: LaidEdge) {
-  const lastSeg = edge.segments[edge.segments.length - 1]!;
-  const tangentFrom = edge.arrowTip ? lastSeg.end : lastSeg.c2;
-  const tangentTo = edge.arrowTip ?? lastSeg.end;
-  const adx = tangentTo.x - tangentFrom.x;
-  const ady = tangentTo.y - tangentFrom.y;
-  const alen = Math.hypot(adx, ady);
-  if (alen <= 0) return;
-  const ax = adx / alen;
-  const ay = ady / alen;
-  const sz = 7;
-  g.moveTo(tangentTo.x, tangentTo.y);
-  g.lineTo(tangentTo.x - ax * sz + ay * sz * 0.4, tangentTo.y - ay * sz - ax * sz * 0.4);
-  g.lineTo(tangentTo.x - ax * sz - ay * sz * 0.4, tangentTo.y - ay * sz + ax * sz * 0.4);
-  g.closePath();
-}
+
 
 // ─── Dot grid tile builder ────────────────────────────────────────────
 
@@ -1351,8 +1387,8 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     world: Container | null;
     edgeTileContainer: Container | null;
     activeEdgeContainer: Container | null;
-    focusEdgeGraphics: Graphics | null;
-    hoverEdgeGraphics: Graphics | null;
+    focusEdgeGraphics: Container | null;
+    hoverEdgeGraphics: Container | null;
     nodeContainer: Container | null;
     investigateOverlay: Graphics | null;
     pinFieldGraphics: Graphics | null;
@@ -2587,7 +2623,15 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       height: size.h,
       resolution: dpr,
       autoDensity: true,
-      antialias: true,
+      // Framebuffer MSAA is off: edges are analytically feathered
+      // meshes, arrowheads are feathered-texture sprites, and node
+      // cards / grid are textures — none need multisampling. The only
+      // remaining raw vector geometry is the axis-aligned rounded-rect
+      // overlays (focus ring, hover highlight, investigate outline),
+      // which alias mildly at the corners only. Skipping MSAA frees
+      // multisample fill-rate across the whole canvas (the 120fps
+      // budget's biggest fixed GPU cost).
+      antialias: false,
       backgroundAlpha: 1,
       backgroundColor: initBgHex,
       preference: "webgl",
@@ -2620,8 +2664,8 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       // focus is set, and the few active edges are redrawn here on
       // top — so focus changes never rebuild tile geometry.
       const activeEdgeContainer = new Container();
-      const focusEdgeGraphics = new Graphics();
-      const hoverEdgeGraphics = new Graphics();
+      const focusEdgeGraphics = new Container();
+      const hoverEdgeGraphics = new Container();
       const nodeContainer = new Container();
       nodeContainer.cullable = true;
       const investigateOverlay = new Graphics();
@@ -3868,9 +3912,9 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   // changes. The edge geometry itself lives on `hoveredEdgeRef`; the
   // state mirror just serves as a render trigger.
   useEffect(() => {
-    const g = sceneRef.current.hoverEdgeGraphics;
-    if (!g) return;
-    g.clear();
+    const layer = sceneRef.current.hoverEdgeGraphics;
+    if (!layer) return;
+    for (const c of layer.removeChildren()) c.destroy({ children: true });
     const e = hoveredEdgeRef.current;
     if (!e) return;
     const color =
@@ -3881,14 +3925,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
           : e.kind === "arg"
             ? 0xf97316
             : 0x3b82f6;
-    g.moveTo(e.start.x, e.start.y);
-    for (const seg of e.segments) {
-      g.bezierCurveTo(seg.c1.x, seg.c1.y, seg.c2.x, seg.c2.y, seg.end.x, seg.end.y);
-    }
-    g.stroke({ width: 4, color, alpha: 1 });
-    g.beginPath();
-    drawArrowHead(g, e);
-    g.fill({ color, alpha: 1 });
+    layer.addChild(buildEdgeBatchMesh([e], { colorHex: color, alphaScale: 1 }, 1, 4));
   }, [hoveredEdgeInfo]);
 
   // Bold stroke overlay for the currently-focused edge so the
@@ -3896,9 +3933,9 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   // Drawn beneath the hover overlay so hovering still wins the visual
   // emphasis when both states apply to the same edge.
   useEffect(() => {
-    const g = sceneRef.current.focusEdgeGraphics;
-    if (!g) return;
-    g.clear();
+    const layer = sceneRef.current.focusEdgeGraphics;
+    if (!layer) return;
+    for (const c of layer.removeChildren()) c.destroy({ children: true });
     const e = focusedEdge;
     if (!e) return;
     const color =
@@ -3909,14 +3946,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
           : e.kind === "arg"
             ? 0xf97316
             : 0x3b82f6;
-    g.moveTo(e.start.x, e.start.y);
-    for (const seg of e.segments) {
-      g.bezierCurveTo(seg.c1.x, seg.c1.y, seg.c2.x, seg.c2.y, seg.end.x, seg.end.y);
-    }
-    g.stroke({ width: 5, color, alpha: 1 });
-    g.beginPath();
-    drawArrowHead(g, e);
-    g.fill({ color, alpha: 1 });
+    layer.addChild(buildEdgeBatchMesh([e], { colorHex: color, alphaScale: 1 }, 1, 5));
   }, [focusedEdge]);
 
   // FPS + timing overlay state
