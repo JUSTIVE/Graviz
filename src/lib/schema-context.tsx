@@ -3,8 +3,8 @@ import { allReachableIds, reachableFrom } from "./reachable";
 import { sdlToGraph, type GraphEdgeData, type GraphNodeData, type NodeKind, type ParsedGraph } from "./sdl-to-graph";
 import { isUntilExpired } from "./until";
 
-/** A field (or enum value) carrying a `[until …]` sunset date — either
- *  already past (expired) or still upcoming. */
+/** A deprecated field (or enum value). May carry a `[until …]` sunset
+ *  date (expired or upcoming), or none at all (undated deprecation). */
 export interface UntilField {
   typeId: string;
   typeName: string;
@@ -13,8 +13,8 @@ export interface UntilField {
   fieldName: string;
   /** Index of the field/value within its owning type's list. */
   fieldIndex: number;
-  /** Sunset date (`YYYY-MM-DD`). */
-  until: string;
+  /** Sunset date (`YYYY-MM-DD`), when the deprecation carries one. */
+  until?: string;
   deprecationReason?: string;
 }
 
@@ -37,6 +37,8 @@ interface SchemaContextValue {
   /** Fields/enum values carrying a `[until …]` date still in the
    *  future. Empty when none are upcoming. */
   upcomingFields: UntilField[];
+  /** Deprecated fields/enum values that carry no `[until …]` date. */
+  deprecatedFields: UntilField[];
   setSchema: (input: { sdl: string; name?: string }) => void;
   clearSchema: () => void;
 
@@ -211,16 +213,23 @@ export function SchemaProvider({ children }: { children: React.ReactNode }) {
   // and enum values whose `[until …]` sunset date has already passed.
   // Time-dependent, but the comparison instant is fixed per graph load —
   // a session's clock drift is immaterial against day-granularity dates.
-  const { expiredFields, upcomingFields } = useMemo(() => {
+  const { expiredFields, upcomingFields, deprecatedFields } = useMemo(() => {
     const now = Date.now();
     const expired: UntilField[] = [];
     const upcoming: UntilField[] = [];
+    const deprecated: UntilField[] = [];
     for (const n of graph.nodes) {
-      const rows: { name: string; until?: string; deprecationReason?: string }[] =
-        n.kind === "Enum" ? (n.values ?? []) : (n.fields ?? []);
+      const rows: {
+        name: string;
+        until?: string;
+        deprecationReason?: string;
+        isDeprecated?: boolean;
+      }[] = n.kind === "Enum" ? (n.values ?? []) : (n.fields ?? []);
       for (let i = 0; i < rows.length; i++) {
         const r = rows[i]!;
-        if (!r.until) continue;
+        // Only deprecated rows are of interest; a bare `[until …]` without
+        // @deprecated wouldn't be parsed onto `until` anyway.
+        if (!r.until && !r.isDeprecated) continue;
         const entry: UntilField = {
           typeId: n.id,
           typeName: n.name,
@@ -230,14 +239,20 @@ export function SchemaProvider({ children }: { children: React.ReactNode }) {
           until: r.until,
           deprecationReason: r.deprecationReason,
         };
-        (isUntilExpired(r.until, now) ? expired : upcoming).push(entry);
+        if (!r.until) deprecated.push(entry);
+        else if (isUntilExpired(r.until, now)) expired.push(entry);
+        else upcoming.push(entry);
       }
     }
-    // Expired: most-overdue (oldest date) first. Upcoming: soonest first.
-    // Ascending by date satisfies both.
-    expired.sort((a, b) => a.until.localeCompare(b.until));
-    upcoming.sort((a, b) => a.until.localeCompare(b.until));
-    return { expiredFields: expired, upcomingFields: upcoming };
+    // Dated lists sort by date (most-overdue / soonest first); undated by
+    // type then field name for a stable, scannable order.
+    expired.sort((a, b) => (a.until ?? "").localeCompare(b.until ?? ""));
+    upcoming.sort((a, b) => (a.until ?? "").localeCompare(b.until ?? ""));
+    deprecated.sort(
+      (a, b) =>
+        a.typeName.localeCompare(b.typeName) || a.fieldName.localeCompare(b.fieldName),
+    );
+    return { expiredFields: expired, upcomingFields: upcoming, deprecatedFields: deprecated };
   }, [graph]);
 
   const setSchema = useCallback(
@@ -300,6 +315,7 @@ export function SchemaProvider({ children }: { children: React.ReactNode }) {
       orphanedEdges,
       expiredFields,
       upcomingFields,
+      deprecatedFields,
       setSchema,
       clearSchema,
       rootType: effectiveRoot,
@@ -324,6 +340,7 @@ export function SchemaProvider({ children }: { children: React.ReactNode }) {
       orphanedEdges,
       expiredFields,
       upcomingFields,
+      deprecatedFields,
       setSchema,
       clearSchema,
       effectiveRoot,

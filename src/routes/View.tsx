@@ -89,6 +89,7 @@ export function ViewRoute() {
     orphanedEdges,
     expiredFields,
     upcomingFields,
+    deprecatedFields,
     pushFocus,
     popTo,
     setPinnedField,
@@ -98,9 +99,11 @@ export function ViewRoute() {
   const [orphanFocus, setOrphanFocus] = useState<string | null>(null);
   const [untilFocus, setUntilFocus] = useState<string | null>(null);
 
-  // The "until" tab exists whenever the schema has any dated field —
-  // whether already expired or still upcoming.
-  const hasUntil = expiredFields.length + upcomingFields.length > 0;
+  // The "Deprecated" tab exists whenever the schema has any deprecated
+  // field — expired, upcoming, or undated.
+  const deprecatedCount =
+    expiredFields.length + upcomingFields.length + deprecatedFields.length;
+  const hasDeprecated = deprecatedCount > 0;
 
   const containerRef = useRef<HTMLDivElement>(null);
   const [sidebarWidth, setSidebarWidth] = useSidebarWidth();
@@ -129,8 +132,8 @@ export function ViewRoute() {
   // If the schema swaps to one with no dated fields at all, fall back to
   // the reachable view so we never sit on an empty Until tab.
   useEffect(() => {
-    if (mode === "until" && !hasUntil) setMode("reachable");
-  }, [mode, hasUntil]);
+    if (mode === "until" && !hasDeprecated) setMode("reachable");
+  }, [mode, hasDeprecated]);
 
   if (!hasSchema) return null;
 
@@ -200,15 +203,16 @@ export function ViewRoute() {
             tone="amber"
             disabled={orphanedNodes.length === 0}
           />
-          {/* Until tab is hidden entirely when the schema has no dated
-              fields. Red when something is already overdue, else amber. */}
-          {hasUntil && (
+          {/* Deprecated tab is hidden entirely when the schema has no
+              deprecated fields. Red when something is already overdue,
+              else amber. */}
+          {hasDeprecated && (
             <ModeTab
               active={mode === "until"}
               onClick={() => setMode("until")}
-              label="Until"
+              label="Deprecated"
               icon={Clock}
-              count={expiredFields.length || upcomingFields.length}
+              count={deprecatedCount}
               tone={expiredFields.length > 0 ? "red" : "amber"}
             />
           )}
@@ -235,6 +239,7 @@ export function ViewRoute() {
           <UntilPanel
             expired={expiredFields}
             upcoming={upcomingFields}
+            deprecated={deprecatedFields}
             focusId={untilFocus}
             onSelect={(f) => {
               setUntilFocus(f.typeId);
@@ -522,36 +527,61 @@ function groupByType(fields: UntilField[]) {
   return [...map.entries()].map(([typeId, list]) => ({ typeId, list }));
 }
 
-/** The "Until" tab, split into an already-past section and an upcoming
- *  section so the two are easy to tell apart at a glance. */
+type UntilVariant = "expired" | "upcoming" | "undated";
+
+// Per-section styling: banner, field text/strike, date chip, focus tint.
+const UNTIL_VARIANT: Record<
+  UntilVariant,
+  { title: string; banner: string; name: string; date: string; focus: string }
+> = {
+  expired: {
+    title: "Expired",
+    banner: "bg-red-500/10 text-red-600 dark:text-red-400",
+    name: "text-red-600 decoration-red-500/50 dark:text-red-400",
+    date: "text-red-500",
+    focus: "bg-red-500/10",
+  },
+  upcoming: {
+    title: "Upcoming",
+    banner: "bg-amber-500/10 text-amber-600 dark:text-amber-400",
+    name: "text-amber-700 decoration-amber-500/50 dark:text-amber-300",
+    date: "text-amber-500",
+    focus: "bg-amber-500/10",
+  },
+  undated: {
+    title: "Deprecated",
+    banner: "bg-slate-500/10 text-slate-600 dark:text-slate-400",
+    name: "text-muted-foreground decoration-muted-foreground/50",
+    date: "",
+    focus: "bg-secondary",
+  },
+};
+
+/** The "Deprecated" tab: expired / upcoming (dated) sections plus an
+ *  undated section for deprecations with no `[until …]` sunset date. */
 function UntilPanel({
   expired,
   upcoming,
+  deprecated,
   focusId,
   onSelect,
 }: {
   expired: UntilField[];
   upcoming: UntilField[];
+  deprecated: UntilField[];
   focusId: string | null;
   onSelect: (f: UntilField) => void;
 }) {
   return (
     <div className="min-h-0 flex-1 overflow-auto [scrollbar-width:none] [&_::-webkit-scrollbar]:w-0">
       {expired.length > 0 && (
-        <UntilSection
-          variant="expired"
-          fields={expired}
-          focusId={focusId}
-          onSelect={onSelect}
-        />
+        <UntilSection variant="expired" fields={expired} focusId={focusId} onSelect={onSelect} />
       )}
       {upcoming.length > 0 && (
-        <UntilSection
-          variant="upcoming"
-          fields={upcoming}
-          focusId={focusId}
-          onSelect={onSelect}
-        />
+        <UntilSection variant="upcoming" fields={upcoming} focusId={focusId} onSelect={onSelect} />
+      )}
+      {deprecated.length > 0 && (
+        <UntilSection variant="undated" fields={deprecated} focusId={focusId} onSelect={onSelect} />
       )}
     </div>
   );
@@ -563,26 +593,24 @@ function UntilSection({
   focusId,
   onSelect,
 }: {
-  variant: "expired" | "upcoming";
+  variant: UntilVariant;
   fields: UntilField[];
   focusId: string | null;
   onSelect: (f: UntilField) => void;
 }) {
   const grouped = useMemo(() => groupByType(fields), [fields]);
-  const expired = variant === "expired";
+  const v = UNTIL_VARIANT[variant];
 
   return (
     <section>
-      {/* Section banner — distinguishes past from upcoming. */}
+      {/* Section banner — distinguishes expired / upcoming / undated. */}
       <div
         className={cn(
           "sticky top-0 z-10 flex items-center gap-1.5 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider backdrop-blur",
-          expired
-            ? "bg-red-500/10 text-red-600 dark:text-red-400"
-            : "bg-amber-500/10 text-amber-600 dark:text-amber-400",
+          v.banner,
         )}
       >
-        {expired ? "Expired" : "Upcoming"}
+        {v.title}
         <span className="opacity-70">({fields.length})</span>
       </div>
       {grouped.map(({ typeId, list }) => {
@@ -598,10 +626,19 @@ function UntilSection({
             </div>
             <ul>
               {list.map((f) => {
-                const days = daysFromNow(f.until);
-                const meta = expired
-                  ? days > 0 ? `${days.toLocaleString()}d overdue` : "overdue"
-                  : days < 0 ? `in ${Math.abs(days).toLocaleString()}d` : "due today";
+                let meta: string;
+                if (variant === "undated") {
+                  meta = f.deprecationReason ?? "deprecated";
+                } else {
+                  const days = daysFromNow(f.until!);
+                  const when =
+                    variant === "expired"
+                      ? days > 0 ? `${days.toLocaleString()}d overdue` : "overdue"
+                      : days < 0 ? `in ${Math.abs(days).toLocaleString()}d` : "due today";
+                  meta = f.deprecationReason
+                    ? `${when} · ${stripUntil(f.deprecationReason)}`
+                    : when;
+                }
                 return (
                   <li key={`${f.typeId}.${f.fieldName}.${f.fieldIndex}`}>
                     <button
@@ -609,35 +646,18 @@ function UntilSection({
                       onClick={() => onSelect(f)}
                       className={cn(
                         "flex w-full flex-col gap-0.5 px-3 py-1.5 text-left transition-colors",
-                        focusId === f.typeId
-                          ? expired ? "bg-red-500/10" : "bg-amber-500/10"
-                          : "hover:bg-secondary/60",
+                        focusId === f.typeId ? v.focus : "hover:bg-secondary/60",
                       )}
                     >
                       <span className="flex w-full items-center gap-2 font-mono text-xs">
-                        <span
-                          className={cn(
-                            "truncate line-through",
-                            expired
-                              ? "text-red-600 decoration-red-500/50 dark:text-red-400"
-                              : "text-amber-700 decoration-amber-500/50 dark:text-amber-300",
-                          )}
-                        >
-                          {f.fieldName}
-                        </span>
-                        <span
-                          className={cn(
-                            "ml-auto shrink-0 font-mono text-[10px]",
-                            expired ? "text-red-500" : "text-amber-500",
-                          )}
-                        >
-                          {f.until}
-                        </span>
+                        <span className={cn("truncate line-through", v.name)}>{f.fieldName}</span>
+                        {f.until && (
+                          <span className={cn("ml-auto shrink-0 font-mono text-[10px]", v.date)}>
+                            {f.until}
+                          </span>
+                        )}
                       </span>
-                      <span className="text-[10px] text-muted-foreground">
-                        {meta}
-                        {f.deprecationReason ? ` · ${stripUntil(f.deprecationReason)}` : ""}
-                      </span>
+                      <span className="text-[10px] text-muted-foreground">{meta}</span>
                     </button>
                   </li>
                 );
