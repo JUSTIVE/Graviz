@@ -1407,6 +1407,12 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
 
   // Layout state
   const [layoutResult, setLayoutResult] = useState<LayoutResult>(EMPTY_LAYOUT);
+  // The `nodes` array `layoutResult` was computed for. When the mode/tab
+  // switches, `nodes` changes immediately but the async layout hasn't caught
+  // up — this lets `laidNodes` detect the mismatch and keep the previous
+  // graph instead of flashing an empty canvas.
+  const layoutForNodesRef = useRef<GraphNodeData[] | null>(null);
+  const prevLaidNodesRef = useRef<LaidNode[]>([]);
   const [isPending, setIsPending] = useState(nodes.length > 0);
   const [layoutProgress, setLayoutProgress] = useState<{ done: number; total: number } | null>(null);
   const [lastTiming, setLastTiming] = useState<OrchestratorTimings | null>(null);
@@ -1539,6 +1545,8 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   useEffect(() => {
     if (nodes.length === 0) {
       requestIdRef.current += 1;
+      layoutForNodesRef.current = nodes;
+      prevLaidNodesRef.current = [];
       setLayoutResult(EMPTY_LAYOUT);
       setIsPending(false);
       return;
@@ -1591,6 +1599,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       .layout(request)
       .then((resp) => {
         if (resp.id !== requestIdRef.current) return;
+        layoutForNodesRef.current = nodes;
         setLayoutResult(resp.result);
         setLastTiming(resp.timings);
         lastTimingRef.current = resp.timings;
@@ -1605,11 +1614,20 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   }, [nodes, edges, rootId, showGraphDescriptions]);
 
   const laidNodes = useMemo<LaidNode[]>(() => {
+    // Stale guard: `layoutResult` was computed for a *different* `nodes`
+    // array (a mode/tab switch just changed the node set and the new
+    // layout is still in flight). Building now would filter the old
+    // positions down to the intersection — empty for disjoint sets — and
+    // flash a blank canvas. Keep the last good graph until the matching
+    // layout lands.
+    if (layoutForNodesRef.current !== nodes && prevLaidNodesRef.current.length > 0) {
+      return prevLaidNodesRef.current;
+    }
     const byId = new Map<string, GraphNodeData>();
     for (const n of nodes) byId.set(n.id, n);
     const rowH = rowHFor(showGraphDescriptions);
     const headerH = headerHFor(showGraphDescriptions);
-    return layoutResult.nodes
+    const built = layoutResult.nodes
       .filter((p) => byId.has(p.id))
       .map((p) => ({
         id: p.id,
@@ -1621,6 +1639,8 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         rowH,
         headerH,
       }));
+    prevLaidNodesRef.current = built;
+    return built;
   }, [layoutResult, nodes, showGraphDescriptions]);
 
   const nodeById = useMemo(() => {
