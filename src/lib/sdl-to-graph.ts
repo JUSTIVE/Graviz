@@ -1,4 +1,5 @@
 import { getLocation, Kind, parse, type ConstDirectiveNode, type TypeNode } from "graphql";
+import { parseUntil } from "./until";
 
 export type NodeKind = "Object" | "Interface" | "Union" | "Enum" | "Scalar" | "Input";
 
@@ -12,6 +13,9 @@ export interface GraphField {
   description?: string;
   isDeprecated?: boolean;
   deprecationReason?: string;
+  /** Sunset date (`YYYY-MM-DD`) parsed from a `[until …]` marker in the
+   *  deprecation reason, when present. Used to flag overdue fields. */
+  until?: string;
 }
 
 export interface EnumValue {
@@ -19,6 +23,8 @@ export interface EnumValue {
   description?: string;
   isDeprecated?: boolean;
   deprecationReason?: string;
+  /** See {@link GraphField.until}. */
+  until?: string;
 }
 
 export interface GraphNodeData {
@@ -133,12 +139,13 @@ function isRelayBoilerplate(node: GraphNodeData): boolean {
   return false;
 }
 
-function parseDeprecated(directives: readonly ConstDirectiveNode[] | undefined): { isDeprecated: boolean; deprecationReason?: string } {
+function parseDeprecated(directives: readonly ConstDirectiveNode[] | undefined): { isDeprecated: boolean; deprecationReason?: string; until?: string } {
   const d = directives?.find((d) => d.name.value === "deprecated");
   if (!d) return { isDeprecated: false };
   const reason = d.arguments?.find((a) => a.name.value === "reason");
   const reasonValue = reason?.value.kind === Kind.STRING ? reason.value.value : undefined;
-  return { isDeprecated: true, deprecationReason: reasonValue };
+  const until = parseUntil(reasonValue) ?? undefined;
+  return { isDeprecated: true, deprecationReason: reasonValue, until };
 }
 
 function renderType(t: TypeNode): { rendered: string; base: string } {
@@ -235,7 +242,7 @@ export function sdlToGraph(sdl: string, options: SdlToGraphOptions = {}): Parsed
                     typeName: renderType(a.type).base,
                   }))
                 : undefined,
-            ...(dep.isDeprecated && { isDeprecated: true, deprecationReason: dep.deprecationReason }),
+            ...(dep.isDeprecated && { isDeprecated: true, deprecationReason: dep.deprecationReason, until: dep.until }),
           });
         }
 
@@ -266,7 +273,7 @@ export function sdlToGraph(sdl: string, options: SdlToGraphOptions = {}): Parsed
               return {
                 name: v.name.value,
                 description: v.description?.value,
-                ...(dep.isDeprecated && { isDeprecated: true, deprecationReason: dep.deprecationReason }),
+                ...(dep.isDeprecated && { isDeprecated: true, deprecationReason: dep.deprecationReason, until: dep.until }),
               };
             }) ?? [],
         });

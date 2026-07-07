@@ -10,6 +10,7 @@ import {
 } from "@/lib/layout-orchestrator";
 import type { GraphEdgeData, GraphNodeData, NodeKind } from "@/lib/sdl-to-graph";
 import { useSchema } from "@/lib/schema-context";
+import { isUntilExpired } from "@/lib/until";
 import { useTheme } from "@/lib/theme";
 import { applyTooltipStyle, tooltipStyle } from "@/lib/tooltip-pos";
 import { cn } from "@/lib/utils";
@@ -482,14 +483,20 @@ function drawColoredType(
   /** Extra alpha multiplier — used to fade the type when the row is
    *  deprecated, matching the fade applied to the field name. */
   baseAlpha: number = 1,
+  /** When set, overrides the type color entirely (used to paint the
+   *  type red on expired rows). */
+  colorOverride?: string,
 ) {
   const w = cachedTextWidth(ctx, typeStr);
-  ctx.fillStyle = primitive ? "#b08c5a" : "#f59e0b";
-  ctx.globalAlpha = (primitive ? 0.7 : 1) * baseAlpha;
+  ctx.fillStyle = colorOverride ?? (primitive ? "#b08c5a" : "#f59e0b");
+  ctx.globalAlpha = (colorOverride ? 1 : primitive ? 0.7 : 1) * baseAlpha;
   ctx.fillText(typeStr, rightX - w, y);
   ctx.globalAlpha = 1;
 }
 
+/** Red used to flag fields/values whose `[until …]` sunset date has
+ *  passed — they should have been removed and are now overdue. */
+const EXPIRED_COLOR = "#ef4444"; // red-500
 const RELAY_COLOR = "#F26A03";
 const RELAY_SVG_PATH = new Path2D(
   "M2.264 4.937A2.264 2.264 0 1 0 4.456 7.77h10.339a1.792 1.792 0 0 1 0 3.583h-5.73a3.037 3.037 0 0 0-3.034 3.033a3.036 3.036 0 0 0 3.033 3.033h10.494a2.264 2.264 0 1 0 0-1.242H9.064a1.793 1.793 0 0 1-1.791-1.791c0-.988.803-1.792 1.791-1.792h5.73a3.036 3.036 0 0 0 3.034-3.033a3.036 3.036 0 0 0-3.033-3.033H4.427a2.265 2.265 0 0 0-2.163-1.592",
@@ -666,9 +673,19 @@ function drawNodeSprite(
     for (let i = 0; i < values.length; i++) {
       const v = values[i]!;
       const fy = bodyY + i * rowH + 10;
+      const expired = isUntilExpired(v.until);
       ctx.font = `10px ${MONO}`;
-      ctx.fillStyle = mutedFg;
+      ctx.fillStyle = expired ? EXPIRED_COLOR : mutedFg;
       ctx.fillText(v.name, 10, fy);
+      if (expired) {
+        const nameW = ctx.measureText(v.name).width;
+        ctx.strokeStyle = EXPIRED_COLOR;
+        ctx.lineWidth = 0.75;
+        ctx.beginPath();
+        ctx.moveTo(10, fy - 3.5);
+        ctx.lineTo(10 + nameW, fy - 3.5);
+        ctx.stroke();
+      }
       // Deprecated values without a description fall back to the
       // @deprecated reason so the row still gets an inline note.
       drawRowDesc(
@@ -693,15 +710,18 @@ function drawNodeSprite(
     for (let i = 0; i < fields.length; i++) {
       const f = fields[i]!;
       const fy = bodyY + i * rowH + 10;
-      const depAlpha = f.isDeprecated ? 0.4 : 1;
+      const expired = isUntilExpired(f.until);
+      // Expired rows render at full opacity in red; ordinary deprecated
+      // rows keep the muted amber fade.
+      const depAlpha = expired ? 1 : f.isDeprecated ? 0.4 : 1;
       ctx.font = `10px ${MONO}`;
-      ctx.fillStyle = fgColor;
+      ctx.fillStyle = expired ? EXPIRED_COLOR : fgColor;
       ctx.globalAlpha = depAlpha;
       ctx.fillText(f.name, 10, fy);
       if (f.isDeprecated) {
         const nameW = ctx.measureText(f.name).width;
         const typeW = cachedTextWidth(ctx, f.type);
-        ctx.strokeStyle = fgColor;
+        ctx.strokeStyle = expired ? EXPIRED_COLOR : fgColor;
         ctx.lineWidth = 0.75;
         ctx.beginPath();
         // Strikethrough name and type so the entire row reads as
@@ -721,7 +741,7 @@ function drawNodeSprite(
         ctx.globalAlpha = 1;
         ctx.font = `10px ${MONO}`;
       }
-      drawColoredType(ctx, f.type, w - 10, fy, BUILTIN_SCALARS.has(f.typeName), depAlpha);
+      drawColoredType(ctx, f.type, w - 10, fy, BUILTIN_SCALARS.has(f.typeName), depAlpha, expired ? EXPIRED_COLOR : undefined);
       drawRowDesc(
         f.description ?? (f.isDeprecated ? f.deprecationReason : undefined),
         fy,

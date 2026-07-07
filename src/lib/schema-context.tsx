@@ -1,6 +1,21 @@
 import { createContext, useCallback, useContext, useMemo, useState } from "react";
 import { allReachableIds, reachableFrom } from "./reachable";
-import { sdlToGraph, type GraphEdgeData, type GraphNodeData, type ParsedGraph } from "./sdl-to-graph";
+import { sdlToGraph, type GraphEdgeData, type GraphNodeData, type NodeKind, type ParsedGraph } from "./sdl-to-graph";
+import { isUntilExpired } from "./until";
+
+/** A field (or enum value) whose `[until …]` sunset date has passed. */
+export interface ExpiredField {
+  typeId: string;
+  typeName: string;
+  typeKind: NodeKind;
+  /** Field name, or enum value name for enum members. */
+  fieldName: string;
+  /** Index of the field/value within its owning type's list. */
+  fieldIndex: number;
+  /** Sunset date (`YYYY-MM-DD`) that has already passed. */
+  until: string;
+  deprecationReason?: string;
+}
 
 interface SchemaContextValue {
   sdl: string;
@@ -15,6 +30,9 @@ interface SchemaContextValue {
   orphanedNodes: GraphNodeData[];
   /** Edges whose both endpoints are orphaned. */
   orphanedEdges: GraphEdgeData[];
+  /** Fields/enum values across the whole schema whose `[until …]`
+   *  sunset date has already passed. Empty when none are overdue. */
+  expiredFields: ExpiredField[];
   setSchema: (input: { sdl: string; name?: string }) => void;
   clearSchema: () => void;
 
@@ -185,6 +203,35 @@ export function SchemaProvider({ children }: { children: React.ReactNode }) {
     return { orphanedNodes: nodes, orphanedEdges: edges };
   }, [graph.nodes, graph.edges, effectiveRoot, hidePrimitiveFields, rootOps]);
 
+  // Scan the entire schema (not just the reachable subset) for fields
+  // and enum values whose `[until …]` sunset date has already passed.
+  // Time-dependent, but the comparison instant is fixed per graph load —
+  // a session's clock drift is immaterial against day-granularity dates.
+  const expiredFields = useMemo<ExpiredField[]>(() => {
+    const now = Date.now();
+    const out: ExpiredField[] = [];
+    for (const n of graph.nodes) {
+      const rows: { name: string; until?: string; deprecationReason?: string }[] =
+        n.kind === "Enum" ? (n.values ?? []) : (n.fields ?? []);
+      for (let i = 0; i < rows.length; i++) {
+        const r = rows[i]!;
+        if (!isUntilExpired(r.until, now)) continue;
+        out.push({
+          typeId: n.id,
+          typeName: n.name,
+          typeKind: n.kind,
+          fieldName: r.name,
+          fieldIndex: i,
+          until: r.until!,
+          deprecationReason: r.deprecationReason,
+        });
+      }
+    }
+    // Most-overdue first so the worst offenders sit at the top.
+    out.sort((a, b) => a.until.localeCompare(b.until));
+    return out;
+  }, [graph]);
+
   const setSchema = useCallback(
     ({ sdl: nextSdl, name: nextName }: { sdl: string; name?: string }) => {
       const n = nextName?.trim() || "Untitled schema";
@@ -243,6 +290,7 @@ export function SchemaProvider({ children }: { children: React.ReactNode }) {
       visibleEdges,
       orphanedNodes,
       orphanedEdges,
+      expiredFields,
       setSchema,
       clearSchema,
       rootType: effectiveRoot,
@@ -265,6 +313,7 @@ export function SchemaProvider({ children }: { children: React.ReactNode }) {
       visibleEdges,
       orphanedNodes,
       orphanedEdges,
+      expiredFields,
       setSchema,
       clearSchema,
       effectiveRoot,

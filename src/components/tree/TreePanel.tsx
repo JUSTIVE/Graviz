@@ -6,6 +6,7 @@ import { useSchema } from "@/lib/schema-context";
 import type { GraphNodeData, NodeKind } from "@/lib/sdl-to-graph";
 import { applyTooltipStyle, tooltipStyle } from "@/lib/tooltip-pos";
 import { ColoredType } from "@/lib/type-colors";
+import { isUntilExpired } from "@/lib/until";
 import { cn } from "@/lib/utils";
 
 const BUILTIN = new Set(["String", "Int", "Float", "Boolean", "ID"]);
@@ -970,18 +971,24 @@ function TypeDetail({
 
       {node.kind === "Enum" ? (
         <ul className="space-y-0.5 font-mono text-xs text-muted-foreground">
-          {node.values?.map((v) => (
+          {node.values?.map((v) => {
+            const expired = isUntilExpired(v.until);
+            return (
             <li
               key={v.name}
-              className={cn("rounded px-2 py-1", v.isDeprecated && "bg-amber-400/10")}
+              className={cn(
+                "rounded px-2 py-1",
+                v.isDeprecated && !expired && "bg-amber-400/10",
+                expired && "bg-red-500/10",
+              )}
             >
               <div className="flex flex-col gap-0.5">
-                <span className={cn("flex items-center gap-1", v.isDeprecated && "text-muted-foreground/60")}>
-                  {v.isDeprecated && <TriangleAlert className="h-2.5 w-2.5 shrink-0 text-amber-500/70" />}
-                  <span className={cn("text-foreground", v.isDeprecated && "line-through decoration-muted-foreground/40")}>{v.name}</span>
+                <span className={cn("flex items-center gap-1", v.isDeprecated && !expired && "text-muted-foreground/60")}>
+                  {v.isDeprecated && <TriangleAlert className={cn("h-2.5 w-2.5 shrink-0", expired ? "text-red-500" : "text-amber-500/70")} />}
+                  <span className={cn(expired ? "text-red-600 dark:text-red-400" : "text-foreground", v.isDeprecated && "line-through", expired ? "decoration-red-500/50" : "decoration-muted-foreground/40")}>{v.name}</span>
                 </span>
                 {v.deprecationReason && (
-                  <span className="text-[11px] font-sans leading-snug text-amber-600/70 dark:text-amber-400/70">
+                  <span className={cn("text-[11px] font-sans leading-snug", expired ? "text-red-600 dark:text-red-400" : "text-amber-600/70 dark:text-amber-400/70")}>
                     {v.deprecationReason}
                   </span>
                 )}
@@ -992,7 +999,8 @@ function TypeDetail({
                 )}
               </div>
             </li>
-          ))}
+            );
+          })}
           {(!node.values || node.values.length === 0) && (
             <li className="italic">no values</li>
           )}
@@ -1035,6 +1043,7 @@ function TypeDetail({
                   args={f.args?.map((a) => ({ ...a, navigable: isNavigable(a.typeName) }))}
                   isDeprecated={f.isDeprecated}
                   deprecationReason={f.deprecationReason}
+                  expired={isUntilExpired(f.until)}
                   onNavigate={onNavigate}
                   onPin={() =>
                     setPinnedField({
@@ -1070,6 +1079,7 @@ function FieldRow({
   args,
   isDeprecated,
   deprecationReason,
+  expired,
   onNavigate,
   onPin,
 }: {
@@ -1079,6 +1089,8 @@ function FieldRow({
   args?: { name: string; type: string; typeName: string; navigable: boolean }[];
   isDeprecated?: boolean;
   deprecationReason?: string;
+  /** The field's `[until …]` sunset date has passed — render it red. */
+  expired?: boolean;
   onNavigate: (id: string) => void;
   /** Called whenever the row itself is clicked — used to pin this
    *  field's highlight on the canvas. Independent of navigation:
@@ -1130,7 +1142,14 @@ function FieldRow({
   ) : null;
 
   const deprecatedNote = isDeprecated ? (
-    <span className="flex items-center gap-1 font-sans text-[11px] leading-snug text-amber-600/80 dark:text-amber-400/80">
+    <span
+      className={cn(
+        "flex items-center gap-1 font-sans text-[11px] leading-snug",
+        expired
+          ? "text-red-600 dark:text-red-400"
+          : "text-amber-600/80 dark:text-amber-400/80",
+      )}
+    >
       <TriangleAlert className="h-2.5 w-2.5 shrink-0" />
       {deprecationReason ?? "Deprecated"}
     </span>
@@ -1201,7 +1220,8 @@ function FieldRow({
     <div
       className={cn(
         "flex w-full cursor-pointer flex-col gap-0.5 rounded px-2 py-1 hover:bg-secondary/60",
-        isDeprecated && "bg-amber-400/10 opacity-60 hover:bg-amber-400/20",
+        isDeprecated && !expired && "bg-amber-400/10 opacity-60 hover:bg-amber-400/20",
+        expired && "bg-red-500/10 hover:bg-red-500/20",
       )}
       onMouseEnter={(ev) => {
         setHovered(true);
@@ -1212,7 +1232,7 @@ function FieldRow({
       onClick={() => onPin?.()}
     >
       <span className="flex w-full items-center justify-between gap-2">
-        <span className={cn("flex min-w-0 items-center gap-1 text-foreground", isDeprecated && "line-through decoration-muted-foreground/50")}>
+        <span className={cn("flex min-w-0 items-center gap-1", expired ? "text-red-600 dark:text-red-400" : "text-foreground", isDeprecated && "line-through", expired ? "decoration-red-500/60" : "decoration-muted-foreground/50")}>
           <span className="truncate">{label}</span>
           {arityBadge}
         </span>
