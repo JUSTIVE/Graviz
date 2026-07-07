@@ -12,11 +12,11 @@ import { SchemaCanvas } from "@/components/graph/SchemaCanvas";
 import { TreePanel } from "@/components/tree/TreePanel";
 import { KIND_STYLES } from "@/components/graph/node-style";
 import { Badge } from "@/components/ui/badge";
-import { useSchema, type ExpiredField } from "@/lib/schema-context";
+import { useSchema, type UntilField } from "@/lib/schema-context";
 import type { GraphNodeData } from "@/lib/sdl-to-graph";
 import { cn } from "@/lib/utils";
 
-type Mode = "reachable" | "orphaned" | "expired";
+type Mode = "reachable" | "orphaned" | "until";
 
 const SIDEBAR_MIN_W = 260;
 const SIDEBAR_MAX_W = 720;
@@ -88,6 +88,7 @@ export function ViewRoute() {
     orphanedNodes,
     orphanedEdges,
     expiredFields,
+    upcomingFields,
     pushFocus,
     popTo,
     setPinnedField,
@@ -95,12 +96,21 @@ export function ViewRoute() {
   const navigate = useNavigate();
   const [mode, setMode] = useState<Mode>("reachable");
   const [orphanFocus, setOrphanFocus] = useState<string | null>(null);
-  const [expiredFocus, setExpiredFocus] = useState<string | null>(null);
+  const [untilFocus, setUntilFocus] = useState<string | null>(null);
+
+  // The "until" tab exists whenever the schema has any dated field —
+  // whether already expired or still upcoming.
+  const hasUntil = expiredFields.length + upcomingFields.length > 0;
 
   const containerRef = useRef<HTMLDivElement>(null);
   const [sidebarWidth, setSidebarWidth] = useSidebarWidth();
   const [collapsed, setCollapsed] = useSidebarCollapsed();
   const isLg = useIsLg();
+  // While the user drags the resize handle we suppress the width
+  // transition so the sidebar tracks the pointer 1:1 instead of easing
+  // behind it. The transition is only wanted for the collapse/expand
+  // toggle.
+  const [isResizing, setIsResizing] = useState(false);
 
   // Translate a pointer X into a new sidebar width, measured from the
   // container's left edge and clamped to the allowed range.
@@ -116,11 +126,11 @@ export function ViewRoute() {
     if (!hasSchema) navigate({ to: "/" });
   }, [hasSchema, navigate]);
 
-  // If every expired field is resolved (e.g. schema swapped), fall back
-  // to the reachable view so we never sit on an empty Expired tab.
+  // If the schema swaps to one with no dated fields at all, fall back to
+  // the reachable view so we never sit on an empty Until tab.
   useEffect(() => {
-    if (mode === "expired" && expiredFields.length === 0) setMode("reachable");
-  }, [mode, expiredFields.length]);
+    if (mode === "until" && !hasUntil) setMode("reachable");
+  }, [mode, hasUntil]);
 
   if (!hasSchema) return null;
 
@@ -132,37 +142,45 @@ export function ViewRoute() {
   const canvasEdges =
     mode === "reachable" ? visibleEdges : mode === "orphaned" ? orphanedEdges : graph.edges;
   const canvasFocusId =
-    mode === "reachable" ? reachableFocusId : mode === "orphaned" ? orphanFocus : expiredFocus;
+    mode === "reachable" ? reachableFocusId : mode === "orphaned" ? orphanFocus : untilFocus;
   const canvasRootId = mode === "reachable" ? rootType : null;
 
   const onCanvasNavigate =
-    mode === "reachable" ? pushFocus : mode === "orphaned" ? setOrphanFocus : setExpiredFocus;
+    mode === "reachable" ? pushFocus : mode === "orphaned" ? setOrphanFocus : setUntilFocus;
   const onCanvasClearFocus =
     mode === "reachable"
       ? () => popTo(-1)
       : mode === "orphaned"
         ? () => setOrphanFocus(null)
-        : () => setExpiredFocus(null);
+        : () => setUntilFocus(null);
 
-  // On `lg`, the sidebar width is driven by state (or 0 when collapsed);
-  // below `lg` the panels stack and the inline template is dropped so the
-  // Tailwind `grid-cols-1` fallback applies.
-  const gridStyle =
-    isLg && !collapsed ? { gridTemplateColumns: `${sidebarWidth}px 1fr` } : undefined;
+  // On `lg` the sidebar column width is state-driven and animates to 0
+  // on collapse (the aside stays mounted and its content clips). Below
+  // `lg` the panels stack, so we drop the inline template and toggle the
+  // aside with `hidden` instead.
+  const gridStyle = isLg
+    ? { gridTemplateColumns: collapsed ? "0px 1fr" : `${sidebarWidth}px 1fr` }
+    : undefined;
 
   return (
     <div
       ref={containerRef}
       className={cn(
-        "grid min-h-0 flex-1",
-        collapsed
-          ? "grid-cols-1"
-          : "grid-cols-1 lg:grid-cols-[minmax(300px,380px)_1fr]",
+        "grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[minmax(300px,380px)_1fr]",
+        // Animate the collapse/expand, but not while dragging the handle.
+        !isResizing && "transition-[grid-template-columns] duration-300 ease-out",
       )}
       style={gridStyle}
     >
-      {!collapsed && (
-      <aside className="relative flex min-h-0 flex-col border-b border-border bg-card/30 lg:border-b-0 lg:border-r">
+      <aside
+        className={cn(
+          "relative flex min-h-0 min-w-0 flex-col overflow-hidden border-b border-border bg-card/30 lg:border-b-0 lg:border-r",
+          // Drop the divider line when fully collapsed on `lg`, and hide
+          // the row entirely when stacked (non-`lg`).
+          collapsed && "lg:border-r-0",
+          collapsed && !isLg && "hidden",
+        )}
+      >
         {/* Mode tab switcher. Inactive tabs collapse to their icon; the
             active tab expands to fill the row with icon + label. */}
         <div className="flex shrink-0 items-stretch border-b border-border">
@@ -171,6 +189,7 @@ export function ViewRoute() {
             onClick={() => setMode("reachable")}
             label="Reachable"
             icon={Waypoints}
+            tone="sky"
           />
           <ModeTab
             active={mode === "orphaned"}
@@ -178,19 +197,19 @@ export function ViewRoute() {
             label="Orphaned"
             icon={Unlink}
             count={orphanedNodes.length}
-            warn={orphanedNodes.length > 0}
+            tone="amber"
             disabled={orphanedNodes.length === 0}
           />
-          {/* Expired tab is hidden entirely when nothing is overdue. */}
-          {expiredFields.length > 0 && (
+          {/* Until tab is hidden entirely when the schema has no dated
+              fields. Red when something is already overdue, else amber. */}
+          {hasUntil && (
             <ModeTab
-              active={mode === "expired"}
-              onClick={() => setMode("expired")}
-              label="Expired"
+              active={mode === "until"}
+              onClick={() => setMode("until")}
+              label="Until"
               icon={Clock}
-              count={expiredFields.length}
-              warn
-              tone="red"
+              count={expiredFields.length || upcomingFields.length}
+              tone={expiredFields.length > 0 ? "red" : "amber"}
             />
           )}
           <button
@@ -213,11 +232,12 @@ export function ViewRoute() {
             onFocus={setOrphanFocus}
           />
         ) : (
-          <ExpiredPanel
-            fields={expiredFields}
-            focusId={expiredFocus}
+          <UntilPanel
+            expired={expiredFields}
+            upcoming={upcomingFields}
+            focusId={untilFocus}
             onSelect={(f) => {
-              setExpiredFocus(f.typeId);
+              setUntilFocus(f.typeId);
               setPinnedField({
                 typeId: f.typeId,
                 fieldName: f.fieldName,
@@ -227,19 +247,26 @@ export function ViewRoute() {
           />
         )}
 
-        {/* Drag handle — only meaningful in the side-by-side layout. */}
-        {isLg && <ResizeHandle onResize={resizeTo} onReset={() => setSidebarWidth(SIDEBAR_DEFAULT_W)} />}
+        {/* Drag handle — only in the expanded side-by-side layout. */}
+        {isLg && !collapsed && (
+          <ResizeHandle
+            onResize={resizeTo}
+            onReset={() => setSidebarWidth(SIDEBAR_DEFAULT_W)}
+            onDraggingChange={setIsResizing}
+          />
+        )}
       </aside>
-      )}
 
-      <section className="relative min-h-[500px] flex-1">
+      <section className="relative min-h-[500px] min-w-0 flex-1 overflow-hidden">
+        {/* When collapsed, the expand affordance sits at the canvas's
+            top-left; the canvas pushes its own controls down to clear it. */}
         {collapsed && (
           <button
             type="button"
             onClick={() => setCollapsed(false)}
             title="Show sidebar"
             aria-label="Show sidebar"
-            className="absolute left-2 top-2 z-20 flex items-center justify-center rounded-md border border-border bg-card/80 p-1.5 text-muted-foreground shadow-sm backdrop-blur transition-colors hover:bg-secondary hover:text-foreground"
+            className="absolute left-4 top-4 z-30 flex items-center justify-center rounded-lg border border-border bg-popover/95 p-1.5 text-muted-foreground shadow-lg backdrop-blur transition-colors hover:bg-secondary hover:text-foreground"
           >
             <PanelLeftOpen className="h-4 w-4" />
           </button>
@@ -251,11 +278,38 @@ export function ViewRoute() {
           rootId={canvasRootId}
           onNavigate={onCanvasNavigate}
           onClearFocus={onCanvasClearFocus}
+          leftControlsInset={collapsed}
         />
       </section>
     </div>
   );
 }
+
+type Tone = "sky" | "amber" | "red";
+
+// Each tab carries one accent color, shared by its icon and — when
+// active — its underline, label text, and count badge, so the active
+// highlight always matches the tab's own icon color.
+const TAB_TONE: Record<Tone, { icon: string; text: string; border: string; badge: string }> = {
+  sky: {
+    icon: "text-sky-500",
+    text: "text-sky-600 dark:text-sky-400",
+    border: "border-sky-500",
+    badge: "bg-sky-500/15 text-sky-600 dark:text-sky-400",
+  },
+  amber: {
+    icon: "text-amber-500",
+    text: "text-amber-600 dark:text-amber-400",
+    border: "border-amber-500",
+    badge: "bg-amber-500/15 text-amber-600 dark:text-amber-400",
+  },
+  red: {
+    icon: "text-red-500",
+    text: "text-red-600 dark:text-red-400",
+    border: "border-red-500",
+    badge: "bg-red-500/15 text-red-600 dark:text-red-400",
+  },
+};
 
 function ModeTab({
   active,
@@ -263,7 +317,6 @@ function ModeTab({
   label,
   icon: Icon,
   count,
-  warn,
   disabled,
   tone = "amber",
 }: {
@@ -272,18 +325,10 @@ function ModeTab({
   label: string;
   icon: LucideIcon;
   count?: number;
-  warn?: boolean;
   disabled?: boolean;
-  tone?: "amber" | "red";
+  tone?: Tone;
 }) {
-  const red = tone === "red";
-  // The warn state tints the tab's own icon (amber/red) so an inactive,
-  // icon-only tab still signals that it has something worth a look.
-  const warnIconColor = warn
-    ? red
-      ? active ? "text-red-500" : "text-red-500/70"
-      : active ? "text-amber-500" : "text-amber-500/70"
-    : undefined;
+  const t = TAB_TONE[tone];
   return (
     <button
       type="button"
@@ -291,34 +336,35 @@ function ModeTab({
       disabled={disabled}
       title={label}
       aria-label={label}
+      // Active tab grows to fill the row; inactive tabs shrink to an
+      // icon-only square. Animating flex-grow (plus the label's
+      // max-width/opacity) makes the swap slide rather than snap.
+      style={{ flexGrow: active ? 1 : 0 }}
       className={cn(
-        "flex items-center justify-center gap-1.5 py-2 text-xs font-medium transition-colors",
-        // Active tab fills the remaining width; inactive tabs shrink to
-        // an icon-only square.
+        "flex items-center justify-center border-b-2 px-3 py-2 text-xs font-medium",
+        "transition-[flex-grow,color,border-color,background-color] duration-300 ease-out",
+        // Active: underline + label take the tab's accent color.
         active
-          ? "flex-1 border-b-2 border-primary text-foreground"
-          : "px-3 text-muted-foreground hover:text-foreground",
+          ? cn(t.border, t.text)
+          : "border-transparent text-muted-foreground hover:text-foreground",
         disabled && "cursor-default opacity-40",
       )}
     >
-      <Icon className={cn("h-4 w-4 shrink-0", warnIconColor)} />
-      {active && (
-        <>
-          {label}
-          {count != null && count > 0 && (
-            <span
-              className={cn(
-                "rounded-full px-1.5 py-px text-[10px] leading-none",
-                red
-                  ? "bg-red-500/15 text-red-600 dark:text-red-400"
-                  : "bg-amber-500/15 text-amber-600 dark:text-amber-400",
-              )}
-            >
-              {count}
-            </span>
-          )}
-        </>
-      )}
+      {/* Icon always wears the tab's accent color (dimmed while inactive). */}
+      <Icon className={cn("h-4 w-4 shrink-0", t.icon, !active && "opacity-70")} />
+      <span
+        className={cn(
+          "flex items-center overflow-hidden whitespace-nowrap transition-all duration-300 ease-out",
+          active ? "ml-1.5 max-w-[200px] opacity-100" : "ml-0 max-w-0 opacity-0",
+        )}
+      >
+        {label}
+        {count != null && count > 0 && (
+          <span className={cn("ml-1.5 rounded-full px-1.5 py-px text-[10px] leading-none", t.badge)}>
+            {count}
+          </span>
+        )}
+      </span>
     </button>
   );
 }
@@ -331,11 +377,18 @@ function ModeTab({
 function ResizeHandle({
   onResize,
   onReset,
+  onDraggingChange,
 }: {
   onResize: (clientX: number) => void;
   onReset: () => void;
+  onDraggingChange?: (dragging: boolean) => void;
 }) {
   const [dragging, setDragging] = useState(false);
+
+  // Let the parent suppress the width transition while dragging.
+  useEffect(() => {
+    onDraggingChange?.(dragging);
+  }, [dragging, onDraggingChange]);
 
   useEffect(() => {
     if (!dragging) return;
@@ -452,46 +505,91 @@ function OrphanPanel({
   );
 }
 
-/** Whole numbers of days between `until` (end of that day) and now. */
-function daysOverdue(until: string): number {
+/** Whole days between the end of the `until` day and now.
+ *  Positive → overdue by that many days; negative → that many days left. */
+function daysFromNow(until: string): number {
   const end = Date.parse(`${until}T23:59:59.999`);
   if (!Number.isFinite(end)) return 0;
   return Math.floor((Date.now() - end) / 86_400_000);
 }
 
-function ExpiredPanel({
+function groupByType(fields: UntilField[]) {
+  const map = new Map<string, UntilField[]>();
+  for (const f of fields) {
+    if (!map.has(f.typeId)) map.set(f.typeId, []);
+    map.get(f.typeId)!.push(f);
+  }
+  return [...map.entries()].map(([typeId, list]) => ({ typeId, list }));
+}
+
+/** The "Until" tab, split into an already-past section and an upcoming
+ *  section so the two are easy to tell apart at a glance. */
+function UntilPanel({
+  expired,
+  upcoming,
+  focusId,
+  onSelect,
+}: {
+  expired: UntilField[];
+  upcoming: UntilField[];
+  focusId: string | null;
+  onSelect: (f: UntilField) => void;
+}) {
+  return (
+    <div className="min-h-0 flex-1 overflow-auto [scrollbar-width:none] [&_::-webkit-scrollbar]:w-0">
+      {expired.length > 0 && (
+        <UntilSection
+          variant="expired"
+          fields={expired}
+          focusId={focusId}
+          onSelect={onSelect}
+        />
+      )}
+      {upcoming.length > 0 && (
+        <UntilSection
+          variant="upcoming"
+          fields={upcoming}
+          focusId={focusId}
+          onSelect={onSelect}
+        />
+      )}
+    </div>
+  );
+}
+
+function UntilSection({
+  variant,
   fields,
   focusId,
   onSelect,
 }: {
-  fields: ExpiredField[];
+  variant: "expired" | "upcoming";
+  fields: UntilField[];
   focusId: string | null;
-  onSelect: (f: ExpiredField) => void;
+  onSelect: (f: UntilField) => void;
 }) {
-  // Group by owning type, preserving the most-overdue-first order the
-  // context already sorted the flat list into.
-  const grouped = useMemo(() => {
-    const map = new Map<string, ExpiredField[]>();
-    for (const f of fields) {
-      if (!map.has(f.typeId)) map.set(f.typeId, []);
-      map.get(f.typeId)!.push(f);
-    }
-    return [...map.entries()].map(([typeId, list]) => ({ typeId, list }));
-  }, [fields]);
-
-  if (fields.length === 0) return null;
+  const grouped = useMemo(() => groupByType(fields), [fields]);
+  const expired = variant === "expired";
 
   return (
-    <div className="min-h-0 flex-1 overflow-auto [scrollbar-width:none] [&_::-webkit-scrollbar]:w-0">
-      <div className="px-3 py-2 text-[10px] text-muted-foreground">
-        {fields.length} field{fields.length !== 1 ? "s" : ""} past their{" "}
-        <span className="font-mono text-red-500">until</span> date
+    <section>
+      {/* Section banner — distinguishes past from upcoming. */}
+      <div
+        className={cn(
+          "sticky top-0 z-10 flex items-center gap-1.5 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider backdrop-blur",
+          expired
+            ? "bg-red-500/10 text-red-600 dark:text-red-400"
+            : "bg-amber-500/10 text-amber-600 dark:text-amber-400",
+        )}
+      >
+        {expired ? "Expired" : "Upcoming"}
+        <span className="opacity-70">({fields.length})</span>
       </div>
       {grouped.map(({ typeId, list }) => {
         const style = KIND_STYLES[list[0]!.typeKind];
         return (
           <div key={typeId}>
-            <div className="sticky top-0 flex items-center gap-1.5 bg-card/90 px-3 py-1 text-[10px] backdrop-blur">
+            <div className="flex items-center gap-1.5 px-3 py-1 text-[10px]">
               <Badge className={cn("shrink-0 px-1.5 py-0 text-[9px] leading-4", style.badge)}>
                 {style.label}
               </Badge>
@@ -500,7 +598,10 @@ function ExpiredPanel({
             </div>
             <ul>
               {list.map((f) => {
-                const overdue = daysOverdue(f.until);
+                const days = daysFromNow(f.until);
+                const meta = expired
+                  ? days > 0 ? `${days.toLocaleString()}d overdue` : "overdue"
+                  : days < 0 ? `in ${Math.abs(days).toLocaleString()}d` : "due today";
                 return (
                   <li key={`${f.typeId}.${f.fieldName}.${f.fieldIndex}`}>
                     <button
@@ -508,19 +609,33 @@ function ExpiredPanel({
                       onClick={() => onSelect(f)}
                       className={cn(
                         "flex w-full flex-col gap-0.5 px-3 py-1.5 text-left transition-colors",
-                        focusId === f.typeId ? "bg-red-500/10" : "hover:bg-secondary/60",
+                        focusId === f.typeId
+                          ? expired ? "bg-red-500/10" : "bg-amber-500/10"
+                          : "hover:bg-secondary/60",
                       )}
                     >
                       <span className="flex w-full items-center gap-2 font-mono text-xs">
-                        <span className="truncate text-red-600 line-through decoration-red-500/50 dark:text-red-400">
+                        <span
+                          className={cn(
+                            "truncate line-through",
+                            expired
+                              ? "text-red-600 decoration-red-500/50 dark:text-red-400"
+                              : "text-amber-700 decoration-amber-500/50 dark:text-amber-300",
+                          )}
+                        >
                           {f.fieldName}
                         </span>
-                        <span className="ml-auto shrink-0 font-mono text-[10px] text-red-500">
+                        <span
+                          className={cn(
+                            "ml-auto shrink-0 font-mono text-[10px]",
+                            expired ? "text-red-500" : "text-amber-500",
+                          )}
+                        >
                           {f.until}
                         </span>
                       </span>
                       <span className="text-[10px] text-muted-foreground">
-                        {overdue > 0 ? `${overdue.toLocaleString()}d overdue` : "overdue"}
+                        {meta}
                         {f.deprecationReason ? ` · ${stripUntil(f.deprecationReason)}` : ""}
                       </span>
                     </button>
@@ -531,7 +646,7 @@ function ExpiredPanel({
           </div>
         );
       })}
-    </div>
+    </section>
   );
 }
 

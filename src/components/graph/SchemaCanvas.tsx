@@ -97,6 +97,10 @@ interface Props {
   rootId?: string | null;
   onNavigate?: (typeId: string) => void;
   onClearFocus?: () => void;
+  /** When true, the canvas's top-left overlay controls slide down to
+   *  clear room for an external control (the sidebar-expand button that
+   *  appears when the sidebar is collapsed). */
+  leftControlsInset?: boolean;
 }
 
 interface EdgeGroupSpec {
@@ -1201,7 +1205,7 @@ function buildDotGridTexture(dotColor: number, alpha: number): Texture {
 
 // ─── Main component ───────────────────────────────────────────────────
 
-export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClearFocus }: Props) {
+export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClearFocus, leftControlsInset }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const pixiContainerRef = useRef<HTMLDivElement>(null);
   const [size, setSize] = useState({ w: 1, h: 1 });
@@ -1246,6 +1250,16 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   // "recently visited" jump list overlaid on the canvas.
   type HistoryItem =
     | { kind: "node"; id: string; nodeId: string; name: string; nodeKind: NodeKind; ts: number }
+    | {
+        kind: "field";
+        id: string;
+        typeId: string;
+        typeName: string;
+        fieldName: string;
+        fieldIndex: number;
+        nodeKind: NodeKind;
+        ts: number;
+      }
     | {
         kind: "edge";
         id: string;
@@ -1897,14 +1911,18 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   // a flash of giant full-detail cards at the origin before the fit lands.
   // A layout effect runs synchronously after commit, before paint and before
   // the next rAF, so viewRef + currentLodRef are correct on the first frame.
-  const fittedKey = useRef("");
+  // Tracks the `laidNodes` reference we last auto-fit. Keyed on the
+  // layout's *identity*, not the viewport size — so a new schema/layout
+  // (or the first valid size) fits, but a pure resize (window resize or
+  // the sidebar collapse/expand animation) preserves the user's current
+  // pan/zoom. That keeps the graph — and the fixed FPS/history overlays —
+  // from jumping around while the canvas width animates.
+  const fittedLayoutRef = useRef<LaidNode[] | null>(null);
   const FOCUS_MIN_ZOOM = 0.9;
   useLayoutEffect(() => {
     if (laidNodes.length === 0 || size.w <= 1) return;
-    // Auto-fit: only fires when the key changes (new layout or resize)
-    const key = `${laidNodes.length}:${Math.round(size.w)}:${Math.round(size.h)}`;
-    if (fittedKey.current !== key) {
-      fittedKey.current = key;
+    if (fittedLayoutRef.current !== laidNodes) {
+      fittedLayoutRef.current = laidNodes;
       const pad = 80;
       const gW = bounds.maxX - bounds.minX + pad * 2;
       const gH = bounds.maxY - bounds.minY + pad * 2;
@@ -3837,22 +3855,83 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     }
   }, [edgeGroups]);
 
-  // When a field is pinned (tree-panel click), frame the canvas
-  // view onto the owner type's node — centers it and lifts the zoom
-  // to at least FIELD_CLICK_MIN_ZOOM so the pinned row is legible.
-  // Re-fires on every pin change so clicking the same field again
-  // (or another field of the same type) re-centers.
+  // When a field is pinned (tree-panel click, Until-panel, or canvas
+  // field click), don't try to fit the whole owner type — a big type like
+  // Mutation never comes into view usefully. Instead just bring the
+  // *clicked field's row* to the centre of the canvas at a readable zoom.
+  // Deterministic — derived only from the node bounds and viewport, never
+  // the current zoom — so repeated clicks land identically.
   useEffect(() => {
     if (!pinnedField) return;
     const n = nodeById.get(pinnedField.typeId);
     if (!n) return;
-    const targetK = Math.max(viewRef.current.k, FIELD_CLICK_MIN_ZOOM * 1.4);
+    const margin = 48;
+    const availW = Math.max(1, size.w - margin * 2);
+    // Readable zoom from the node width, clamped to a legible range.
+    const targetK = Math.min(Math.max(availW / n.w, 0.7), 1.3);
+
+    // World Y of the clicked row's centre. Match the row by NAME against
+    // the canvas node's own field/value list — the tree's fieldIndex can
+    // diverge from the canvas node's array (primitive-field filtering,
+    // Relay unwrapping, ordering), which would otherwise drop us onto the
+    // node centre instead of the actual field. Falls back to the given
+    // index, then the node centre.
+    const rows: { name: string }[] =
+      n.data.kind === "Enum" ? (n.data.values ?? []) : (n.data.fields ?? []);
+    let rowIdx = rows.findIndex((r) => r.name === pinnedField.fieldName);
+    if (rowIdx < 0 && pinnedField.fieldIndex >= 0 && pinnedField.fieldIndex < rows.length) {
+      rowIdx = pinnedField.fieldIndex;
+    }
+    let rowY = n.cy;
+    if (rowIdx >= 0) {
+      const bodyTop = n.headerH + TOP_BODY_PAD - 2;
+      rowY = n.cy - n.h / 2 + bodyTop + rowIdx * n.rowH + n.rowH / 2;
+    }
+
     viewRef.current = {
       k: targetK,
       x: size.w / 2 - n.cx * targetK,
-      y: size.h / 2 - n.cy * targetK,
+      y: size.h / 2 - rowY * targetK,
     };
-  }, [pinnedField, nodeById, size.w, size.h]);
+    // The view just jumped; refresh the LOD immediately and bypass the
+    // motion-settle gate so the framed node's text renders at once
+    // rather than sitting on its low-detail placeholder.
+    const newLod = computeLOD(targetK, currentLodRef.current);
+    if (newLod !== currentLodRef.current) {
+      currentLodRef.current = newLod;
+      setLodTick((t) => t + 1);
+    }
+    focusJumpPendingRef.current = true;
+    wakeRef.current();
+    // Intentionally NOT keyed on size: re-frame only on an actual pin
+    // change, not while the canvas width animates during a sidebar
+    // collapse/expand — otherwise the view would drift and the fixed
+    // overlays would appear to move. `size` is read fresh from the
+    // closure whenever a real pin change re-runs this.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pinnedField, nodeById]);
+
+  // Record every field pin (tree-panel click, Until-panel selection, or
+  // canvas field click) in the Recent history, alongside node/edge
+  // clicks — clicking the entry re-frames and re-highlights the field.
+  useEffect(() => {
+    if (!pinnedField) return;
+    const n = nodeById.get(pinnedField.typeId);
+    if (!n) return;
+    pushHistory({
+      kind: "field",
+      id: `field:${pinnedField.typeId}.${pinnedField.fieldName}`,
+      typeId: pinnedField.typeId,
+      typeName: n.data.name,
+      fieldName: pinnedField.fieldName,
+      fieldIndex: pinnedField.fieldIndex,
+      nodeKind: n.data.kind,
+      ts: Date.now(),
+    });
+    // pushHistory is a stable closure over setClickHistory; excluded to
+    // avoid re-pushing on unrelated re-renders.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pinnedField, nodeById]);
 
   // Pinned-field highlight — draws a persistent orange ring around
   // the specific field row a user clicked in the tree panel. Reads
@@ -3868,19 +3947,23 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     const bodyTop = n.headerH + TOP_BODY_PAD - 2;
     const nodeLeft = n.cx - n.w / 2;
     const nodeTop = n.cy - n.h / 2;
-    const fields = n.data.fields ?? [];
-    if (pinnedField.fieldIndex < 0 || pinnedField.fieldIndex >= fields.length) {
-      return;
+    // Enum values are laid out on the same row grid as object fields.
+    // Match by name against the canvas node's own list (the tree's
+    // fieldIndex can diverge from it), falling back to the given index.
+    const rows: { name: string }[] =
+      n.data.kind === "Enum" ? (n.data.values ?? []) : (n.data.fields ?? []);
+    let rowIdx = rows.findIndex((r) => r.name === pinnedField.fieldName);
+    if (rowIdx < 0 && pinnedField.fieldIndex >= 0 && pinnedField.fieldIndex < rows.length) {
+      rowIdx = pinnedField.fieldIndex;
     }
-    const y = nodeTop + bodyTop + pinnedField.fieldIndex * n.rowH;
+    if (rowIdx < 0) return;
+    const y = nodeTop + bodyTop + rowIdx * n.rowH;
     const pad = 2;
-    g.roundRect(
-      nodeLeft + pad,
-      y - pad,
-      n.w - pad * 2,
-      n.rowH + pad * 2,
-      4,
-    );
+    // A soft fill under a bright ring so the pinned row reads clearly at
+    // a glance, even against the node's own colored body.
+    g.roundRect(nodeLeft + pad, y - pad, n.w - pad * 2, n.rowH + pad * 2, 4);
+    g.fill({ color: 0xf97316, alpha: 0.18 });
+    g.roundRect(nodeLeft + pad, y - pad, n.w - pad * 2, n.rowH + pad * 2, 4);
     g.stroke({ width: 2, color: 0xf97316, alpha: 0.95 });
   }, [pinnedField, nodeById]);
 
@@ -3996,7 +4079,10 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       <div ref={pixiContainerRef} style={{ width: size.w, height: size.h }} />
 
       <div
-        className="pointer-events-auto absolute left-4 top-4 z-20 flex items-center gap-1.5 rounded-lg border border-border bg-popover/95 px-2 py-1.5 font-mono text-xs text-popover-foreground opacity-40 shadow-lg backdrop-blur transition-opacity duration-150 hover:opacity-100"
+        className={cn(
+          "pointer-events-auto absolute left-4 top-4 z-20 flex items-center gap-1.5 rounded-lg border border-border bg-popover/95 px-2 py-1.5 font-mono text-xs text-popover-foreground opacity-40 shadow-lg backdrop-blur transition-[opacity,transform] duration-300 ease-out hover:opacity-100",
+          leftControlsInset && "translate-y-11",
+        )}
         onMouseMove={(ev) => ev.stopPropagation()}
         onClick={(ev) => ev.stopPropagation()}
       >
@@ -4044,7 +4130,10 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       </div>
 
       <div
-        className="pointer-events-auto absolute left-4 top-14 z-20 flex flex-col gap-1.5 rounded-lg border border-border bg-popover/95 px-2 py-1.5 font-mono text-xs text-popover-foreground opacity-40 shadow-lg backdrop-blur transition-opacity duration-150 hover:opacity-100"
+        className={cn(
+          "pointer-events-auto absolute left-4 top-14 z-20 flex flex-col gap-1.5 rounded-lg border border-border bg-popover/95 px-2 py-1.5 font-mono text-xs text-popover-foreground opacity-40 shadow-lg backdrop-blur transition-[opacity,transform] duration-300 ease-out hover:opacity-100",
+          leftControlsInset && "translate-y-11",
+        )}
         onMouseMove={(ev) => ev.stopPropagation()}
         onClick={(ev) => ev.stopPropagation()}
       >
@@ -4178,6 +4267,56 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
                     </li>
                   );
                 }
+                if (item.kind === "field") {
+                  const style = KIND_STYLES[item.nodeKind];
+                  return (
+                    <li key={`${item.id}:${item.ts}`} className="group flex items-center px-2 py-0.5">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setFocusedEdge(null);
+                          // Re-pin → re-frames the owner node and
+                          // re-draws the field-row highlight.
+                          setPinnedField({
+                            typeId: item.typeId,
+                            fieldName: item.fieldName,
+                            fieldIndex: item.fieldIndex,
+                          });
+                        }}
+                        onMouseEnter={(ev) => {
+                          setHoveredHistoryItem(item);
+                          moveHistoryTip(ev.clientX, ev.clientY);
+                        }}
+                        onMouseMove={(ev) => moveHistoryTip(ev.clientX, ev.clientY)}
+                        onMouseLeave={() => setHoveredHistoryItem(null)}
+                        className={cn(
+                          "flex min-w-0 flex-1 cursor-pointer items-center gap-2 rounded px-2 py-1 text-left transition-colors hover:brightness-110",
+                          style.header,
+                        )}
+                      >
+                        <span className={cn("rounded px-1 py-0 text-[9px] uppercase tracking-wide", style.badge)}>
+                          {style.label}
+                        </span>
+                        <span className="min-w-0 flex-1 truncate">
+                          {item.typeName}
+                          <span className="text-muted-foreground">.</span>
+                          <span style={{ color: "#f59e0b" }}>{item.fieldName}</span>
+                        </span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={(ev) => {
+                          ev.stopPropagation();
+                          removeFromHistory(item.id);
+                        }}
+                        className="mr-2 shrink-0 rounded p-1 text-muted-foreground opacity-0 transition-opacity hover:bg-secondary hover:text-foreground group-hover:opacity-100"
+                        title="Remove from history"
+                      >
+                        <X className="h-3 w-3" />
+                      </button>
+                    </li>
+                  );
+                }
                 const sourceKind = nodeById.get(item.sourceId)?.data.kind;
                 const targetKind = nodeById.get(item.targetId)?.data.kind;
                 const sourceStyle = sourceKind ? KIND_STYLES[sourceKind] : null;
@@ -4279,6 +4418,29 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
                   {KIND_STYLES[item.nodeKind].label}
                 </span>
                 <span className="font-semibold">{item.name}</span>
+              </div>
+            </div>
+          );
+        }
+        if (item.kind === "field") {
+          return (
+            <div
+              ref={historyTipElRef}
+              className="pointer-events-none fixed z-50 whitespace-nowrap rounded-lg border border-border bg-popover/95 px-3 py-2 font-mono text-xs text-popover-foreground shadow-lg backdrop-blur"
+              style={tooltipStyle(hoveredHistoryPosRef.current.x, hoveredHistoryPosRef.current.y)}
+            >
+              <div className="flex items-center gap-2">
+                <span
+                  className="rounded px-1 py-0 text-[9px] uppercase tracking-wide text-white"
+                  style={{ backgroundColor: KIND_COLORS[item.nodeKind] }}
+                >
+                  {KIND_STYLES[item.nodeKind].label}
+                </span>
+                <span>
+                  <span className="font-semibold">{item.typeName}</span>
+                  <span className="text-muted-foreground">.</span>
+                  <span style={{ color: "#f59e0b" }}>{item.fieldName}</span>
+                </span>
               </div>
             </div>
           );
