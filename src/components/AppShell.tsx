@@ -1,5 +1,5 @@
 import { Link, useRouterState } from "@tanstack/react-router";
-import { Compass } from "lucide-react";
+import logo from "@/favicon.png";
 import { ThemeToggle } from "./theme-toggle";
 import { useSchema } from "@/lib/schema-context";
 import { cn } from "@/lib/utils";
@@ -23,7 +23,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       <header className="sticky top-0 z-20 flex h-14 shrink-0 items-center justify-between border-b border-border bg-background/80 px-4 backdrop-blur">
         <div className="flex items-center gap-6">
           <Link to="/" className="flex items-center gap-2 font-semibold">
-            <Compass className="h-5 w-5 text-primary" />
+            <img src={logo} alt="" className="h-5 w-5" />
             <span>Graviz</span>
           </Link>
           <nav className="flex items-center gap-1">
