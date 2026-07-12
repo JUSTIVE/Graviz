@@ -299,11 +299,20 @@ function parseColor(color: string): [number, number, number] {
 
 // ─── Mesh builder ─────────────────────────────────────────────────────
 
+// Max quads per Mesh. Huge nodes (hundreds of described fields) can
+// exceed 70k quads; a single giant indexed draw silently truncates on
+// some drivers (observed on ANGLE→Metal — bottom rows vanish), the
+// same failure mode that led the edge renderer to EDGES_PER_BATCH.
+// 8,192 quads = 32,768 vertices, which also lets each chunk use
+// 16-bit indices.
+const MAX_QUADS_PER_MESH = 8192;
+
 /**
- * Build one static Mesh containing every glyph quad for a node card.
- * Positions are card-local px (same space the Canvas 2D painter used),
- * so the mesh is positioned at the node's top-left like its sprite.
- * Returns null when the runs contain no visible glyphs.
+ * Build the glyph quads for a node card as one Container holding one
+ * Mesh per MAX_QUADS_PER_MESH chunk. Positions are card-local px
+ * (same space the Canvas 2D painter used), so the container is
+ * positioned at the node's top-left like its sprite. Returns null
+ * when the runs contain no visible glyphs.
  */
 export function buildNodeTextMesh(
   runs: TextRun[],
@@ -312,12 +321,16 @@ export function buildNodeTextMesh(
 ): Container | null {
   const atlas = getSdfAtlas();
 
-  // Count quads first so buffers are allocated exactly once.
+  // Upper bound for the buffer allocation: every char, spaces
+  // included. The build loop below may emit fewer quads (spaces,
+  // unbakeable glyphs) but can never emit more — an undercount here
+  // would make the subarray views silently clamp and truncate the
+  // tail of the mesh (bottom rows of huge nodes went missing when
+  // this counted `ch !== " "` while the font gave spaces a non-zero
+  // bounding box).
   let quadCount = 0;
   for (const run of runs) {
-    for (const ch of run.text) {
-      if (ch !== " ") quadCount++;
-    }
+    for (const _ch of run.text) quadCount++;
   }
   if (quadCount === 0) return null;
 
@@ -325,7 +338,6 @@ export function buildNodeTextMesh(
   const uvs = new Float32Array(quadCount * 8);
   const colors = new Float32Array(quadCount * 16);
   const scales = new Float32Array(quadCount * 4);
-  const indices = new Uint32Array(quadCount * 6);
 
   let q = 0;
   for (const run of runs) {
@@ -338,7 +350,9 @@ export function buildNodeTextMesh(
     for (const ch of run.text) {
       const g = atlas.glyph(ch, run.weight, run.italic);
       if (!g) continue;
-      if (g.w === 0) {
+      // Spaces advance the pen but never emit a quad, even when the
+      // font reports a non-zero bounding box for them.
+      if (g.w === 0 || ch === " ") {
         penX += g.advance * s;
         continue;
       }
@@ -365,33 +379,45 @@ export function buildNodeTextMesh(
         colors[ci + 3] = run.alpha;
         scales[q * 4 + v] = scale;
       }
-      const ii = q * 6;
-      const base = q * 4;
+      q++;
+    }
+  }
+  if (q === 0) return null;
+
+  const container = new Container();
+  for (let start = 0; start < q; start += MAX_QUADS_PER_MESH) {
+    const n = Math.min(MAX_QUADS_PER_MESH, q - start);
+    // Indices are chunk-local (each quad's vertices are contiguous),
+    // so 16 bits always suffice: n * 4 ≤ 32,768.
+    const indices = new Uint16Array(n * 6);
+    for (let i = 0; i < n; i++) {
+      const base = i * 4;
+      const ii = i * 6;
       indices[ii] = base;
       indices[ii + 1] = base + 1;
       indices[ii + 2] = base + 2;
       indices[ii + 3] = base;
       indices[ii + 4] = base + 2;
       indices[ii + 5] = base + 3;
-      q++;
     }
+    const geometry = new Geometry({
+      attributes: {
+        aPosition: { buffer: positions.subarray(start * 8, (start + n) * 8), format: "float32x2" },
+        aUV: { buffer: uvs.subarray(start * 8, (start + n) * 8), format: "float32x2" },
+        aColor: { buffer: colors.subarray(start * 16, (start + n) * 16), format: "float32x4" },
+        aScale: { buffer: scales.subarray(start * 4, (start + n) * 4), format: "float32" },
+      },
+      indexBuffer: indices,
+    });
+    const mesh = new Mesh({ geometry, shader: getTextShader() });
+    mesh.once("destroyed", () => geometry.destroy());
+    mesh.cullable = true;
+    mesh.boundsArea = new Rectangle(0, 0, boundsW, boundsH);
+    container.addChild(mesh);
   }
-  if (q === 0) return null;
-
-  const geometry = new Geometry({
-    attributes: {
-      aPosition: { buffer: positions.subarray(0, q * 8), format: "float32x2" },
-      aUV: { buffer: uvs.subarray(0, q * 8), format: "float32x2" },
-      aColor: { buffer: colors.subarray(0, q * 16), format: "float32x4" },
-      aScale: { buffer: scales.subarray(0, q * 4), format: "float32" },
-    },
-    indexBuffer: indices.subarray(0, q * 6),
-  });
-  const mesh = new Mesh({ geometry, shader: getTextShader() });
-  mesh.once("destroyed", () => geometry.destroy());
-  mesh.cullable = true;
-  mesh.boundsArea = new Rectangle(0, 0, boundsW, boundsH);
-  return mesh;
+  container.cullable = true;
+  container.boundsArea = new Rectangle(0, 0, boundsW, boundsH);
+  return container;
 }
 
 /** Upload any glyphs baked during this frame's mesh builds. */

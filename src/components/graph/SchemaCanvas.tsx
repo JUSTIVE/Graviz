@@ -3800,6 +3800,25 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       getSpriteResetCount: () => spriteResetCountRef.current,
       getTicksSwept: () => ticksSweptRef.current,
       getSyncBuildCount: () => syncBuildCountRef.current,
+      /** Test-only: SDF text mesh stats per node — chunk count, quads
+       *  per chunk, and visibility — to distinguish build-side from
+       *  draw-side text loss. */
+      getTextMeshInfo: () =>
+        [...nodeTextMeshesRef.current.entries()].map(([id, tm]) => ({
+          id,
+          visible: tm.visible,
+          alpha: tm.alpha,
+          x: tm.x,
+          y: tm.y,
+          chunks: tm.children.map((c) => {
+            const geom = (c as Mesh).geometry;
+            return {
+              indices: geom.indexBuffer?.data?.length ?? 0,
+              positions: geom.getAttribute("aPosition")?.buffer?.data?.length ?? 0,
+              visible: c.visible,
+            };
+          }),
+        })),
       /** Test-only: drive a navigation through the same code path
        *  that a canvas return-type click or a tree-panel field
        *  click uses. */
