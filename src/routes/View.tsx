@@ -184,6 +184,13 @@ export function ViewRoute() {
           collapsed && !isLg && "hidden",
         )}
       >
+        {/* On `lg` the content keeps a fixed pixel width while the grid
+            column animates, so collapsing clips (masks) it instead of
+            reflowing text at every frame. */}
+        <div
+          className="flex min-h-0 flex-1 flex-col"
+          style={isLg ? { width: sidebarWidth } : undefined}
+        >
         {/* Mode tab switcher. Inactive tabs collapse to their icon; the
             active tab expands to fill the row with icon + label. */}
         <div className="flex shrink-0 items-stretch border-b border-border">
@@ -251,6 +258,7 @@ export function ViewRoute() {
             }}
           />
         )}
+        </div>
 
         {/* Drag handle — only in the expanded side-by-side layout. */}
         {isLg && !collapsed && (
