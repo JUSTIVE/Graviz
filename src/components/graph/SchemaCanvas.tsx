@@ -1,4 +1,10 @@
 import { Application, Container, Geometry, Graphics, Mesh, NineSliceSprite, Shader, Sprite, Texture, TilingSprite, UniformGroup } from "pixi.js";
+import {
+  buildNodeTextMesh,
+  flushSdfAtlas,
+  updateTextZoom,
+  type TextRun,
+} from "./sdf-text";
 import { ArrowRight, ChevronDown, ChevronUp, Filter, History, Loader2, Microscope, Trash2, X } from "lucide-react";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { BezierSegment, LayoutResult } from "@/lib/layout";
@@ -435,6 +441,62 @@ function fitText(ctx: CanvasRenderingContext2D, s: string, maxWidth: number): st
   return result;
 }
 
+// ─── SDF text mode (hybrid renderer experiment) ──────────────────────
+// When on, full-LOD card textures are baked *without text* at a fixed
+// DPR (chrome is flat color, it doesn't need zoom-bucket sharpening)
+// and the text is rendered as SDF glyph quad meshes on a layer above
+// the sprites — crisp at every zoom with zero rebuilds. Toggle off for
+// A/B comparison with `?sdf=0`.
+const SDF_TEXT_ENABLED =
+  typeof window !== "undefined" &&
+  new URLSearchParams(window.location.search).get("sdf") !== "0";
+const SDF_CHROME_DPR =
+  typeof window !== "undefined" ? Math.min(2, Math.max(1, window.devicePixelRatio || 1)) : 1;
+
+/** Parsed subset of a ctx.font string, cached by the raw string. */
+const fontParseCache = new Map<string, { px: number; weight: number; italic: boolean }>();
+function parseCtxFont(font: string): { px: number; weight: number; italic: boolean } {
+  let p = fontParseCache.get(font);
+  if (p) return p;
+  const px = parseFloat(/(\d+(?:\.\d+)?)px/.exec(font)?.[1] ?? "10");
+  const weight = parseInt(/(?:^|\s)([1-9]00)(?:\s)/.exec(font)?.[1] ?? "400", 10);
+  const italic = /(?:^|\s)italic(?:\s|$)/.test(font);
+  p = { px, weight, italic };
+  fontParseCache.set(font, p);
+  return p;
+}
+
+/**
+ * fillText or capture: when `sink` is set the run is recorded (SDF
+ * text mode — the glyphs will be rendered by the SDF mesh layer) and
+ * nothing is painted; otherwise this is a plain ctx.fillText. Reads
+ * font / fillStyle / globalAlpha from the ctx so call sites keep their
+ * existing state-setting code as the single source of truth.
+ */
+function paintText(
+  ctx: CanvasRenderingContext2D,
+  sink: TextRun[] | null,
+  text: string,
+  x: number,
+  y: number,
+) {
+  if (!sink) {
+    ctx.fillText(text, x, y);
+    return;
+  }
+  const { px, weight, italic } = parseCtxFont(ctx.font);
+  sink.push({
+    text,
+    x,
+    y,
+    px,
+    weight,
+    italic,
+    color: typeof ctx.fillStyle === "string" ? ctx.fillStyle : "#ffffff",
+    alpha: ctx.globalAlpha,
+  });
+}
+
 function roundRect(
   ctx: CanvasRenderingContext2D,
   x: number,
@@ -490,11 +552,12 @@ function drawColoredType(
   /** When set, overrides the type color entirely (used to paint the
    *  type red on expired rows). */
   colorOverride?: string,
+  sink: TextRun[] | null = null,
 ) {
   const w = cachedTextWidth(ctx, typeStr);
   ctx.fillStyle = colorOverride ?? (primitive ? "#b08c5a" : "#f59e0b");
   ctx.globalAlpha = (colorOverride ? 1 : primitive ? 0.7 : 1) * baseAlpha;
-  ctx.fillText(typeStr, rightX - w, y);
+  paintText(ctx, sink, typeStr, rightX - w, y);
   ctx.globalAlpha = 1;
 }
 
@@ -530,6 +593,9 @@ function drawNodeSprite(
   n: LaidNode,
   { cardColor, fgColor, mutedFg }: SpriteCtx,
   lod: SpriteLOD,
+  /** SDF text mode: capture text runs here instead of rasterizing
+   *  them into the card texture (full LOD only). */
+  sink: TextRun[] | null = null,
 ) {
   const w = n.w;
   const h = n.h;
@@ -636,12 +702,12 @@ function drawNodeSprite(
   ctx.font = `600 9px ${MONO}`;
   ctx.fillStyle = "#ffffff";
   ctx.globalAlpha = 0.6;
-  ctx.fillText(n.data.kind.toUpperCase(), 8, 14);
+  paintText(ctx, sink, n.data.kind.toUpperCase(), 8, 14);
   ctx.globalAlpha = 1;
 
   ctx.font = NODE_NAME_FONT;
   ctx.fillStyle = "#ffffff";
-  ctx.fillText(fitText(ctx, n.data.name, w - 16), 8, 30);
+  paintText(ctx, sink, fitText(ctx, n.data.name, w - 16), 8, 30);
 
   // Type-level description rendered in the header when the toggle is
   // on. One regular line, white-on-color-header, left-aligned with
@@ -650,7 +716,7 @@ function drawNodeSprite(
     ctx.font = `9px ${MONO}`;
     ctx.fillStyle = "#ffffff";
     ctx.globalAlpha = 0.75;
-    ctx.fillText(fitText(ctx, n.data.description.replace(/\s+/g, " ").trim(), w - 16), 8, 42);
+    paintText(ctx, sink, fitText(ctx, n.data.description.replace(/\s+/g, " ").trim(), w - 16), 8, 42);
     ctx.globalAlpha = 1;
   }
 
@@ -663,7 +729,9 @@ function drawNodeSprite(
     ctx.globalAlpha = 0.7;
     // Match the field-name's x=10 left margin so the description
     // sits flush under its row's name (no longer indented).
-    ctx.fillText(
+    paintText(
+      ctx,
+      sink,
       fitText(ctx, desc.replace(/\s+/g, " ").trim(), w - 20),
       10,
       fy + 11,
@@ -680,7 +748,7 @@ function drawNodeSprite(
       const expired = isUntilExpired(v.until);
       ctx.font = `10px ${MONO}`;
       ctx.fillStyle = expired ? EXPIRED_COLOR : mutedFg;
-      ctx.fillText(v.name, 10, fy);
+      paintText(ctx, sink, v.name, 10, fy);
       if (expired) {
         const nameW = ctx.measureText(v.name).width;
         ctx.strokeStyle = EXPIRED_COLOR;
@@ -702,12 +770,12 @@ function drawNodeSprite(
     ctx.fillStyle = mutedFg;
     const members = n.data.members ?? [];
     for (let i = 0; i < members.length; i++) {
-      ctx.fillText("| " + members[i]!, 10, bodyY + i * rowH + 10);
+      paintText(ctx, sink, "| " + members[i]!, 10, bodyY + i * rowH + 10);
     }
   } else if (n.data.kind === "Scalar") {
     ctx.font = `italic 10px ${MONO}`;
     ctx.fillStyle = mutedFg;
-    ctx.fillText("custom scalar", 10, bodyY + 10);
+    paintText(ctx, sink, "custom scalar", 10, bodyY + 10);
   } else {
     const fields = n.data.fields ?? [];
     ctx.font = `10px ${MONO}`;
@@ -721,7 +789,7 @@ function drawNodeSprite(
       ctx.font = `10px ${MONO}`;
       ctx.fillStyle = expired ? EXPIRED_COLOR : fgColor;
       ctx.globalAlpha = depAlpha;
-      ctx.fillText(f.name, 10, fy);
+      paintText(ctx, sink, f.name, 10, fy);
       if (f.isDeprecated) {
         const nameW = ctx.measureText(f.name).width;
         const typeW = cachedTextWidth(ctx, f.type);
@@ -745,7 +813,7 @@ function drawNodeSprite(
         ctx.globalAlpha = 1;
         ctx.font = `10px ${MONO}`;
       }
-      drawColoredType(ctx, f.type, w - 10, fy, BUILTIN_SCALARS.has(f.typeName), depAlpha, expired ? EXPIRED_COLOR : undefined);
+      drawColoredType(ctx, f.type, w - 10, fy, BUILTIN_SCALARS.has(f.typeName), depAlpha, expired ? EXPIRED_COLOR : undefined, sink);
       drawRowDesc(
         f.description ?? (f.isDeprecated ? f.deprecationReason : undefined),
         fy,
@@ -768,7 +836,7 @@ function drawNodeSprite(
       ctx.fillStyle = ifaceColor;
       for (let i = 0; i < interfaces.length; i++) {
         const fy = sectionTop + centerOffset + i * rowH + 10;
-        ctx.fillText(fitText(ctx, interfaces[i]!, w - 20), 10, fy);
+        paintText(ctx, sink, fitText(ctx, interfaces[i]!, w - 20), 10, fy);
       }
     }
   }
@@ -1430,6 +1498,8 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     focusEdgeGraphics: Container | null;
     hoverEdgeGraphics: Container | null;
     nodeContainer: Container | null;
+    /** SDF text meshes, one per full-LOD node, above the card sprites. */
+    textContainer: Container | null;
     investigateOverlay: Graphics | null;
     pinFieldGraphics: Graphics | null;
     hoverGraphics: Graphics | null;
@@ -1442,6 +1512,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     focusEdgeGraphics: null,
     hoverEdgeGraphics: null,
     nodeContainer: null,
+    textContainer: null,
     investigateOverlay: null,
     pinFieldGraphics: null,
     hoverGraphics: null,
@@ -1453,6 +1524,30 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   const spriteDprRef = useRef(0);
   const nodeSpritesRef = useRef(new Map<string, NineSliceSprite>());
   const spriteCtxRef = useRef<SpriteCtx | null>(null);
+  // SDF text meshes, keyed by node id. Lifecycle is tied 1:1 to the
+  // node's full-LOD texture cache entry — created when that texture is
+  // built, destroyed whenever it is purged/evicted.
+  const nodeTextMeshesRef = useRef(new Map<string, Container>());
+
+  // Stable helpers for the ticker closure (touch only refs).
+  const ensureNodeTextMeshRef = useRef((node: LaidNode, runs: TextRun[]) => {
+    const textContainer = sceneRef.current.textContainer;
+    if (!textContainer) return;
+    if (nodeTextMeshesRef.current.has(node.id)) return;
+    const mesh = buildNodeTextMesh(runs, node.w, node.h);
+    if (!mesh) return;
+    mesh.position.set(node.cx - node.w / 2, node.cy - node.h / 2);
+    if (edgeGroupsRef.current.dimNodeIds.has(node.id)) mesh.alpha = 0.1;
+    textContainer.addChild(mesh);
+    nodeTextMeshesRef.current.set(node.id, mesh);
+  });
+  const destroyNodeTextMeshRef = useRef((id: string) => {
+    const tm = nodeTextMeshesRef.current.get(id);
+    if (!tm) return;
+    tm.parent?.removeChild(tm);
+    tm.destroy({ children: true });
+    nodeTextMeshesRef.current.delete(id);
+  });
 
   // Edge tile cache — spatial grid of per-tile Graphics. See `TILE_SIZE`
   // below. Each tile is built lazily when it first enters the viewport
@@ -2726,6 +2821,9 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       const hoverEdgeGraphics = new Container();
       const nodeContainer = new Container();
       nodeContainer.cullable = true;
+      // SDF text layer — glyph quad meshes above the card chrome.
+      const textContainer = new Container();
+      textContainer.cullable = true;
       const investigateOverlay = new Graphics();
       const pinFieldGraphics = new Graphics();
       const hoverGraphics = new Graphics();
@@ -2743,6 +2841,10 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       // emphasized line reads cleanly without spilling onto nodes.
       world.addChild(hoverEdgeGraphics);
       world.addChild(nodeContainer);
+      // Text sits directly above the card sprites so field highlights
+      // (pin/hover, added later) keep their existing z-order relative
+      // to the chrome.
+      world.addChild(textContainer);
       // Investigate overlay sits above nodes so its orange outlines
       // pop over the (possibly dimmed) cards.
       world.addChild(investigateOverlay);
@@ -2766,6 +2868,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         focusEdgeGraphics,
         hoverEdgeGraphics,
         nodeContainer,
+        textContainer,
         investigateOverlay,
         pinFieldGraphics,
         hoverGraphics,
@@ -2848,6 +2951,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         scene.world.position.set(v.x, v.y);
         scene.world.scale.set(v.k, v.k);
         updateEdgeZoom(v.k);
+        if (SDF_TEXT_ENABLED) updateTextZoom(v.k);
 
         // Detect LOD change → trigger node/edge rebuild. Whenever
         // the LOD steps up into "full" (most often: right after the
@@ -3153,7 +3257,14 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
           const nodeContainer = scene.nodeContainer;
           const spriteCtx = spriteCtxRef.current;
           const lod = currentLodRef.current;
-          const dpr = spriteDprForLod(lod, v.k);
+          // SDF text mode: full-LOD textures carry only flat-color
+          // chrome, so they never need the zoom-proportional resolution
+          // ladder — a fixed DPR both kills bucket-crossing rebuilds
+          // and keeps the cache key stable.
+          const dpr =
+            SDF_TEXT_ENABLED && lod === "full"
+              ? SDF_CHROME_DPR
+              : spriteDprForLod(lod, v.k);
           spriteDprRef.current = dpr;
 
           const prev = lastSpriteSweepViewRef.current;
@@ -3291,6 +3402,10 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
                 // same kind — cheap and gives a proper card silhouette
                 // instead of the old solid tinted rectangle.
                 if (lod !== "full" && !forceFull) {
+                  // Keep the (still cached) text mesh but hide it —
+                  // bar/chrome placeholders carry their own fake text.
+                  const tm = nodeTextMeshesRef.current.get(id);
+                  if (tm && tm.visible) tm.visible = false;
                   const kindTex = kindTextureCacheRef.current.get(
                     node.data.kind,
                   );
@@ -3305,8 +3420,16 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
                   continue;
                 }
                 const effLod: SpriteLOD = forceFull ? "full" : lod;
-                const effDpr = forceFull ? spriteDprForLod("full", v.k) : dpr;
+                const effDpr = forceFull
+                  ? SDF_TEXT_ENABLED
+                    ? SDF_CHROME_DPR
+                    : spriteDprForLod("full", v.k)
+                  : dpr;
                 const key = `${id}:${effLod}:${effDpr}`;
+                if (SDF_TEXT_ENABLED) {
+                  const tm = nodeTextMeshesRef.current.get(id);
+                  if (tm && !tm.visible) tm.visible = true;
+                }
                 const cachedTex = textureCacheRef.current.get(key);
                 if (cachedTex) {
                   if (sprite.texture !== cachedTex) {
@@ -3331,7 +3454,12 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
                   const c2d = can.getContext("2d");
                   if (c2d) {
                     c2d.setTransform(drawDpr, 0, 0, drawDpr, 0, 0);
-                    drawNodeSprite(c2d, node, spriteCtx, "full");
+                    const sink: TextRun[] | null = SDF_TEXT_ENABLED ? [] : null;
+                    drawNodeSprite(c2d, node, spriteCtx, "full", sink);
+                    if (sink) {
+                      ensureNodeTextMeshRef.current(node, sink);
+                      flushSdfAtlas();
+                    }
                     const tex = Texture.from(can);
                     textureCacheRef.current.set(key, tex);
                     sprite.texture = tex;
@@ -3370,6 +3498,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
                 sprite.destroy();
                 nodeSpritesRef.current.delete(id);
                 spriteLastSeenFrameRef.current.delete(id);
+                destroyNodeTextMeshRef.current(id);
               }
             }
 
@@ -3437,7 +3566,10 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
             const c2d = can.getContext("2d");
             if (c2d) {
               c2d.setTransform(drawDpr, 0, 0, drawDpr, 0, 0);
-              drawNodeSprite(c2d, n, buildQ.spriteCtx, buildQ.lod);
+              const sink: TextRun[] | null =
+                SDF_TEXT_ENABLED && buildQ.lod === "full" ? [] : null;
+              drawNodeSprite(c2d, n, buildQ.spriteCtx, buildQ.lod, sink);
+              if (sink) ensureNodeTextMeshRef.current(n, sink);
               const tex = Texture.from(can);
               textureCacheRef.current.set(key, tex);
               const spr = nodeSpritesRef.current.get(n.id);
@@ -3451,6 +3583,9 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
               }
             }
           }
+          // One GPU upload for every glyph baked by this frame's
+          // builds (no-op when the atlas is clean).
+          if (SDF_TEXT_ENABLED) flushSdfAtlas();
           if (buildQ.nodes.length === 0) {
             // Drain complete: every sprite currently in view has a
             // texture for `buildQ.lod` at `buildQ.dpr`. Any cached
@@ -3491,6 +3626,12 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
                 tex.destroy(true);
               }
               textureCacheRef.current.delete(key);
+              // A purged full-LOD texture takes its text mesh with it
+              // so the pair stays in lockstep (both rebuild together
+              // on the next full-LOD sweep).
+              if (key.includes(":full:")) {
+                destroyNodeTextMeshRef.current(key.slice(0, key.indexOf(":")));
+              }
             }
             spriteBuildQueueRef.current = null;
             // Only clear the focus-jump flag once sprite *creation*
@@ -3583,11 +3724,13 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
             focusEdgeGraphics: null,
         hoverEdgeGraphics: null,
         nodeContainer: null,
+        textContainer: null,
         investigateOverlay: null,
         pinFieldGraphics: null,
         hoverGraphics: null,
         focusGraphics: null,
       };
+      nodeTextMeshesRef.current.clear();
       // Explicit tile cache teardown. Pixi destroys Graphics children
       // via app.destroy, but holding stale references in the ref would
       // leak when the component remounts.
@@ -3851,6 +3994,12 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     nodeSpritesRef.current.clear();
     scene.nodeContainer.removeChildren();
 
+    for (const tm of nodeTextMeshesRef.current.values()) {
+      tm.destroy({ children: true });
+    }
+    nodeTextMeshesRef.current.clear();
+    scene.textContainer?.removeChildren();
+
     const cardColor = getComputedCssVar("--card", "#ffffff");
     const fgColor = getComputedCssVar("--foreground", "#0f172a");
     const mutedFg = getComputedCssVar("--muted-foreground", "#64748b");
@@ -3872,6 +4021,9 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     const DIM = 0.1;
     for (const [id, sprite] of nodeSpritesRef.current) {
       sprite.alpha = dimNodeIds.has(id) ? DIM : 1;
+    }
+    for (const [id, tm] of nodeTextMeshesRef.current) {
+      tm.alpha = dimNodeIds.has(id) ? DIM : 1;
     }
   }, [edgeGroups]);
 

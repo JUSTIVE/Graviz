@@ -5,6 +5,7 @@
     "": {
       "name": "bun-react-template",
       "dependencies": {
+        "@mapbox/tiny-sdf": "^2.2.0",
         "@radix-ui/react-label": "^2.1.7",
         "@radix-ui/react-select": "^2.2.6",
         "@radix-ui/react-slot": "^1.2.3",
@@ -82,6 +83,8 @@
     "@locator/runtime": ["@locator/runtime@0.5.1", "", { "dependencies": { "@floating-ui/dom": "^1.6.12", "@locator/shared": "^0.5.0", "solid-js": "^1.9.2", "tailwindcss": "^3.4.14" } }, "sha512-VA7uF1QJXO+YLsREnpIuHuF2sq0O683jGLX6R2zhgIKsoM40kLuEGStyd+J/48fLZR1L062/tr2CoJRpK9c2SA=="],
 
     "@locator/shared": ["@locator/shared@0.5.0", "", { "dependencies": { "semver": "^7.7.3" } }, "sha512-NS46z7y1et5YFrD4S6VIWs5uSEkvEL0TaCDuZfUBUyK/1oFQMvwYI5K6+FyqDaYbkaE+fuInOOJ3vWzQtkX/ig=="],
+
+    "@mapbox/tiny-sdf": ["@mapbox/tiny-sdf@2.2.0", "", {}, "sha512-LVL4wgI9YAum5V+LNVQO6QgFBPw7/MIIY4XJPNsPDMrjEwcE+JfKk1LuIl8GnF197ejVdC9QdPaxrx5gfgdGXg=="],
 
     "@marijn/find-cluster-break": ["@marijn/find-cluster-break@1.0.2", "", {}, "sha512-l0h88YhZFyKdXIFNfSWpyjStDjGHwZ/U7iobcK1cQQD8sejsONdQtTVU+1wVN1PBw40PiiHB1vA5S7VTfQiP9g=="],
 
