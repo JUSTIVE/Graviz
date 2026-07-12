@@ -1,5 +1,14 @@
 import TinySDF from "@mapbox/tiny-sdf";
-import { Container, Geometry, Mesh, Rectangle, Shader, Texture, UniformGroup } from "pixi.js";
+import {
+  BufferImageSource,
+  Container,
+  Geometry,
+  Mesh,
+  Rectangle,
+  Shader,
+  Texture,
+  UniformGroup,
+} from "pixi.js";
 
 /**
  * SDF text rendering for node cards (hybrid renderer experiment).
@@ -66,8 +75,10 @@ interface AtlasGlyph {
 }
 
 class SdfGlyphAtlas {
-  readonly canvas: HTMLCanvasElement;
-  readonly ctx: CanvasRenderingContext2D;
+  /** Single-channel SDF backing store — uploaded as an R8 texture
+   *  (2048² = 4.2 MB on both sides, vs 16.8 MB as RGBA canvas). The
+   *  shader samples `.r`. */
+  private readonly data: Uint8Array;
   readonly texture: Texture;
   private glyphs = new Map<string, AtlasGlyph | null>();
   private sdfs = new Map<string, TinySDF>();
@@ -78,11 +89,15 @@ class SdfGlyphAtlas {
   private full = false;
 
   constructor() {
-    this.canvas = document.createElement("canvas");
-    this.canvas.width = ATLAS_SIZE;
-    this.canvas.height = ATLAS_SIZE;
-    this.ctx = this.canvas.getContext("2d", { willReadFrequently: true })!;
-    this.texture = Texture.from(this.canvas);
+    this.data = new Uint8Array(ATLAS_SIZE * ATLAS_SIZE);
+    const source = new BufferImageSource({
+      resource: this.data,
+      width: ATLAS_SIZE,
+      height: ATLAS_SIZE,
+      format: "r8unorm",
+      alphaMode: "no-premultiply-alpha",
+    });
+    this.texture = new Texture({ source });
   }
 
   private sdfFor(weight: number, italic: boolean): TinySDF {
@@ -140,16 +155,13 @@ class SdfGlyphAtlas {
     this.penX += g.width + 1;
     this.rowH = Math.max(this.rowH, g.height);
 
-    // Write the single-channel SDF into the alpha channel (white RGB
-    // so the premultiplied sample stays neutral).
-    const img = this.ctx.createImageData(g.width, g.height);
-    for (let i = 0; i < g.data.length; i++) {
-      img.data[i * 4] = 255;
-      img.data[i * 4 + 1] = 255;
-      img.data[i * 4 + 2] = 255;
-      img.data[i * 4 + 3] = g.data[i]!;
+    // Blit the glyph's SDF rows straight into the R8 backing buffer.
+    for (let row = 0; row < g.height; row++) {
+      this.data.set(
+        g.data.subarray(row * g.width, row * g.width + g.width),
+        (y + row) * ATLAS_SIZE + x,
+      );
     }
-    this.ctx.putImageData(img, x, y);
     this.dirty = true;
 
     const entry: AtlasGlyph = {
@@ -223,7 +235,7 @@ function getTextShader(): Shader {
         uniform vec4 uColor;
         uniform float uZoom;
         void main() {
-          float d = texture2D(uTexture, vUV).a;
+          float d = texture2D(uTexture, vUV).r;
           // vScale = world px spanned by one SDF alpha unit. A ~0.75
           // screen-px feather converted into alpha units, clamped so
           // heavily minified text degrades to a soft fade instead of
