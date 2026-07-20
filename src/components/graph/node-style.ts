@@ -107,18 +107,24 @@ export function estimateNodeHeight(
   memberCount = 0,
   interfaceCount = 0,
   showDescriptions = false,
+  /** For Object types: number of Union types this type is a member
+   *  of — rendered as an extra amber section below `implements`. */
+  unionCount = 0,
 ): number {
   const rowH = rowHFor(showDescriptions);
   const headerH = headerHFor(showDescriptions);
-  const rows =
-    kind === "Enum"
-      ? valueCount
-      : kind === "Union"
-        ? memberCount
-        : kind === "Scalar"
-          ? 0
-          : fieldCount + interfaceCount;
-  const body = rows === 0 ? rowH : rows * rowH;
+  const rows = kind === "Enum" ? valueCount : kind === "Scalar" ? 0 : kind === "Union" ? 0 : fieldCount;
+  // Rows that never carry a description line — implements /
+  // union-membership sections and Union member rows — always use the
+  // tight base ROW_H even in descriptions mode.
+  const tightRows =
+    kind === "Union"
+      ? memberCount
+      : kind === "Object" || kind === "Interface"
+        ? interfaceCount + unionCount
+        : 0;
+  const body =
+    rows === 0 && tightRows === 0 ? rowH : rows * rowH + tightRows * ROW_H;
   // Add a small gap between the last field row and the implements
   // section so they don't collide visually (only applies when the
   // node actually has both fields AND interfaces).
@@ -128,7 +134,14 @@ export function estimateNodeHeight(
     fieldCount > 0
       ? IMPL_SECTION_GAP
       : 0;
-  return headerH + TOP_BODY_PAD + body + implGap + BOTTOM_PAD;
+  // Same breathing strip above the union-membership section — but only
+  // against plain field rows. When an implements section sits directly
+  // above, the two colored bands touch instead.
+  const unionGap =
+    kind === "Object" && unionCount > 0 && interfaceCount === 0 && fieldCount > 0
+      ? IMPL_SECTION_GAP
+      : 0;
+  return headerH + TOP_BODY_PAD + body + implGap + unionGap + BOTTOM_PAD;
 }
 
 /** Font used for the name row in a node header — referenced from both

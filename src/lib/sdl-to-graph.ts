@@ -36,6 +36,10 @@ export interface GraphNodeData {
   values?: EnumValue[];
   members?: string[];
   interfaces?: string[];
+  /** For Object types: names of Union types that include this type as
+   *  a member (reverse of {@link members}). Rendered as an extra card
+   *  section, like `interfaces`. */
+  memberOfUnions?: string[];
 }
 
 export interface GraphEdgeData {
@@ -473,6 +477,27 @@ export function sdlToGraph(sdl: string, options: SdlToGraphOptions = {}): Parsed
   const keptNodes = hideRelayBoilerplate
     ? nodes.filter((n) => !isRelayBoilerplate(n))
     : nodes;
+
+  // Reverse union membership: each Object member gets the list of
+  // Unions that include it, mirroring how `interfaces` hangs off the
+  // implementing type. Computed over kept nodes so a filtered-out
+  // union never shows up as a phantom membership.
+  {
+    const unionsByMember = new Map<string, string[]>();
+    for (const n of keptNodes) {
+      if (n.kind !== "Union" || !n.members) continue;
+      for (const m of n.members) {
+        const list = unionsByMember.get(m);
+        if (list) list.push(n.name);
+        else unionsByMember.set(m, [n.name]);
+      }
+    }
+    for (const n of keptNodes) {
+      if (n.kind !== "Object") continue;
+      const unions = unionsByMember.get(n.name);
+      if (unions) n.memberOfUnions = unions.sort();
+    }
+  }
   const keptIds = new Set(keptNodes.map((n) => n.id));
   const edges = rawEdges.filter((e) => keptIds.has(e.target) && keptIds.has(e.source));
 

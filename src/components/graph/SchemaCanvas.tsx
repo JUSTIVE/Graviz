@@ -580,12 +580,74 @@ function drawRelayIcon(ctx: CanvasRenderingContext2D, cx: number, cy: number) {
   ctx.restore();
 }
 
+/**
+ * Card-local Y geometry of the trailing implements / member-of-union
+ * sections. Mirrors drawNodeSprite's full-tier text layout exactly
+ * (including the +2 body offset, section gaps, and in-band centering)
+ * so the hit-test and hover overlay land on the same pixels the
+ * painter used. Section rows always use the tight ROW_H pitch — they
+ * never carry description lines.
+ */
+function trailingSectionGeom(n: LaidNode): {
+  /** Violet wash band (implements). Zero-height when no interfaces. */
+  ifaceBandTop: number;
+  ifaceBandBottom: number;
+  /** Amber wash band (member-of-union). Runs to the card bottom. */
+  unionBandTop: number;
+  ifaceRowsTop: number;
+  ifaceBlockH: number;
+  unionRowsTop: number;
+  unionBlockH: number;
+} {
+  const fields = n.data.fields?.length ?? 0;
+  const ifaces = n.data.interfaces?.length ?? 0;
+  const unions =
+    n.data.kind === "Object" ? (n.data.memberOfUnions?.length ?? 0) : 0;
+  const implGap = ifaces > 0 && fields > 0 ? IMPL_SECTION_GAP : 0;
+  const unionGap = unions > 0 && ifaces === 0 && fields > 0 ? IMPL_SECTION_GAP : 0;
+  const washTop =
+    n.headerH + TOP_BODY_PAD + fields * n.rowH - 2 + implGap + unionGap;
+  const ifaceBlockH = ifaces * ROW_H;
+  const unionBlockH = unions * ROW_H;
+  // Leftover space below the section rows (bottom pad + rounding).
+  // With both sections present it is split evenly between the two
+  // bands so equal row counts render equal band heights; a lone
+  // section absorbs all of it.
+  const extra = Math.max(0, n.h - washTop - ifaceBlockH - unionBlockH);
+  const ifaceBandTop = washTop;
+  const ifaceBandBottom =
+    ifaces > 0
+      ? unions > 0
+        ? washTop + ifaceBlockH + Math.floor(extra / 2)
+        : n.h
+      : washTop;
+  const unionBandTop = ifaces > 0 ? ifaceBandBottom : washTop;
+  const ifaceRowsTop =
+    ifaceBandTop +
+    Math.max(0, Math.floor((ifaceBandBottom - ifaceBandTop - ifaceBlockH) / 2));
+  const unionRowsTop =
+    unionBandTop + Math.max(0, Math.floor((n.h - unionBandTop - unionBlockH) / 2));
+  return {
+    ifaceBandTop,
+    ifaceBandBottom,
+    unionBandTop,
+    ifaceRowsTop,
+    ifaceBlockH,
+    unionRowsTop,
+    unionBlockH,
+  };
+}
+
 function bodyRowCount(n: LaidNode): number {
   const d = n.data;
   if (d.kind === "Enum") return (d.values ?? []).length;
   if (d.kind === "Union") return (d.members ?? []).length;
   if (d.kind === "Scalar") return 1;
-  return (d.fields ?? []).length + (d.interfaces ?? []).length;
+  return (
+    (d.fields ?? []).length +
+    (d.interfaces ?? []).length +
+    (d.memberOfUnions ?? []).length
+  );
 }
 
 function drawNodeSprite(
@@ -633,39 +695,43 @@ function drawNodeSprite(
   ctx.stroke();
   ctx.globalAlpha = 1;
 
-  // Implements section background — a violet wash (matching the
-  // Interface kind color) over the bottom of the card so the
-  // `implements X` rows visually read as a separate sub-section
-  // distinct from the field list.
+  // Trailing-section backgrounds — a violet wash for the `implements`
+  // rows and an amber wash (Union kind color) for the "member of
+  // union" rows, so both read as sub-sections distinct from the field
+  // list.
   if (n.data.kind === "Object" || n.data.kind === "Interface") {
     const interfaceCount = n.data.interfaces?.length ?? 0;
-    if (interfaceCount > 0) {
-      const fieldCount = n.data.fields?.length ?? 0;
-      // Add a gap between the last field and the implements section
-      // when the node has both — mirrors the extra height baked in
-      // by `estimateNodeHeight`. With no fields, the violet section
-      // starts right after the header (no gap to insert).
-      const implGap = fieldCount > 0 ? IMPL_SECTION_GAP : 0;
-      const implTop = headerH + TOP_BODY_PAD + fieldCount * rowH - 2 + implGap;
-      // Clip to the rounded card shape so the violet doesn't spill
+    const unionCount =
+      n.data.kind === "Object" ? (n.data.memberOfUnions?.length ?? 0) : 0;
+    const washSection = (top: number, bottom: number, color: string) => {
+      // Clip to the rounded card shape so the wash doesn't spill
       // past the bottom corner curves.
       ctx.save();
       roundRect(ctx, 0, 0, w, h, 6);
       ctx.clip();
-      ctx.fillStyle = KIND_COLORS.Interface;
+      ctx.fillStyle = color;
       ctx.globalAlpha = 0.1;
-      ctx.fillRect(0, implTop, w, h - implTop);
+      ctx.fillRect(0, top, w, bottom - top);
       ctx.globalAlpha = 1;
       ctx.restore();
-      // Thin divider above the implements section.
-      ctx.strokeStyle = KIND_COLORS.Interface;
+      // Thin divider above the section.
+      ctx.strokeStyle = color;
       ctx.globalAlpha = 0.4;
       ctx.lineWidth = 0.5;
       ctx.beginPath();
-      ctx.moveTo(0, implTop);
-      ctx.lineTo(w, implTop);
+      ctx.moveTo(0, top);
+      ctx.lineTo(w, top);
       ctx.stroke();
       ctx.globalAlpha = 1;
+    };
+    // Band bounds come from the shared geometry helper — the same
+    // source the hit-test and hover overlay use.
+    const geom = trailingSectionGeom(n);
+    if (interfaceCount > 0) {
+      washSection(geom.ifaceBandTop, geom.ifaceBandBottom, KIND_COLORS.Interface);
+    }
+    if (unionCount > 0) {
+      washSection(geom.unionBandTop, h, KIND_COLORS.Union);
     }
   }
 
@@ -680,8 +746,10 @@ function drawNodeSprite(
 
     const bodyY = headerH + TOP_BODY_PAD - 2;
     const rowCount = bodyRowCount(n);
+    // Union member bars mirror the tight ROW_H pitch of the real rows.
+    const barPitch = n.data.kind === "Union" ? ROW_H : rowH;
     for (let i = 0; i < rowCount; i++) {
-      const fy = bodyY + i * rowH + 3;
+      const fy = bodyY + i * barPitch + 3;
       const ff = BAR_FIELD_FRACS[i % BAR_FIELD_FRACS.length]!;
       const tf = BAR_TYPE_FRACS[i % BAR_TYPE_FRACS.length]!;
       const typeBarW = avail * tf;
@@ -766,11 +834,15 @@ function drawNodeSprite(
       );
     }
   } else if (n.data.kind === "Union") {
+    // Member rows are Object types — paint them in the Object kind
+    // color, no "|" prefix (the union header already says union).
+    // Members carry no description line, so they always use the tight
+    // ROW_H pitch, even in descriptions mode.
     ctx.font = `10px ${MONO}`;
-    ctx.fillStyle = mutedFg;
+    ctx.fillStyle = KIND_COLORS.Object;
     const members = n.data.members ?? [];
     for (let i = 0; i < members.length; i++) {
-      paintText(ctx, sink, "| " + members[i]!, 10, bodyY + i * rowH + 10);
+      paintText(ctx, sink, members[i]!, 10, bodyY + i * ROW_H + 10);
     }
   } else if (n.data.kind === "Scalar") {
     ctx.font = `italic 10px ${MONO}`;
@@ -820,23 +892,28 @@ function drawNodeSprite(
       );
     }
     const interfaces = n.data.interfaces ?? [];
+    const memberOfUnions =
+      n.data.kind === "Object" ? (n.data.memberOfUnions ?? []) : [];
+    // Section rows never carry descriptions — tight ROW_H pitch
+    // regardless of descriptions mode. Row positions come from the
+    // shared geometry helper (centered inside each wash band); the
+    // "implements" / "|" prefixes are dropped — the band colors
+    // already communicate the semantics.
+    const geom = trailingSectionGeom(n);
     if (interfaces.length > 0) {
-      const ifaceColor = KIND_COLORS.Interface;
-      // Vertically center the implements list inside the violet
-      // section so a single interface name doesn't hug the divider.
-      // The "implements" / "&" prefix is dropped — the violet
-      // background already communicates that these are
-      // implementations.
-      const implGap = fields.length > 0 ? IMPL_SECTION_GAP : 0;
-      const sectionTop = bodyY + fields.length * rowH + 2 + implGap;
-      const sectionH = h - sectionTop;
-      const blockH = interfaces.length * rowH;
-      const centerOffset = Math.max(0, Math.floor((sectionH - blockH) / 2));
       ctx.font = `600 10px ${MONO}`;
-      ctx.fillStyle = ifaceColor;
+      ctx.fillStyle = KIND_COLORS.Interface;
       for (let i = 0; i < interfaces.length; i++) {
-        const fy = sectionTop + centerOffset + i * rowH + 10;
+        const fy = geom.ifaceRowsTop + i * ROW_H + 10;
         paintText(ctx, sink, fitText(ctx, interfaces[i]!, w - 20), 10, fy);
+      }
+    }
+    if (memberOfUnions.length > 0) {
+      ctx.font = `600 10px ${MONO}`;
+      ctx.fillStyle = KIND_COLORS.Union;
+      for (let i = 0; i < memberOfUnions.length; i++) {
+        const fy = geom.unionRowsTop + i * ROW_H + 10;
+        paintText(ctx, sink, fitText(ctx, memberOfUnions[i]!, w - 20), 10, fy);
       }
     }
   }
@@ -1652,14 +1729,18 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       const interfaceRows: [string, string][] = (n.interfaces ?? []).map(
         (iface): [string, string] => [iface, ""],
       );
+      const unionRows: [string, string][] = (n.memberOfUnions ?? []).map(
+        (u): [string, string] => [u, ""],
+      );
       const bodyRows: [string, string][] =
         n.kind === "Enum"
           ? (n.values?.map((v): [string, string] => [v.name, ""]) ?? [])
           : n.kind === "Union"
-            ? (n.members?.map((m): [string, string] => ["| " + m, ""]) ?? [])
+            ? (n.members?.map((m): [string, string] => [m, ""]) ?? [])
             : [
                 ...(n.fields?.map((x): [string, string] => [x.name, x.typeName]) ?? []),
                 ...interfaceRows,
+                ...unionRows,
               ];
       return {
         id: n.id,
@@ -1671,6 +1752,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
           n.members?.length ?? 0,
           n.interfaces?.length ?? 0,
           showGraphDescriptions,
+          n.memberOfUnions?.length ?? 0,
         ),
       };
     });
@@ -2287,14 +2369,23 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
             },
           };
         }
+        // Trailing sections (implements / member-of-union) use the
+        // tight ROW_H pitch and carry gap/centering offsets — derive
+        // the row index from the painter's exact geometry instead of
+        // the field grid.
         const interfaces = data.interfaces ?? [];
-        const ifaceIdx = rowIdx - fields.length;
-        if (ifaceIdx < interfaces.length) {
+        const geom = trailingSectionGeom(n);
+        const ifaceIdx =
+          localY >= geom.ifaceRowsTop &&
+          localY < geom.ifaceRowsTop + geom.ifaceBlockH
+            ? Math.floor((localY - geom.ifaceRowsTop) / ROW_H)
+            : -1;
+        if (ifaceIdx >= 0 && ifaceIdx < interfaces.length) {
           const ifaceName = interfaces[ifaceIdx]!;
           const nav = nodeById.has(ifaceName) ? ifaceName : null;
           return {
             nodeId: n.id,
-            fieldIndex: rowIdx,
+            fieldIndex: fields.length + ifaceIdx,
             fieldName: null,
             navigableTarget: nav,
             isRelayHover: false,
@@ -2304,15 +2395,39 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
             returnTypeRect: null,
           };
         }
+        // "Member of union" rows follow the implements section and
+        // behave the same way: the row IS the union type.
+        const memberOfUnions =
+          data.kind === "Object" ? (data.memberOfUnions ?? []) : [];
+        const unionIdx =
+          localY >= geom.unionRowsTop &&
+          localY < geom.unionRowsTop + geom.unionBlockH
+            ? Math.floor((localY - geom.unionRowsTop) / ROW_H)
+            : -1;
+        if (unionIdx >= 0 && unionIdx < memberOfUnions.length) {
+          const unionName = memberOfUnions[unionIdx]!;
+          const nav = nodeById.has(unionName) ? unionName : null;
+          return {
+            nodeId: n.id,
+            fieldIndex: fields.length + interfaces.length + unionIdx,
+            fieldName: null,
+            navigableTarget: nav,
+            isRelayHover: false,
+            isReturnTypeHover: !!nav,
+            returnTypeRect: null,
+          };
+        }
         return null;
       }
       if (data.kind === "Union") {
-        const m = data.members?.[rowIdx];
+        // Member rows use the tight ROW_H pitch (no descriptions).
+        const memberIdx = Math.floor((localY - bodyTop) / ROW_H);
+        const m = data.members?.[memberIdx];
         if (!m) return null;
         const nav = !BUILTIN_SCALARS.has(m) && nodeById.has(m) ? m : null;
         return {
           nodeId: n.id,
-          fieldIndex: rowIdx,
+          fieldIndex: memberIdx,
           fieldName: null,
           navigableTarget: nav,
           isRelayHover: false,
@@ -2337,6 +2452,11 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     }
     return null;
   };
+
+  // Latest hit-test closure for the once-registered debug hook (its
+  // effect would otherwise capture the pre-layout closure).
+  const hitTestFieldRef = useRef(hitTestField);
+  hitTestFieldRef.current = hitTestField;
 
   const hitTestNodeHeader = (worldX: number, worldY: number): string | null => {
     for (const n of nodesAt(worldX, worldY)) {
@@ -2996,30 +3116,40 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
               const bodyTop = n.headerH + TOP_BODY_PAD - 2;
               const fields = n.data.fields ?? [];
               const interfaces = n.data.interfaces ?? [];
+              const memberOfUnions =
+                n.data.kind === "Object" ? (n.data.memberOfUnions ?? []) : [];
               let hy: number;
-              if (
+              // Rows without description lines (implements /
+              // member-of-union sections, Union member rows) use the
+              // tight ROW_H pitch. Their Y comes from the shared
+              // painter geometry so the highlight tracks the rendered
+              // text exactly.
+              let hoverRowH = n.rowH;
+              if (n.data.kind === "Union") {
+                hy = nodeTop + bodyTop + hoveredField.fieldIndex * ROW_H;
+                hoverRowH = ROW_H;
+              } else if (
+                hoveredField.fieldIndex >= fields.length + interfaces.length &&
+                memberOfUnions.length > 0
+              ) {
+                const unionIdx =
+                  hoveredField.fieldIndex - fields.length - interfaces.length;
+                hy =
+                  nodeTop + trailingSectionGeom(n).unionRowsTop + unionIdx * ROW_H;
+                hoverRowH = ROW_H;
+              } else if (
                 hoveredField.fieldIndex >= fields.length &&
                 interfaces.length > 0
               ) {
-                // Hovered row lives in the implements section, which
-                // is vertically centered inside its violet band —
-                // mirror the same offset used by drawNodeSprite so
-                // the highlight tracks the rendered text.
                 const ifaceIdx = hoveredField.fieldIndex - fields.length;
-                const implGap = fields.length > 0 ? IMPL_SECTION_GAP : 0;
-                const sectionTop = bodyTop + fields.length * n.rowH + 2 + implGap;
-                const sectionH = n.h - sectionTop;
-                const blockH = interfaces.length * n.rowH;
-                const centerOffset = Math.max(
-                  0,
-                  Math.floor((sectionH - blockH) / 2),
-                );
-                hy = nodeTop + sectionTop + centerOffset + ifaceIdx * n.rowH;
+                hy =
+                  nodeTop + trailingSectionGeom(n).ifaceRowsTop + ifaceIdx * ROW_H;
+                hoverRowH = ROW_H;
               } else {
                 hy = nodeTop + bodyTop + hoveredField.fieldIndex * n.rowH;
               }
               const hpad = 4;
-              scene.hoverGraphics.roundRect(nodeLeft + hpad, hy, n.w - hpad * 2, n.rowH, 3);
+              scene.hoverGraphics.roundRect(nodeLeft + hpad, hy, n.w - hpad * 2, hoverRowH, 3);
               scene.hoverGraphics.fill({ color: fgHex, alpha: 0.07 });
 
               // Distinct return-type hover effect — only fires when
@@ -3803,6 +3933,10 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       /** Test-only: SDF text mesh stats per node — chunk count, quads
        *  per chunk, and visibility — to distinguish build-side from
        *  draw-side text loss. */
+      /** Test-only: run the canvas field hit-test at a world point.
+       *  Via ref — the effect's closure would otherwise capture a
+       *  pre-layout hitTestField with an empty node index. */
+      hitTestFieldAt: (wx: number, wy: number) => hitTestFieldRef.current(wx, wy),
       getTextMeshInfo: () =>
         [...nodeTextMeshesRef.current.entries()].map(([id, tm]) => ({
           id,
@@ -3833,6 +3967,8 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
           headerH: n.headerH,
           w: n.w,
           h: n.h,
+          cx: n.cx,
+          cy: n.cy,
         })),
       getInViewNodeIds: () => {
         const v = viewRef.current;
