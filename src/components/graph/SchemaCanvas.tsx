@@ -5022,12 +5022,12 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       {hoveredFieldTip && (
         <div
           ref={fieldTipElRef}
-          className="pointer-events-none fixed z-50 rounded-md border border-border bg-popover px-2.5 py-1.5 font-mono text-[11px] text-popover-foreground shadow-md"
+          className="pointer-events-none fixed z-50 rounded-md border border-border bg-popover px-2.5 py-1.5 font-mono text-[12.5px] text-popover-foreground shadow-md"
           style={tooltipStyle(hoveredFieldScreenRef.current.x, hoveredFieldScreenRef.current.y)}
         >
           {/* Width lives on the inner wrapper — tooltipStyle sets an
               inline maxWidth on the box that would override a class. */}
-          <div className="max-w-[340px]">
+          <div className="max-w-[380px]">
             <div className="mb-0.5 font-semibold">{hoveredFieldTip.name}</div>
             <div className="whitespace-pre-wrap break-words leading-relaxed text-muted-foreground">
               {hoveredFieldTip.desc}
