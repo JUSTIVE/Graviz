@@ -1540,6 +1540,15 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   } | null>(null);
   const hoveredNodeScreenRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
   const nodeTipElRef = useRef<HTMLDivElement | null>(null);
+  // Field-description tooltip — the inline row description is trimmed
+  // to the card width, so hovering the row surfaces the full text.
+  const hoveredFieldTipKeyRef = useRef<string | null>(null);
+  const [hoveredFieldTip, setHoveredFieldTip] = useState<{
+    name: string;
+    desc: string;
+  } | null>(null);
+  const hoveredFieldScreenRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  const fieldTipElRef = useRef<HTMLDivElement | null>(null);
   const [cursor, setCursor] = useState<"grab" | "pointer">("grab");
   const { resolved: themeResolved } = useTheme();
   const {
@@ -2537,10 +2546,10 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     }
     const hit = hitTestField(world.x, world.y);
     const hoveredNode = hitTestNode(world.x, world.y);
-    if (onNavigate) {
-      const lowLod =
+    const lowLod =
       currentLodRef.current !== "full" ||
       viewRef.current.k < FIELD_CLICK_MIN_ZOOM;
+    if (onNavigate) {
       // At low LOD the whole node card is the click target. At full
       // LOD the pointer appears whenever the cursor is on a field row
       // (which is always clickable — pins the field) or on a node
@@ -2568,6 +2577,31 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         : null;
     }
     hoveredNodeRef.current = hoveredNode;
+
+    // Field-description tooltip — full untrimmed text for the hovered
+    // field row (full LOD only). Gated on row identity so a parked
+    // pointer doesn't re-render per move.
+    const tipKey =
+      !lowLod && hit && hit.fieldName ? `${hit.nodeId}:${hit.fieldIndex}` : null;
+    if (tipKey !== hoveredFieldTipKeyRef.current) {
+      hoveredFieldTipKeyRef.current = tipKey;
+      if (tipKey && hit && hit.fieldName) {
+        const f = nodeById.get(hit.nodeId)?.data.fields?.[hit.fieldIndex];
+        const desc =
+          f?.description ?? (f?.isDeprecated ? f.deprecationReason : undefined);
+        setHoveredFieldTip(
+          desc?.trim() ? { name: hit.fieldName, desc: desc.trim() } : null,
+        );
+      } else {
+        setHoveredFieldTip(null);
+      }
+    }
+    if (tipKey) {
+      hoveredFieldScreenRef.current = { x: e.clientX, y: e.clientY };
+      if (fieldTipElRef.current) {
+        applyTooltipStyle(fieldTipElRef.current, e.clientX, e.clientY);
+      }
+    }
 
     // Node-name tooltip data — always tracked here; the JSX shows it
     // only at low LODs (bar / chrome) where the sprite doesn't paint
@@ -2628,6 +2662,10 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     if (hoveredNodeForTipRef.current !== null) {
       hoveredNodeForTipRef.current = null;
       setHoveredNodeTip(null);
+    }
+    if (hoveredFieldTipKeyRef.current !== null) {
+      hoveredFieldTipKeyRef.current = null;
+      setHoveredFieldTip(null);
     }
   };
 
@@ -4978,6 +5016,23 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
             {KIND_STYLES[hoveredNodeTip.kind].label}
           </span>
           <span>{hoveredNodeTip.name}</span>
+        </div>
+      )}
+
+      {hoveredFieldTip && (
+        <div
+          ref={fieldTipElRef}
+          className="pointer-events-none fixed z-50 rounded-md border border-border bg-popover px-2.5 py-1.5 font-mono text-[11px] text-popover-foreground shadow-md"
+          style={tooltipStyle(hoveredFieldScreenRef.current.x, hoveredFieldScreenRef.current.y)}
+        >
+          {/* Width lives on the inner wrapper — tooltipStyle sets an
+              inline maxWidth on the box that would override a class. */}
+          <div className="max-w-[340px]">
+            <div className="mb-0.5 font-semibold">{hoveredFieldTip.name}</div>
+            <div className="whitespace-pre-wrap break-words leading-relaxed text-muted-foreground">
+              {hoveredFieldTip.desc}
+            </div>
+          </div>
         </div>
       )}
 
