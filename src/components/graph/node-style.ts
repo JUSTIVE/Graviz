@@ -153,6 +153,15 @@ const NAME_H_PAD = 16;
 const NODE_MIN_WIDTH = 220;
 const NODE_MAX_WIDTH = 900;
 
+/** Font the field rows actually render with (drawNodeSprite) — field
+ *  width measurement must use the same to avoid over-/under-sizing. */
+const FIELD_FONT = "10px ui-monospace, SFMono-Regular, Menlo, monospace";
+// Field-row width budget: left margin (10) + name + gap + type +
+// right margin (10). The gap is the minimum breathing room between a
+// row's name and its right-aligned type label.
+const FIELD_ROW_SIDE_PAD = 20;
+const FIELD_NAME_TYPE_GAP = 16;
+
 // Global width multiplier — nodes render this much wider than the
 // name+pad requirement, so field-name / field-type rows have plenty
 // of breathing room and their truncation limits can grow
@@ -189,10 +198,17 @@ export function estimateNodeWidth(name: string, fields: [string, string][]): num
   if (ctx) {
     ctx.font = NODE_NAME_FONT;
     textW = ctx.measureText(name).width;
+    // Field rows render at FIELD_FONT (10px), not the 13px header
+    // font — measuring with the render font keeps the name↔type gap
+    // tight instead of inflating every row by ~30%.
+    ctx.font = FIELD_FONT;
     for (const field of fields) {
       fieldMax = Math.max(
         fieldMax,
-        ctx.measureText(field[0]).width + NAME_H_PAD + ctx.measureText(field[1]).width,
+        ctx.measureText(field[0]).width +
+          FIELD_NAME_TYPE_GAP +
+          ctx.measureText(field[1]).width +
+          FIELD_ROW_SIDE_PAD,
       );
     }
   } else {
