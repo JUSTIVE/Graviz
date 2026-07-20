@@ -1549,6 +1549,8 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     /** Set when the tooltip belongs to a card header — renders the
      *  kind badge in the header's color. */
     kind?: NodeKind;
+    /** Field rows: the rendered return-type string, e.g. "[Post!]!". */
+    type?: string;
   } | null>(null);
   const hoveredFieldScreenRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
   const fieldTipElRef = useRef<HTMLDivElement | null>(null);
@@ -2602,7 +2604,9 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         const desc =
           f?.description ?? (f?.isDeprecated ? f.deprecationReason : undefined);
         setHoveredFieldTip(
-          desc?.trim() ? { name: hit.fieldName, desc: desc.trim() } : null,
+          desc?.trim()
+            ? { name: hit.fieldName, desc: desc.trim(), type: f?.type }
+            : null,
         );
       } else if (headerNodeId) {
         const d = nodeById.get(headerNodeId)?.data;
@@ -5060,6 +5064,11 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
                 </span>
               )}
               {hoveredFieldTip.name}
+              {hoveredFieldTip.type && (
+                <span className="font-normal" style={{ color: "#f59e0b" }}>
+                  {hoveredFieldTip.type}
+                </span>
+              )}
             </div>
             <div className="whitespace-pre-wrap break-words leading-relaxed text-muted-foreground">
               {hoveredFieldTip.desc}
