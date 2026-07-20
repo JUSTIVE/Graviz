@@ -862,9 +862,19 @@ function drawNodeSprite(
       ctx.fillStyle = expired ? EXPIRED_COLOR : fgColor;
       ctx.globalAlpha = depAlpha;
       paintText(ctx, sink, f.name, 10, fy);
+      // Defensive truncation: the width estimate should fit every
+      // rendered type, but if a stale layout (or the min-width clamp)
+      // leaves the row short, ellipse the type rather than letting it
+      // pierce the card edge / overlap the name.
+      const nameW = cachedTextWidth(ctx, f.name);
+      const relayPad = f.isRelayConnection ? 20 : 0;
+      const typeStr = fitText(
+        ctx,
+        f.type,
+        Math.max(40, w - 20 - nameW - relayPad - 8),
+      );
       if (f.isDeprecated) {
-        const nameW = ctx.measureText(f.name).width;
-        const typeW = cachedTextWidth(ctx, f.type);
+        const typeW = cachedTextWidth(ctx, typeStr);
         ctx.strokeStyle = expired ? EXPIRED_COLOR : fgColor;
         ctx.lineWidth = 0.75;
         ctx.beginPath();
@@ -878,14 +888,14 @@ function drawNodeSprite(
       }
       ctx.globalAlpha = 1;
       if (f.isRelayConnection) {
-        const typeW = ctx.measureText(f.type).width;
+        const typeW = cachedTextWidth(ctx, typeStr);
         const iconCx = w - 10 - typeW - 8;
         ctx.globalAlpha = depAlpha;
         drawRelayIcon(ctx, iconCx, fy - 2);
         ctx.globalAlpha = 1;
         ctx.font = `10px ${MONO}`;
       }
-      drawColoredType(ctx, f.type, w - 10, fy, BUILTIN_SCALARS.has(f.typeName), depAlpha, expired ? EXPIRED_COLOR : undefined, sink);
+      drawColoredType(ctx, typeStr, w - 10, fy, BUILTIN_SCALARS.has(f.typeName), depAlpha, expired ? EXPIRED_COLOR : undefined, sink);
       drawRowDesc(
         f.description ?? (f.isDeprecated ? f.deprecationReason : undefined),
         fy,
@@ -1738,7 +1748,15 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
           : n.kind === "Union"
             ? (n.members?.map((m): [string, string] => [m, ""]) ?? [])
             : [
-                ...(n.fields?.map((x): [string, string] => [x.name, x.typeName]) ?? []),
+                // Width must fit the *rendered* type string (x.type —
+                // includes wrappers, and for unwrapped Relay fields the
+                // original Connection name, which x.typeName no longer
+                // carries). Relay rows lead with a stand-in for the ~
+                // icon's width.
+                ...(n.fields?.map((x): [string, string] => [
+                  x.name,
+                  (x.isRelayConnection ? "~~ " : "") + x.type,
+                ]) ?? []),
                 ...interfaceRows,
                 ...unionRows,
               ];
