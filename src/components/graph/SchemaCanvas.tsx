@@ -1546,6 +1546,9 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   const [hoveredFieldTip, setHoveredFieldTip] = useState<{
     name: string;
     desc: string;
+    /** Set when the tooltip belongs to a card header — renders the
+     *  kind badge in the header's color. */
+    kind?: NodeKind;
   } | null>(null);
   const hoveredFieldScreenRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
   const fieldTipElRef = useRef<HTMLDivElement | null>(null);
@@ -2578,11 +2581,20 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     }
     hoveredNodeRef.current = hoveredNode;
 
-    // Field-description tooltip — full untrimmed text for the hovered
-    // field row (full LOD only). Gated on row identity so a parked
-    // pointer doesn't re-render per move.
+    // Description tooltip — full untrimmed text for the hovered field
+    // row, or the type's own description when hovering a card header
+    // (both are trimmed inline). Full LOD only; gated on identity so a
+    // parked pointer doesn't re-render per move.
+    const headerNodeId =
+      !lowLod && (!hit || !hit.fieldName)
+        ? hitTestNodeHeader(world.x, world.y)
+        : null;
     const tipKey =
-      !lowLod && hit && hit.fieldName ? `${hit.nodeId}:${hit.fieldIndex}` : null;
+      !lowLod && hit && hit.fieldName
+        ? `f:${hit.nodeId}:${hit.fieldIndex}`
+        : headerNodeId
+          ? `h:${headerNodeId}`
+          : null;
     if (tipKey !== hoveredFieldTipKeyRef.current) {
       hoveredFieldTipKeyRef.current = tipKey;
       if (tipKey && hit && hit.fieldName) {
@@ -2591,6 +2603,13 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
           f?.description ?? (f?.isDeprecated ? f.deprecationReason : undefined);
         setHoveredFieldTip(
           desc?.trim() ? { name: hit.fieldName, desc: desc.trim() } : null,
+        );
+      } else if (headerNodeId) {
+        const d = nodeById.get(headerNodeId)?.data;
+        setHoveredFieldTip(
+          d?.description?.trim()
+            ? { name: d.name, desc: d.description.trim(), kind: d.kind }
+            : null,
         );
       } else {
         setHoveredFieldTip(null);
@@ -5028,7 +5047,20 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
           {/* Width lives on the inner wrapper — tooltipStyle sets an
               inline maxWidth on the box that would override a class. */}
           <div className="max-w-[380px]">
-            <div className="mb-0.5 font-semibold">{hoveredFieldTip.name}</div>
+            <div className="mb-0.5 flex items-center gap-1.5 font-semibold">
+              {hoveredFieldTip.kind && (
+                <span
+                  className="rounded px-1 py-0 text-[9px] font-normal uppercase tracking-wide"
+                  style={{
+                    backgroundColor: KIND_COLORS[hoveredFieldTip.kind],
+                    color: "white",
+                  }}
+                >
+                  {KIND_STYLES[hoveredFieldTip.kind].label}
+                </span>
+              )}
+              {hoveredFieldTip.name}
+            </div>
             <div className="whitespace-pre-wrap break-words leading-relaxed text-muted-foreground">
               {hoveredFieldTip.desc}
             </div>
