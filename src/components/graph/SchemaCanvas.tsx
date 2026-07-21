@@ -4799,7 +4799,11 @@ export function SchemaCanvas({ nodes, edges: edgesProp, focusId, rootId, onNavig
       <div
         className={cn(
           isMobile
-            ? "pointer-events-none absolute inset-x-0 bottom-0 z-20 flex flex-col-reverse"
+            // Safe-area bottom padding keeps the dock clear of the home
+            // indicator / gesture bar; the matching background fills that
+            // strip so the bottom bar reads as extending into it. (No
+            // safe area → env() is 0, so this is a no-op elsewhere.)
+            ? "pointer-events-none absolute inset-x-0 bottom-0 z-20 flex flex-col-reverse bg-popover/95 pb-[env(safe-area-inset-bottom)] backdrop-blur"
             : "contents",
         )}
       >
