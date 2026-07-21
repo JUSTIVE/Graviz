@@ -2763,9 +2763,12 @@ export function SchemaCanvas({ nodes, edges: edgesProp, focusId, rootId, onNavig
     }
   };
 
-  const onClick = (e: React.MouseEvent) => {
-    if (dragRef.current.moved) return;
-    const world = screenToWorld(e.clientX, e.clientY);
+  // Core tap/click behavior, shared by the mouse `onClick` and the
+  // touch tap so every pointer type triggers the exact same actions
+  // (field pin, return-type / union / interface / header navigation,
+  // low-LOD node framing, edge focus, empty-space clear).
+  const performTapAt = (clientX: number, clientY: number) => {
+    const world = screenToWorld(clientX, clientY);
     if (!world) return;
     const recordNodeClick = (id: string) => {
       const n = nodeById.get(id);
@@ -2856,47 +2859,19 @@ export function SchemaCanvas({ nodes, edges: edgesProp, focusId, rootId, onNavig
     onClearFocus?.();
   };
 
-  // Touch gestures — wrap the click-target hit test so a tap at low
-  // LOD selects the whole node card (where field text isn't drawn).
-  // Returns either a navigation target id, a pin instruction, or null.
-  type TapAction =
-    | { kind: "navigate"; id: string }
-    | { kind: "pin"; typeId: string; fieldName: string; fieldIndex: number }
-    | null;
-  const tapHitTest = (wx: number, wy: number): TapAction => {
-    if (
-      currentLodRef.current !== "full" ||
-      viewRef.current.k < FIELD_CLICK_MIN_ZOOM
-    ) {
-      const id = hitTestNode(wx, wy);
-      return id ? { kind: "navigate", id } : null;
-    }
-    const hit = hitTestField(wx, wy);
-    if (hit) {
-      if (hit.isReturnTypeHover && hit.navigableTarget) {
-        return { kind: "navigate", id: hit.navigableTarget };
-      }
-      if (hit.fieldName) {
-        return {
-          kind: "pin",
-          typeId: hit.nodeId,
-          fieldName: hit.fieldName,
-          fieldIndex: hit.fieldIndex,
-        };
-      }
-      if (hit.navigableTarget) {
-        return { kind: "navigate", id: hit.navigableTarget };
-      }
-    }
-    const header = hitTestNodeHeader(wx, wy);
-    return header ? { kind: "navigate", id: header } : null;
+  const onClick = (e: React.MouseEvent) => {
+    if (dragRef.current.moved) return;
+    performTapAt(e.clientX, e.clientY);
   };
-  const hitTestRef = useRef(tapHitTest);
-  hitTestRef.current = tapHitTest;
+  // Latest performTapAt for the once-registered touch listener.
+  const performTapAtRef = useRef(performTapAt);
+  performTapAtRef.current = performTapAt;
+
+  // Touch gestures. A single-finger tap runs the same action path as a
+  // mouse click (see performTapAt); two fingers pinch-zoom; one-finger
+  // drag pans.
   const onNavigateRef = useRef(onNavigate);
   onNavigateRef.current = onNavigate;
-  const setPinnedFieldRef = useRef(setPinnedField);
-  setPinnedFieldRef.current = setPinnedField;
 
   useEffect(() => {
     const el = containerRef.current;
@@ -2990,21 +2965,8 @@ export function SchemaCanvas({ nodes, edges: edgesProp, focusId, rootId, onNavig
         mode = "none";
         if (!wasTap) return;
         const t = ended[ended.length - 1]!;
-        const rect = el.getBoundingClientRect();
-        const v = viewRef.current;
-        const wx = (t.clientX - rect.left - v.x) / v.k;
-        const wy = (t.clientY - rect.top - v.y) / v.k;
-        const action = hitTestRef.current(wx, wy);
-        if (!action) return;
-        if (action.kind === "navigate") {
-          onNavigateRef.current?.(action.id);
-        } else {
-          setPinnedFieldRef.current({
-            typeId: action.typeId,
-            fieldName: action.fieldName,
-            fieldIndex: action.fieldIndex,
-          });
-        }
+        // Same behavior as a mouse click at this point.
+        performTapAtRef.current(t.clientX, t.clientY);
       }
     };
 
@@ -4627,7 +4589,7 @@ export function SchemaCanvas({ nodes, edges: edgesProp, focusId, rootId, onNavig
 
       <div
         className={cn(
-          "pointer-events-auto absolute left-4 top-4 z-20 flex items-center gap-1.5 rounded-lg border border-border bg-popover/95 px-2 py-1.5 font-mono text-xs text-popover-foreground opacity-40 shadow-lg backdrop-blur transition-[opacity,transform] duration-300 ease-out hover:opacity-100",
+          "pointer-events-auto absolute left-4 top-4 z-20 flex items-center gap-1.5 rounded-lg border border-border bg-popover/95 px-2 py-1.5 font-mono text-xs text-popover-foreground opacity-40 shadow-lg backdrop-blur transition-[opacity,transform] duration-300 ease-out hover:opacity-100 [@media(hover:none)]:opacity-100",
           leftControlsInset && "translate-y-11",
         )}
         onMouseMove={(ev) => ev.stopPropagation()}
@@ -4692,7 +4654,7 @@ export function SchemaCanvas({ nodes, edges: edgesProp, focusId, rootId, onNavig
 
       <div
         className={cn(
-          "pointer-events-auto absolute left-4 top-14 z-20 flex flex-col gap-1.5 rounded-lg border border-border bg-popover/95 px-2 py-1.5 font-mono text-xs text-popover-foreground opacity-40 shadow-lg backdrop-blur transition-[opacity,transform] duration-300 ease-out hover:opacity-100",
+          "pointer-events-auto absolute left-4 top-14 z-20 flex flex-col gap-1.5 rounded-lg border border-border bg-popover/95 px-2 py-1.5 font-mono text-xs text-popover-foreground opacity-40 shadow-lg backdrop-blur transition-[opacity,transform] duration-300 ease-out hover:opacity-100 [@media(hover:none)]:opacity-100",
           leftControlsInset && "translate-y-11",
         )}
         onMouseMove={(ev) => ev.stopPropagation()}
@@ -4738,7 +4700,7 @@ export function SchemaCanvas({ nodes, edges: edgesProp, focusId, rootId, onNavig
 
       {clickHistory.length > 0 && (
         <div
-          className="pointer-events-auto absolute right-4 top-4 z-20 flex w-64 max-w-[40vw] flex-col rounded-lg border border-border bg-popover/95 font-mono text-xs text-popover-foreground opacity-40 shadow-lg backdrop-blur transition-opacity duration-150 hover:opacity-100"
+          className="pointer-events-auto absolute right-4 top-4 z-20 flex w-64 max-w-[40vw] flex-col rounded-lg border border-border bg-popover/95 font-mono text-xs text-popover-foreground opacity-40 shadow-lg backdrop-blur transition-opacity duration-150 hover:opacity-100 [@media(hover:none)]:opacity-100"
           // Swallow mouse moves so the canvas's hover hit-tests don't
           // fire while the cursor is on the history panel. Click is
           // swallowed too so the canvas's onClick doesn't treat a
@@ -4820,7 +4782,7 @@ export function SchemaCanvas({ nodes, edges: edgesProp, focusId, rootId, onNavig
                           ev.stopPropagation();
                           removeFromHistory(item.id);
                         }}
-                        className="mr-2 shrink-0 rounded p-1 text-muted-foreground opacity-0 transition-opacity hover:bg-secondary hover:text-foreground group-hover:opacity-100"
+                        className="mr-2 shrink-0 rounded p-1 text-muted-foreground opacity-0 transition-opacity hover:bg-secondary hover:text-foreground group-hover:opacity-100 [@media(hover:none)]:opacity-100"
                         title="Remove from history"
                       >
                         <X className="h-3 w-3" />
@@ -4870,7 +4832,7 @@ export function SchemaCanvas({ nodes, edges: edgesProp, focusId, rootId, onNavig
                           ev.stopPropagation();
                           removeFromHistory(item.id);
                         }}
-                        className="mr-2 shrink-0 rounded p-1 text-muted-foreground opacity-0 transition-opacity hover:bg-secondary hover:text-foreground group-hover:opacity-100"
+                        className="mr-2 shrink-0 rounded p-1 text-muted-foreground opacity-0 transition-opacity hover:bg-secondary hover:text-foreground group-hover:opacity-100 [@media(hover:none)]:opacity-100"
                         title="Remove from history"
                       >
                         <X className="h-3 w-3" />
@@ -4949,7 +4911,7 @@ export function SchemaCanvas({ nodes, edges: edgesProp, focusId, rootId, onNavig
                         ev.stopPropagation();
                         removeFromHistory(item.id);
                       }}
-                      className="mr-2 shrink-0 rounded p-1 text-muted-foreground opacity-0 transition-opacity hover:bg-secondary hover:text-foreground group-hover:opacity-100"
+                      className="mr-2 shrink-0 rounded p-1 text-muted-foreground opacity-0 transition-opacity hover:bg-secondary hover:text-foreground group-hover:opacity-100 [@media(hover:none)]:opacity-100"
                       title="Remove from history"
                     >
                       <X className="h-3 w-3" />
