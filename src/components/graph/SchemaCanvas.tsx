@@ -5,7 +5,7 @@ import {
   updateTextZoom,
   type TextRun,
 } from "./sdf-text";
-import { ArrowRight, ChevronDown, ChevronUp, Filter, History, Loader2, Microscope, Trash2, X } from "lucide-react";
+import { ArrowRight, ChevronDown, ChevronUp, Filter, History, Loader2, Microscope, PanelLeftOpen, Trash2, X } from "lucide-react";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { BezierSegment, LayoutResult } from "@/lib/layout";
 import {
@@ -159,6 +159,10 @@ interface Props {
    *  clear room for an external control (the sidebar-expand button that
    *  appears when the sidebar is collapsed). */
   leftControlsInset?: boolean;
+  /** Mobile: reopen the sidebar from inside the merged view-controls
+   *  header (replaces the floating expand button, which is desktop-only
+   *  so it never overlaps the top dock). */
+  onExpandSidebar?: () => void;
 }
 
 interface EdgeGroupSpec {
@@ -1412,11 +1416,28 @@ function buildDotGridTexture(dotColor: number, alpha: number): Texture {
 
 // ─── Main component ───────────────────────────────────────────────────
 
-export function SchemaCanvas({ nodes, edges: edgesProp, focusId, rootId, onNavigate, onClearFocus, leftControlsInset }: Props) {
+/** True below the `lg` breakpoint — the canvas's overlays reflow for
+ *  small / touch screens (bottom-docked Recent panel, fps-only perf). */
+function useIsMobile(): boolean {
+  const query = "(max-width: 1023px)";
+  const [isMobile, setIsMobile] = useState(
+    () => typeof window !== "undefined" && window.matchMedia(query).matches,
+  );
+  useEffect(() => {
+    const mq = window.matchMedia(query);
+    const on = () => setIsMobile(mq.matches);
+    mq.addEventListener("change", on);
+    return () => mq.removeEventListener("change", on);
+  }, []);
+  return isMobile;
+}
+
+export function SchemaCanvas({ nodes, edges: edgesProp, focusId, rootId, onNavigate, onClearFocus, leftControlsInset, onExpandSidebar }: Props) {
   // "Bundle edges" toggle — collapse multi-field A→B references into a
   // single arrow (details surface on hover). Off by default. Changing
   // it swaps the edge set fed to layout, so the graph re-lays out.
   const [bundleEdges, setBundleEdges] = useState(false);
+  const isMobile = useIsMobile();
   const edges = useMemo(
     () => (bundleEdges ? bundleFieldEdges(edgesProp) : edgesProp),
     [edgesProp, bundleEdges],
@@ -1488,7 +1509,11 @@ export function SchemaCanvas({ nodes, edges: edgesProp, focusId, rootId, onNavig
       };
   const HISTORY_CAP = 50;
   const [clickHistory, setClickHistory] = useState<HistoryItem[]>([]);
-  const [historyOpen, setHistoryOpen] = useState(true);
+  // Recent starts collapsed and stays that way as entries accumulate —
+  // only the user's explicit toggle opens it.
+  const [historyOpen, setHistoryOpen] = useState(false);
+  // Merged top-controls widget (mobile): collapsible; starts open.
+  const [topPanelsOpen, setTopPanelsOpen] = useState(true);
   const [hoveredHistoryItem, setHoveredHistoryItem] = useState<HistoryItem | null>(null);
   // Tooltip positions live in refs (not state) — a mousemove over a
   // node/edge/history row repositions the already-mounted tooltip DOM
@@ -2893,7 +2918,18 @@ export function SchemaCanvas({ nodes, edges: edgesProp, focusId, rootId, onNavig
       mode = "pinch";
     };
 
+    // Touches that land on an overlay control (toggles, Recent panel,
+    // focused-edge widget…) must reach that element normally — tap,
+    // scroll — instead of being hijacked as a canvas pan/tap. The
+    // graph itself lives inside pixiContainerRef; anything outside it
+    // is an overlay, so we don't track or preventDefault those.
+    const isCanvasTarget = (target: EventTarget | null) =>
+      target instanceof Node &&
+      !!pixiContainerRef.current &&
+      pixiContainerRef.current.contains(target);
+
     const onTouchStart = (e: TouchEvent) => {
+      if (!isCanvasTarget(e.target)) return;
       if (e.cancelable) e.preventDefault();
       wakeRef.current();
       for (let i = 0; i < e.changedTouches.length; i++) {
@@ -2905,6 +2941,9 @@ export function SchemaCanvas({ nodes, edges: edgesProp, focusId, rootId, onNavig
     };
 
     const onTouchMove = (e: TouchEvent) => {
+      // Not tracking this gesture (started on an overlay) — leave it to
+      // the browser so overlay lists can scroll.
+      if (points.size === 0) return;
       if (e.cancelable) e.preventDefault();
       wakeRef.current();
       const before = new Map<number, { x: number; y: number }>();
@@ -4587,10 +4626,55 @@ export function SchemaCanvas({ nodes, edges: edgesProp, focusId, rootId, onNavig
     >
       <div ref={pixiContainerRef} style={{ width: size.w, height: size.h }} />
 
+      {/* Top-dock layout (mobile): the view-toggle chips and the
+          Investigate panel merge into one top-attached, collapsible
+          widget. On desktop the wrapper is `contents`, so each keeps
+          its own floating card position. */}
       <div
         className={cn(
-          "pointer-events-auto absolute left-4 top-4 z-20 flex items-center gap-1.5 rounded-lg border border-border bg-popover/95 px-2 py-1.5 font-mono text-xs text-popover-foreground opacity-40 shadow-lg backdrop-blur transition-[opacity,transform] duration-300 ease-out hover:opacity-100 [@media(hover:none)]:opacity-100",
-          leftControlsInset && "translate-y-11",
+          isMobile
+            ? "pointer-events-auto absolute inset-x-0 top-0 z-20 flex flex-col border-b border-border bg-popover/95 shadow-lg backdrop-blur"
+            : "contents",
+        )}
+        onMouseMove={isMobile ? (ev) => ev.stopPropagation() : undefined}
+        onClick={isMobile ? (ev) => ev.stopPropagation() : undefined}
+      >
+        {isMobile && (
+          <div className="flex items-center gap-1 px-2 py-1.5">
+            {leftControlsInset && onExpandSidebar && (
+              <button
+                type="button"
+                onClick={onExpandSidebar}
+                title="Show sidebar"
+                aria-label="Show sidebar"
+                className="shrink-0 rounded p-1 text-muted-foreground hover:bg-secondary hover:text-foreground"
+              >
+                <PanelLeftOpen className="h-4 w-4" />
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => setTopPanelsOpen((v) => !v)}
+              className="flex flex-1 items-center gap-1.5 px-1 font-mono text-[10px] uppercase tracking-wider text-muted-foreground"
+            >
+              <Filter className="h-3 w-3 shrink-0" />
+              <span className="flex-1 text-left">View controls</span>
+              {topPanelsOpen ? (
+                <ChevronUp className="h-3 w-3" />
+              ) : (
+                <ChevronDown className="h-3 w-3" />
+              )}
+            </button>
+          </div>
+        )}
+        {(!isMobile || topPanelsOpen) && (
+          <>
+      <div
+        className={cn(
+          isMobile
+            ? "pointer-events-auto flex flex-wrap items-center gap-1.5 px-3 pb-2 font-mono text-xs text-popover-foreground"
+            : "pointer-events-auto absolute left-4 top-4 z-20 flex items-center gap-1.5 rounded-lg border border-border bg-popover/95 px-2 py-1.5 font-mono text-xs text-popover-foreground opacity-40 shadow-lg backdrop-blur transition-[opacity,transform] duration-300 ease-out hover:opacity-100 [@media(hover:none)]:opacity-100",
+          !isMobile && leftControlsInset && "translate-y-11",
         )}
         onMouseMove={(ev) => ev.stopPropagation()}
         onClick={(ev) => ev.stopPropagation()}
@@ -4654,8 +4738,10 @@ export function SchemaCanvas({ nodes, edges: edgesProp, focusId, rootId, onNavig
 
       <div
         className={cn(
-          "pointer-events-auto absolute left-4 top-14 z-20 flex flex-col gap-1.5 rounded-lg border border-border bg-popover/95 px-2 py-1.5 font-mono text-xs text-popover-foreground opacity-40 shadow-lg backdrop-blur transition-[opacity,transform] duration-300 ease-out hover:opacity-100 [@media(hover:none)]:opacity-100",
-          leftControlsInset && "translate-y-11",
+          isMobile
+            ? "pointer-events-auto flex flex-col gap-1.5 px-3 pb-2 font-mono text-xs text-popover-foreground"
+            : "pointer-events-auto absolute left-4 top-14 z-20 flex flex-col gap-1.5 rounded-lg border border-border bg-popover/95 px-2 py-1.5 font-mono text-xs text-popover-foreground opacity-40 shadow-lg backdrop-blur transition-[opacity,transform] duration-300 ease-out hover:opacity-100 [@media(hover:none)]:opacity-100",
+          !isMobile && leftControlsInset && "translate-y-11",
         )}
         onMouseMove={(ev) => ev.stopPropagation()}
         onClick={(ev) => ev.stopPropagation()}
@@ -4697,10 +4783,36 @@ export function SchemaCanvas({ nodes, edges: edgesProp, focusId, rootId, onNavig
           </span>
         </div>
       </div>
+          </>
+        )}
+      </div>
 
+      {/* Bottom-dock layout system (mobile). The focused-edge widget
+          and the Recent panel — and any future bottom-docked widget —
+          stack via flexbox: later widgets on top, Recent at the bottom.
+          `flex-col-reverse` renders later DOM children higher, so we
+          keep natural source order (Recent first) with no height
+          measurement. On desktop the wrapper is `contents`, leaving
+          each child's own floating position untouched. The hover-only
+          tooltips nested here render null on touch, so they never take
+          a dock slot. */}
+      <div
+        className={cn(
+          isMobile
+            ? "pointer-events-none absolute inset-x-0 bottom-0 z-20 flex flex-col-reverse"
+            : "contents",
+        )}
+      >
       {clickHistory.length > 0 && (
         <div
-          className="pointer-events-auto absolute right-4 top-4 z-20 flex w-64 max-w-[40vw] flex-col rounded-lg border border-border bg-popover/95 font-mono text-xs text-popover-foreground opacity-40 shadow-lg backdrop-blur transition-opacity duration-150 hover:opacity-100 [@media(hover:none)]:opacity-100"
+          className={cn(
+            "pointer-events-auto flex flex-col border-border bg-popover/95 font-mono text-xs text-popover-foreground opacity-40 shadow-lg backdrop-blur transition-opacity duration-150 hover:opacity-100 [@media(hover:none)]:opacity-100",
+            // Mobile: in-flow, full-width at the bottom of the dock.
+            // Desktop: floating card pinned to the top-right.
+            isMobile
+              ? "w-full border-t"
+              : "absolute right-4 top-4 z-20 w-64 max-w-[40vw] rounded-lg border",
+          )}
           // Swallow mouse moves so the canvas's hover hit-tests don't
           // fire while the cursor is on the history panel. Click is
           // swallowed too so the canvas's onClick doesn't treat a
@@ -5087,7 +5199,15 @@ export function SchemaCanvas({ nodes, edges: edgesProp, focusId, rootId, onNavig
         const targetKind = nodeById.get(e.targetId)?.data.kind;
         return (
           <div
-            className="pointer-events-auto absolute bottom-4 left-1/2 z-20 max-w-[92vw] -translate-x-1/2 rounded-lg border border-border bg-popover/95 px-3 py-2 font-mono text-xs text-popover-foreground shadow-lg backdrop-blur"
+            className={cn(
+              "pointer-events-auto border-border bg-popover/95 px-3 py-2 font-mono text-xs text-popover-foreground backdrop-blur",
+              // Mobile: in-flow, full-width, square top + no shadow (it
+              // sits flush under the fps bar in the dock stack). Desktop:
+              // centered floating card near the bottom, with a shadow.
+              isMobile
+                ? "w-full border-t"
+                : "absolute bottom-4 left-1/2 z-20 max-w-[92vw] -translate-x-1/2 rounded-lg border shadow-lg",
+            )}
             // Swallow mouse moves so the canvas's hover hit-tests don't
             // fire while the cursor is on the focused-edge tooltip.
             // Click is swallowed too so the canvas's onClick doesn't
@@ -5159,6 +5279,16 @@ export function SchemaCanvas({ nodes, edges: edgesProp, focusId, rootId, onNavig
           </div>
         );
       })()}
+      {/* fps readout — top of the bottom dock stack on mobile. The
+          chart canvas stays mounted (hidden) so the ticker's chart
+          draw still has a target. */}
+      {isMobile && (
+        <div className="pointer-events-auto flex items-center justify-end gap-2 rounded-t-lg border-t border-border bg-popover/95 px-3 py-1 font-mono text-[10px] text-muted-foreground/60 backdrop-blur">
+          <span ref={fpsTextRef}>0 fps</span>
+          <canvas ref={chartCanvasRef} width={260} height={48} className="hidden" />
+        </div>
+      )}
+      </div>
 
       {hoveredNodeTip &&
         (currentLodRef.current !== "full" ||
@@ -5263,42 +5393,46 @@ export function SchemaCanvas({ nodes, edges: edgesProp, focusId, rootId, onNavig
         </div>
       )}
 
-      {/* FPS overlay with real-time chart */}
-      <div
-        ref={fpsOverlayRef}
-        className="pointer-events-none absolute bottom-4 right-4 rounded-lg border border-border/20 bg-background/10 px-3 py-2 font-mono text-xs text-muted-foreground/60 backdrop-blur-sm"
-        style={{ minWidth: 280 }}
-      >
-        <canvas
-          ref={chartCanvasRef}
-          width={260}
-          height={48}
-          className="mb-1.5 rounded"
-          style={{ width: 260, height: 48, display: "block" }}
-        />
-        <div className="flex items-baseline justify-between gap-4">
-          <span ref={fpsTextRef}>0 fps</span>
-          <span>{laidNodes.length} nodes · {laidEdges.length} edges</span>
-        </div>
-        {lastTiming && (
-          <div className="mt-1 space-y-0.5 opacity-70">
-            {lastTiming.fromCache ? (
-              <div>cached · total {lastTiming.totalMs.toFixed(0)}ms</div>
-            ) : (
-              <>
-                <div>similarity {lastTiming.similarityMs.toFixed(0)}ms max</div>
-                <div>layout {lastTiming.layoutMs.toFixed(0)}ms · total {lastTiming.totalMs.toFixed(0)}ms</div>
-                <div>
-                  {lastTiming.componentCount} comp · {lastTiming.singletonCount} singletons · {lastTiming.parallelWorkers}w
-                </div>
-                {lastTiming.fallbackNodeCount > 0 && (
-                  <div>fallback grid: {lastTiming.fallbackNodeCount} nodes</div>
-                )}
-              </>
-            )}
+      {/* Performance panel — desktop only (full chart + layout timing).
+          On mobile just the fps number shows, at the top of the bottom
+          dock stack (see above). */}
+      {!isMobile && (
+        <div
+          ref={fpsOverlayRef}
+          className="pointer-events-none absolute bottom-4 right-4 rounded-lg border border-border/20 bg-background/10 px-3 py-2 font-mono text-xs text-muted-foreground/60 backdrop-blur-sm"
+          style={{ minWidth: 280 }}
+        >
+          <canvas
+            ref={chartCanvasRef}
+            width={260}
+            height={48}
+            className="mb-1.5 rounded"
+            style={{ width: 260, height: 48, display: "block" }}
+          />
+          <div className="flex items-baseline justify-between gap-4">
+            <span ref={fpsTextRef}>0 fps</span>
+            <span>{laidNodes.length} nodes · {laidEdges.length} edges</span>
           </div>
-        )}
-      </div>
+          {lastTiming && (
+            <div className="mt-1 space-y-0.5 opacity-70">
+              {lastTiming.fromCache ? (
+                <div>cached · total {lastTiming.totalMs.toFixed(0)}ms</div>
+              ) : (
+                <>
+                  <div>similarity {lastTiming.similarityMs.toFixed(0)}ms max</div>
+                  <div>layout {lastTiming.layoutMs.toFixed(0)}ms · total {lastTiming.totalMs.toFixed(0)}ms</div>
+                  <div>
+                    {lastTiming.componentCount} comp · {lastTiming.singletonCount} singletons · {lastTiming.parallelWorkers}w
+                  </div>
+                  {lastTiming.fallbackNodeCount > 0 && (
+                    <div>fallback grid: {lastTiming.fallbackNodeCount} nodes</div>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }

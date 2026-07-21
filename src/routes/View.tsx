@@ -92,6 +92,7 @@ export function ViewRoute() {
     deprecatedFields,
     pushFocus,
     popTo,
+    pinnedField,
     setPinnedField,
   } = useSchema();
   const navigate = useNavigate();
@@ -135,6 +136,23 @@ export function ViewRoute() {
     if (mode === "until" && !hasDeprecated) setMode("reachable");
   }, [mode, hasDeprecated]);
 
+  // Mobile is single-pane: the tree fills the screen and the canvas is
+  // hidden behind it. When the user selects something in the tree
+  // (focus push or field pin), collapse the sidebar so the canvas —
+  // now framed on that selection — comes to the front. Guarded on a
+  // real change so it never fires on mount or on unrelated re-renders.
+  const prevSelRef = useRef<string>("");
+  useEffect(() => {
+    const sel =
+      focusStack.join(">") +
+      "|" +
+      (pinnedField ? `${pinnedField.typeId}.${pinnedField.fieldName}` : "");
+    if (prevSelRef.current && sel !== prevSelRef.current && !isLg && !collapsed) {
+      setCollapsed(true);
+    }
+    prevSelRef.current = sel;
+  }, [focusStack, pinnedField, isLg, collapsed, setCollapsed]);
+
   if (!hasSchema) return null;
 
   const reachableFocusId =
@@ -169,7 +187,10 @@ export function ViewRoute() {
     <div
       ref={containerRef}
       className={cn(
-        "grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[minmax(300px,380px)_1fr]",
+        // Mobile is single-pane: one full-height row holds whichever of
+        // aside/section is visible (the other is `hidden`). On `lg` the
+        // two go side by side and rows reset to auto.
+        "grid min-h-0 flex-1 grid-cols-1 grid-rows-[1fr] lg:grid-cols-[minmax(300px,380px)_1fr] lg:grid-rows-none",
         // Animate the collapse/expand, but not while dragging the handle.
         !isResizing && "transition-[grid-template-columns] duration-300 ease-out",
       )}
@@ -270,10 +291,20 @@ export function ViewRoute() {
         )}
       </aside>
 
-      <section className="relative min-h-[500px] min-w-0 flex-1 overflow-hidden">
-        {/* When collapsed, the expand affordance sits at the canvas's
-            top-left; the canvas pushes its own controls down to clear it. */}
-        {collapsed && (
+      <section
+        className={cn(
+          "relative min-w-0 flex-1 overflow-hidden lg:min-h-[500px]",
+          // On mobile the canvas hides behind the full-screen tree while
+          // the sidebar is open; it returns when the sidebar collapses.
+          !collapsed && !isLg && "hidden",
+        )}
+      >
+        {/* Desktop: floating expand affordance at the canvas top-left
+            (the canvas pushes its own controls down to clear it). On
+            mobile the expand button lives inside the merged view-controls
+            header instead (see SchemaCanvas onExpandSidebar), so it never
+            overlaps the top dock. */}
+        {collapsed && isLg && (
           <button
             type="button"
             onClick={() => setCollapsed(false)}
@@ -292,6 +323,7 @@ export function ViewRoute() {
           onNavigate={onCanvasNavigate}
           onClearFocus={onCanvasClearFocus}
           leftControlsInset={collapsed}
+          onExpandSidebar={() => setCollapsed(false)}
         />
       </section>
     </div>

@@ -20,13 +20,13 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
   return (
     <div className="flex h-screen w-full flex-col overflow-hidden bg-background text-foreground">
-      <header className="sticky top-0 z-20 flex h-14 shrink-0 items-center justify-between border-b border-border bg-background/80 px-4 backdrop-blur">
-        <div className="flex items-center gap-6">
-          <Link to="/" className="flex items-center gap-2 font-semibold">
-            <img src={logo} alt="" className="h-5 w-5" />
+      <header className="sticky top-0 z-20 flex h-10 shrink-0 items-center justify-between border-b border-border bg-background/80 px-2 backdrop-blur lg:h-14 lg:px-4">
+        <div className="flex items-center gap-2 lg:gap-6">
+          <Link to="/" className="flex items-center gap-1.5 text-sm font-semibold lg:gap-2 lg:text-base">
+            <img src={logo} alt="" className="h-4 w-4 lg:h-5 lg:w-5" />
             <span>Graviz</span>
           </Link>
-          <nav className="flex items-center gap-1">
+          <nav className="flex items-center gap-0.5 lg:gap-1">
             {NAV.map((item) => {
               const active =
                 item.to === "/" ? path === "/" : path.startsWith(item.to);
@@ -35,7 +35,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                   key={item.to}
                   to={item.to}
                   className={cn(
-                    "rounded-md px-3 py-1.5 text-sm transition-colors",
+                    "rounded-md px-2 py-1 text-xs transition-colors lg:px-3 lg:py-1.5 lg:text-sm",
                     active
                       ? "bg-secondary text-secondary-foreground"
                       : "text-muted-foreground hover:bg-secondary/60 hover:text-foreground",
