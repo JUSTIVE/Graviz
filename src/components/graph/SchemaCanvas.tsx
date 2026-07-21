@@ -79,6 +79,9 @@ interface LaidEdge {
    *  name, for implements/union edges the relationship word. Surfaced
    *  in the edge hover tooltip. */
   label?: string;
+  /** Field names collapsed into this bundled edge (source→target).
+   *  Present only on bundled edges; drives the grouped hover list. */
+  bundledLabels?: string[];
   /** Per-edge opacity multiplier (1 = full). Edges incident to a
    *  hub node (in-degree or out-degree ≥ HUB_FADE_DEGREE) get
    *  HUB_FADE_ALPHA so hub fan-outs don't drown the canvas. */
@@ -95,6 +98,55 @@ interface LaidEdge {
 const HUB_FADE_DEGREE = 50;
 /** Alpha multiplier for edges incident to a hub node. */
 const HUB_FADE_ALPHA = 0.3;
+
+/**
+ * Collapse every group of `field` edges that share the same
+ * source→target into a single bundled edge, so N fields of A that
+ * all reference B draw one arrow instead of N. The bundle carries the
+ * field names (bundledLabels) for the grouped hover tooltip. Non-field
+ * edges and lone field edges pass through unchanged; original ordering
+ * is preserved (the bundle takes the slot of the group's first edge).
+ */
+function bundleFieldEdges(edges: GraphEdgeData[]): GraphEdgeData[] {
+  const key = (e: GraphEdgeData) => `${e.source} ${e.target}`;
+  const groups = new Map<string, GraphEdgeData[]>();
+  for (const e of edges) {
+    if (e.kind !== "field") continue;
+    const k = key(e);
+    const g = groups.get(k);
+    if (g) g.push(e);
+    else groups.set(k, [e]);
+  }
+  const emitted = new Set<string>();
+  const out: GraphEdgeData[] = [];
+  for (const e of edges) {
+    if (e.kind !== "field") {
+      out.push(e);
+      continue;
+    }
+    const k = key(e);
+    if (emitted.has(k)) continue;
+    emitted.add(k);
+    const g = groups.get(k)!;
+    if (g.length === 1) {
+      out.push(g[0]!);
+      continue;
+    }
+    out.push({
+      id: `bundle:${e.source}->${e.target}`,
+      source: e.source,
+      target: e.target,
+      kind: "field",
+      // Solid style — a bundle asserts "one or more references exist",
+      // not a single field's nullability.
+      nullable: false,
+      bundledLabels: g
+        .map((x) => x.label)
+        .filter((l): l is string => !!l),
+    });
+  }
+  return out;
+}
 
 interface Props {
   nodes: GraphNodeData[];
@@ -1360,7 +1412,15 @@ function buildDotGridTexture(dotColor: number, alpha: number): Texture {
 
 // ─── Main component ───────────────────────────────────────────────────
 
-export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClearFocus, leftControlsInset }: Props) {
+export function SchemaCanvas({ nodes, edges: edgesProp, focusId, rootId, onNavigate, onClearFocus, leftControlsInset }: Props) {
+  // "Bundle edges" toggle — collapse multi-field A→B references into a
+  // single arrow (details surface on hover). Off by default. Changing
+  // it swaps the edge set fed to layout, so the graph re-lays out.
+  const [bundleEdges, setBundleEdges] = useState(false);
+  const edges = useMemo(
+    () => (bundleEdges ? bundleFieldEdges(edgesProp) : edgesProp),
+    [edgesProp, bundleEdges],
+  );
   const containerRef = useRef<HTMLDivElement>(null);
   const pixiContainerRef = useRef<HTMLDivElement>(null);
   const [size, setSize] = useState({ w: 1, h: 1 });
@@ -1395,6 +1455,8 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     sourceId: string;
     targetId: string;
     kind: GraphEdgeData["kind"];
+    /** Field names when the hovered edge is a bundle of several. */
+    bundledLabels?: string[];
   } | null>(null);
   // Edge selected by click — dims everything except this edge and
   // its two endpoint nodes. Mutually exclusive with node focus
@@ -1531,6 +1593,9 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   };
   const hoveredEdgeScreenRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
   const edgeTipElRef = useRef<HTMLDivElement | null>(null);
+  // Latest focusOnEdge for the once-registered debug hook.
+  const focusOnEdgeRef = useRef(focusOnEdge);
+  focusOnEdgeRef.current = focusOnEdge;
   // Node-name tooltip — only rendered at low LODs (bar / chrome)
   // where the sprite no longer paints the type name.
   const hoveredNodeForTipRef = useRef<string | null>(null);
@@ -1603,6 +1668,8 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     textContainer: Container | null;
     investigateOverlay: Graphics | null;
     pinFieldGraphics: Graphics | null;
+    /** Field-row highlights for the fields behind a focused edge. */
+    edgeFieldGraphics: Graphics | null;
     hoverGraphics: Graphics | null;
     focusGraphics: Graphics | null;
   }>({
@@ -1616,6 +1683,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     textContainer: null,
     investigateOverlay: null,
     pinFieldGraphics: null,
+    edgeFieldGraphics: null,
     hoverGraphics: null,
     focusGraphics: null,
   });
@@ -1939,6 +2007,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         kind: e.kind,
         nullable: e.nullable ?? false,
         label: e.label,
+        bundledLabels: e.bundledLabels,
         start,
         segments,
         arrowTip,
@@ -2651,21 +2720,23 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     // node card (the node would otherwise occlude the edge endpoint
     // and edge hover would feel sticky on the node).
     const edge = hoveredNode ? null : hitTestEdge(world.x, world.y);
+    const edgeHasInfo = !!edge && (!!edge.label || !!edge.bundledLabels?.length);
     const prevEdge = hoveredEdgeRef.current;
     if (edge !== prevEdge) {
       hoveredEdgeRef.current = edge;
-      if (edge && edge.label) {
+      if (edge && edgeHasInfo) {
         setHoveredEdgeInfo({
-          label: edge.label,
+          label: edge.label ?? "",
           sourceId: edge.sourceId,
           targetId: edge.targetId,
           kind: edge.kind,
+          bundledLabels: edge.bundledLabels,
         });
       } else {
         setHoveredEdgeInfo(null);
       }
     }
-    if (edge && edge.label) {
+    if (edge && edgeHasInfo) {
       hoveredEdgeScreenRef.current = { x: e.clientX, y: e.clientY };
       if (edgeTipElRef.current) {
         applyTooltipStyle(edgeTipElRef.current, e.clientX, e.clientY);
@@ -3025,6 +3096,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       textContainer.cullable = true;
       const investigateOverlay = new Graphics();
       const pinFieldGraphics = new Graphics();
+      const edgeFieldGraphics = new Graphics();
       const hoverGraphics = new Graphics();
       const focusGraphics = new Graphics();
 
@@ -3051,6 +3123,9 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       // visible on top of the field text, but below the focus ring
       // so focus state stays the dominant visual.
       world.addChild(pinFieldGraphics);
+      // Focused-edge field highlights share the pin's z-band — above
+      // cards/text, below the hover/focus rings.
+      world.addChild(edgeFieldGraphics);
       world.addChild(hoverGraphics);
       world.addChild(focusGraphics);
 
@@ -3070,6 +3145,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         textContainer,
         investigateOverlay,
         pinFieldGraphics,
+        edgeFieldGraphics,
         hoverGraphics,
         focusGraphics,
       };
@@ -3936,6 +4012,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         textContainer: null,
         investigateOverlay: null,
         pinFieldGraphics: null,
+        edgeFieldGraphics: null,
         hoverGraphics: null,
         focusGraphics: null,
       };
@@ -3986,6 +4063,8 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   // empty), so state updates need this ref to be seen.
   const laidNodesRef = useRef(laidNodes);
   laidNodesRef.current = laidNodes;
+  const laidEdgesRef = useRef(laidEdges);
+  laidEdgesRef.current = laidEdges;
 
   // Diagnostic counters for the e2e test.
   const spriteResetCountRef = useRef(0);
@@ -4049,6 +4128,21 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
           cx: n.cx,
           cy: n.cy,
         })),
+      /** Test-only: number of laid edges (drops after bundling). */
+      getLaidEdgeCount: () => laidEdgesRef.current.length,
+      /** Test-only: bundled-field labels of a laid edge, by endpoints. */
+      getBundledLabels: (sourceId: string, targetId: string) =>
+        laidEdgesRef.current.find(
+          (le) => le.sourceId === sourceId && le.targetId === targetId,
+        )?.bundledLabels ?? null,
+      /** Test-only: focus the laid edge between two endpoints (drives
+       *  the same path as clicking it). */
+      focusEdge: (sourceId: string, targetId: string) => {
+        const le = laidEdgesRef.current.find(
+          (e) => e.sourceId === sourceId && e.targetId === targetId,
+        );
+        if (le) focusOnEdgeRef.current(le);
+      },
       getInViewNodeIds: () => {
         const v = viewRef.current;
         const sw = size.w;
@@ -4373,6 +4467,53 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     g.stroke({ width: 2, color: 0xf97316, alpha: 0.95 });
   }, [pinnedField, nodeById]);
 
+  // Highlight the source-node field row(s) behind a focused field edge
+  // — every collapsed field for a bundle, or the single field for a
+  // lone field edge. Amber to match the field-edge / type-label accent
+  // and stay distinct from the orange pin ring. Redraws on focus or
+  // layout change.
+  useEffect(() => {
+    const g = sceneRef.current.edgeFieldGraphics;
+    if (!g) return;
+    g.clear();
+    const e = focusedEdge;
+    if (!e || e.kind !== "field") return;
+    const n = nodeById.get(e.sourceId);
+    if (!n) return;
+    const names = e.bundledLabels ?? (e.label ? [e.label] : []);
+    if (names.length === 0) return;
+    const fields = n.data.fields ?? [];
+    const bodyTop = n.headerH + TOP_BODY_PAD - 2;
+    const nodeLeft = n.cx - n.w / 2;
+    const nodeTop = n.cy - n.h / 2;
+    const pad = 2;
+    // Resolve rows, then coalesce runs of adjacent indices so a block
+    // of consecutive fields draws as one rectangle instead of stacked
+    // boxes with seams between them.
+    const rowIdxs = names
+      .map((name) => fields.findIndex((f) => f.name === name))
+      .filter((i) => i >= 0)
+      .sort((a, b) => a - b);
+    if (rowIdxs.length === 0) return;
+    const ranges: [number, number][] = [];
+    for (const idx of rowIdxs) {
+      const last = ranges[ranges.length - 1];
+      if (last && idx === last[1] + 1) last[1] = idx;
+      else ranges.push([idx, idx]);
+    }
+    const addRects = () => {
+      for (const [lo, hi] of ranges) {
+        const y = nodeTop + bodyTop + lo * n.rowH;
+        const h = (hi - lo + 1) * n.rowH;
+        g.roundRect(nodeLeft + pad, y - pad, n.w - pad * 2, h + pad * 2, 4);
+      }
+    };
+    addRects();
+    g.fill({ color: 0xf59e0b, alpha: 0.16 });
+    addRects();
+    g.stroke({ width: 1.5, color: 0xf59e0b, alpha: 0.9 });
+  }, [focusedEdge, nodeById]);
+
   // Redraw the investigate-mode overlay whenever the match set or
   // node layout changes. Two layers of highlight:
   //   1. Per-row orange fill on each field/value whose description
@@ -4532,6 +4673,20 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         >
           <Filter className="h-2.5 w-2.5" />
           Show descriptions
+        </button>
+        <button
+          type="button"
+          onClick={() => setBundleEdges((v) => !v)}
+          className={cn(
+            "flex cursor-pointer items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-medium transition-colors",
+            bundleEdges
+              ? "border-primary bg-primary/10 text-primary"
+              : "border-border text-muted-foreground hover:border-border/80 hover:text-foreground",
+          )}
+          title="Collapse multiple fields that reference the same type into one arrow; hover the edge for the field list (re-runs layout)"
+        >
+          <Filter className="h-2.5 w-2.5" />
+          Bundle edges
         </button>
       </div>
 
@@ -4901,6 +5056,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       {hoveredEdgeInfo && (() => {
         const sourceKind = nodeById.get(hoveredEdgeInfo.sourceId)?.data.kind;
         const targetKind = nodeById.get(hoveredEdgeInfo.targetId)?.data.kind;
+        const bundled = hoveredEdgeInfo.bundledLabels;
         return (
           <div
             ref={edgeTipElRef}
@@ -4916,7 +5072,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
                   {KIND_STYLES[sourceKind].label}
                 </span>
               )}
-              {(hoveredEdgeInfo.kind === "field" || hoveredEdgeInfo.kind === "arg") && hoveredEdgeInfo.label ? (
+              {!bundled && (hoveredEdgeInfo.kind === "field" || hoveredEdgeInfo.kind === "arg") && hoveredEdgeInfo.label ? (
                 <span>
                   <span className="font-semibold">{hoveredEdgeInfo.sourceId}</span>
                   <span className="text-muted-foreground">.</span>
@@ -4942,6 +5098,21 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
               )}
               <span className="font-semibold">{hoveredEdgeInfo.targetId}</span>
             </div>
+            {bundled && bundled.length > 0 && (
+              <div className="mt-1.5 border-t border-border/60 pt-1.5">
+                <div className="mb-0.5 text-[10px] uppercase tracking-wide text-muted-foreground">
+                  {bundled.length} fields
+                </div>
+                <div className="flex flex-col gap-0.5">
+                  {bundled.map((f) => (
+                    <span key={f}>
+                      <span className="text-muted-foreground">{hoveredEdgeInfo.sourceId}.</span>
+                      <span style={{ color: "#f59e0b" }}>{f}</span>
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
         );
       })()}
@@ -4949,6 +5120,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       {focusedEdge && (() => {
         const e = focusedEdge;
         const label = e.label ?? "";
+        const bundled = e.bundledLabels;
         const sourceKind = nodeById.get(e.sourceId)?.data.kind;
         const targetKind = nodeById.get(e.targetId)?.data.kind;
         return (
@@ -4983,11 +5155,16 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
                   {KIND_STYLES[sourceKind].label}
                 </span>
               )}
-              {(e.kind === "field" || e.kind === "arg") && label ? (
+              {!bundled && (e.kind === "field" || e.kind === "arg") && label ? (
                 <span>
                   <span className="font-semibold">{e.sourceId}</span>
                   <span className="text-muted-foreground">.</span>
                   <span style={{ color: "#f59e0b" }}>{label}</span>
+                </span>
+              ) : bundled ? (
+                <span>
+                  <span className="font-semibold">{e.sourceId}</span>
+                  <span className="text-muted-foreground"> ({bundled.length} fields)</span>
                 </span>
               ) : (
                 <span className="font-semibold">{e.sourceId}</span>

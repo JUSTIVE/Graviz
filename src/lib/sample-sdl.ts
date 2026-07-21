@@ -40,6 +40,10 @@ type Post implements Node {
   body: String!
   """The user who wrote this post."""
   author: User!
+  """Users who collaborated on the post besides the author."""
+  coauthors: [User!]!
+  """User who reviewed the post before publishing, if any."""
+  reviewer: User
   """Topic labels used for discovery and filtering."""
   tags: [Tag!]!
   """Where the post sits in its publishing lifecycle."""

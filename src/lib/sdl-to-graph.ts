@@ -51,6 +51,10 @@ export interface GraphEdgeData {
   label?: string;
   kind: "field" | "implements" | "union" | "arg";
   nullable?: boolean;
+  /** Set on a bundled edge that collapses several field edges sharing
+   *  the same source→target into one arrow. Carries the names of every
+   *  field that references the target, surfaced together on hover. */
+  bundledLabels?: string[];
 }
 
 /**
