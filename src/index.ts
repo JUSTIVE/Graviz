@@ -50,6 +50,26 @@ const server = serve({
     // works in both dev and prod.
     "/layout-worker.js": () => buildLayoutWorker(),
 
+    // PWA static files. Served verbatim from src/ at fixed root URLs so
+    // the manifest, icons, and service worker resolve the same in dev
+    // and prod (build.ts copies these into dist/). The SW is served at
+    // root so its default scope covers the whole app.
+    "/manifest.webmanifest": () =>
+      new Response(Bun.file(join(import.meta.dir, "manifest.webmanifest")), {
+        headers: { "content-type": "application/manifest+json; charset=utf-8" },
+      }),
+    "/sw.js": () =>
+      new Response(Bun.file(join(import.meta.dir, "sw.js")), {
+        headers: {
+          "content-type": "application/javascript; charset=utf-8",
+          // Let the SW control the whole origin and never be stale.
+          "service-worker-allowed": "/",
+          "cache-control": "no-cache",
+        },
+      }),
+    "/icon-192.png": () => new Response(Bun.file(join(import.meta.dir, "icon-192.png"))),
+    "/icon-512.png": () => new Response(Bun.file(join(import.meta.dir, "icon-512.png"))),
+
     "/api/hello": {
       async GET(req) {
         return Response.json({

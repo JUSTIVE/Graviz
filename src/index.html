@@ -5,6 +5,40 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Graviz — GraphQL SDL visualizer</title>
     <link rel="icon" type="image/png" href="./favicon.png" />
+    <!-- theme-color / apple meta are inert to the bundler (no href). -->
+    <meta name="theme-color" content="#0b0f19" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Graviz" />
+    <script>
+      // PWA wiring. The manifest / apple-touch-icon links are injected
+      // at runtime rather than written in the HTML because Bun's HTML
+      // bundler tries (and fails) to resolve absolute-path <link href>
+      // at build time. These files are served verbatim at fixed root
+      // URLs (see index.ts routes, build.ts copy step).
+      (function () {
+        function link(rel, href) {
+          var el = document.createElement("link");
+          el.rel = rel;
+          el.href = href;
+          document.head.appendChild(el);
+        }
+        link("manifest", "/manifest.webmanifest");
+        link("apple-touch-icon", "/icon-192.png");
+        // Register the service worker for offline / installable PWA.
+        // Skip localhost so Bun's HMR and the e2e suite aren't served
+        // stale, SW-cached assets during development — unless a test
+        // opts in via localStorage("pwa:sw") === "force".
+        if (!("serviceWorker" in navigator)) return;
+        var forced = false;
+        try { forced = localStorage.getItem("pwa:sw") === "force"; } catch (e) {}
+        var h = location.hostname;
+        if (!forced && (h === "localhost" || h === "127.0.0.1" || h === "[::1]")) return;
+        window.addEventListener("load", function () {
+          navigator.serviceWorker.register("/sw.js").catch(function () {});
+        });
+      })();
+    </script>
     <script>
       // Apply dark class before first paint to prevent white flash.
       // Runs synchronously in <head>, before any CSS or React loads.

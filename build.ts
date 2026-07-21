@@ -157,6 +157,23 @@ const workerResult = await Bun.build({
   },
 });
 
+// PWA static files — copied verbatim to fixed root URLs (the manifest,
+// icons, and service worker are referenced by absolute path from
+// index.html and served as-is; they must not be hashed/bundled).
+const PWA_FILES = [
+  "manifest.webmanifest",
+  "sw.js",
+  "icon-192.png",
+  "icon-512.png",
+  "favicon.png",
+];
+for (const name of PWA_FILES) {
+  const src = path.resolve("src", name);
+  if (existsSync(src)) {
+    await Bun.write(path.join(outdir, name), Bun.file(src));
+  }
+}
+
 const end = performance.now();
 
 if (!workerResult.success) {
