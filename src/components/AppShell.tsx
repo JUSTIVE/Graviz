@@ -20,7 +20,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
   return (
     <div className="flex h-screen w-full flex-col overflow-hidden bg-background text-foreground">
-      <header className="sticky top-0 z-20 flex h-10 shrink-0 items-center justify-between border-b border-border bg-background/80 px-2 backdrop-blur lg:h-14 lg:px-4">
+      <header className="sticky top-0 z-20 flex min-h-10 shrink-0 items-center justify-between border-b border-border bg-background/80 px-2 pt-[env(safe-area-inset-top)] backdrop-blur lg:min-h-14 lg:px-4">
         <div className="flex items-center gap-2 lg:gap-6">
           <Link to="/" className="flex items-center gap-1.5 text-sm font-semibold lg:gap-2 lg:text-base">
             <img src={logo} alt="" className="h-4 w-4 lg:h-5 lg:w-5" />
