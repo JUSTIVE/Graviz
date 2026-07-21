@@ -2,7 +2,13 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <!-- Disable browser viewport zoom (pinch / double-tap) so mobile
+         pinch gestures don't zoom the whole page. The canvas does its
+         own pinch-zoom in JS (touch handlers), which is unaffected. -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1, user-scalable=no, viewport-fit=cover"
+    />
     <title>Graviz — GraphQL SDL visualizer</title>
     <link rel="icon" type="image/png" href="./favicon.png" />
     <!-- theme-color / apple meta are inert to the bundler (no href). -->
