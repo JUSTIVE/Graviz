@@ -85,6 +85,43 @@ function fuzzyScore(
   return { score, indices };
 }
 
+// ─── Prose (description / deprecation reason) search ───────────────────
+//
+// Names get fuzzy scoring above; descriptions and deprecation reasons are
+// free-form prose where a case-insensitive substring match is the right
+// model. Returns the match start plus a display score that prefers earlier
+// hits in shorter text.
+
+function proseMatch(
+  query: string,
+  text: string | undefined,
+): { index: number; score: number } | null {
+  if (!text) return null;
+  const idx = text.toLowerCase().indexOf(query.toLowerCase());
+  if (idx < 0) return null;
+  const posBonus = Math.max(0, 6 - Math.floor(idx / 4));
+  const score = 4 + posBonus + Math.round((query.length / text.length) * 4);
+  return { index: idx, score };
+}
+
+// Builds a short, ellipsized excerpt of `text` centered on the match, and
+// the highlight indices of the matched span *within that excerpt*.
+function makeSnippet(
+  text: string,
+  matchStart: number,
+  queryLen: number,
+): { snippet: string; indices: number[] } {
+  const CONTEXT = 24;
+  const start = Math.max(0, matchStart - CONTEXT);
+  const end = Math.min(text.length, matchStart + queryLen + CONTEXT);
+  const prefix = start > 0 ? "…" : "";
+  const suffix = end < text.length ? "…" : "";
+  const snippet = prefix + text.slice(start, end) + suffix;
+  const base = matchStart - start + prefix.length;
+  const indices = Array.from({ length: queryLen }, (_, k) => base + k);
+  return { snippet, indices };
+}
+
 // ─── Windowed list ─────────────────────────────────────────────────────
 //
 // Minimal fixed-row-height virtualization for the capped (max-h-48)
@@ -287,6 +324,12 @@ export function TreePanel() {
     score: number;
     matchIndices: number[];
     typeMatchIndices?: number[]; // set when query is "Type.field" form
+    // Set when the hit came from prose (description / deprecation reason)
+    // rather than a name — carries the excerpt to show and where to
+    // highlight within it, plus which prose field matched.
+    snippet?: string;
+    snippetIndices?: number[];
+    snippetKind?: "description" | "deprecationReason";
   }
 
   const searchResults = useMemo<SearchResult[]>(() => {
@@ -324,7 +367,10 @@ export function TreePanel() {
         }
       }
     } else {
-      // Plain mode: fuzzy-match query against type names, field names, and enum values.
+      // Plain mode: fuzzy-match query against type / field / enum-value
+      // names, and substring-match against their descriptions and
+      // deprecation reasons. Prose matches only apply when the name itself
+      // doesn't match, so a type/field never shows up twice.
       for (const node of graph.nodes) {
         const tm = fuzzyScore(q, node.name);
         if (tm) {
@@ -335,6 +381,21 @@ export function TreePanel() {
             score: tm.score + 3,
             matchIndices: tm.indices,
           });
+        } else {
+          const dm = proseMatch(q, node.description);
+          if (dm) {
+            const { snippet, indices } = makeSnippet(node.description!, dm.index, q.length);
+            out.push({
+              typeId: node.id,
+              typeName: node.name,
+              typeKind: node.kind,
+              score: dm.score,
+              matchIndices: [],
+              snippet,
+              snippetIndices: indices,
+              snippetKind: "description",
+            });
+          }
         }
         for (const f of node.fields ?? []) {
           const fm = fuzzyScore(q, f.name);
@@ -348,6 +409,29 @@ export function TreePanel() {
               score: fm.score,
               matchIndices: fm.indices,
             });
+          } else {
+            const dm = proseMatch(q, f.description);
+            const rm = proseMatch(q, f.deprecationReason);
+            const hit = dm
+              ? { text: f.description!, m: dm, kind: "description" as const }
+              : rm
+                ? { text: f.deprecationReason!, m: rm, kind: "deprecationReason" as const }
+                : null;
+            if (hit) {
+              const { snippet, indices } = makeSnippet(hit.text, hit.m.index, q.length);
+              out.push({
+                typeId: node.id,
+                typeName: node.name,
+                typeKind: node.kind,
+                fieldName: f.name,
+                fieldType: f.type,
+                score: hit.m.score,
+                matchIndices: [],
+                snippet,
+                snippetIndices: indices,
+                snippetKind: hit.kind,
+              });
+            }
           }
         }
         for (const v of node.values ?? []) {
@@ -361,6 +445,28 @@ export function TreePanel() {
               score: vm.score,
               matchIndices: vm.indices,
             });
+          } else {
+            const dm = proseMatch(q, v.description);
+            const rm = proseMatch(q, v.deprecationReason);
+            const hit = dm
+              ? { text: v.description!, m: dm, kind: "description" as const }
+              : rm
+                ? { text: v.deprecationReason!, m: rm, kind: "deprecationReason" as const }
+                : null;
+            if (hit) {
+              const { snippet, indices } = makeSnippet(hit.text, hit.m.index, q.length);
+              out.push({
+                typeId: node.id,
+                typeName: node.name,
+                typeKind: node.kind,
+                fieldName: v.name,
+                score: hit.m.score,
+                matchIndices: [],
+                snippet,
+                snippetIndices: indices,
+                snippetKind: hit.kind,
+              });
+            }
           }
         }
       }
@@ -591,31 +697,52 @@ export function TreePanel() {
                       onClick={() => jumpToAndClose(r.typeId)}
                       onMouseEnter={() => setSelectedIdx(i)}
                       className={cn(
-                        "flex w-full items-center gap-2 px-3 py-1.5 text-left font-mono text-xs transition-colors",
+                        "flex w-full flex-col gap-0.5 px-3 py-1.5 text-left font-mono text-xs transition-colors",
                         isSelected ? "bg-secondary" : "hover:bg-secondary/60",
                       )}
                     >
-                      <Badge className={cn("shrink-0 px-1.5 py-0 text-[9px] leading-4", style.badge)}>
-                        {style.label}
-                      </Badge>
-                      {r.fieldName ? (
-                        <span className="min-w-0 flex-1 truncate">
-                          {r.typeMatchIndices ? (
-                            <HighlightedText text={r.typeName} indices={r.typeMatchIndices} className="text-muted-foreground" />
-                          ) : (
-                            <span className="text-muted-foreground">{r.typeName}</span>
-                          )}
-                          <span className="text-muted-foreground">.</span>
-                          <HighlightedText text={r.fieldName} indices={r.matchIndices} />
-                        </span>
-                      ) : (
-                        <span className="min-w-0 flex-1 truncate">
-                          <HighlightedText text={r.typeName} indices={r.matchIndices} />
-                        </span>
-                      )}
-                      {r.fieldType && (
-                        <span className="shrink-0 text-[10px] text-muted-foreground">
-                          {r.fieldType}
+                      <span className="flex w-full items-center gap-2">
+                        <Badge className={cn("shrink-0 px-1.5 py-0 text-[9px] leading-4", style.badge)}>
+                          {style.label}
+                        </Badge>
+                        {r.fieldName ? (
+                          <span className="min-w-0 flex-1 truncate">
+                            {r.typeMatchIndices ? (
+                              <HighlightedText text={r.typeName} indices={r.typeMatchIndices} className="text-muted-foreground" />
+                            ) : (
+                              <span className="text-muted-foreground">{r.typeName}</span>
+                            )}
+                            <span className="text-muted-foreground">.</span>
+                            <HighlightedText text={r.fieldName} indices={r.matchIndices} />
+                          </span>
+                        ) : (
+                          <span className="min-w-0 flex-1 truncate">
+                            <HighlightedText text={r.typeName} indices={r.matchIndices} />
+                          </span>
+                        )}
+                        {r.fieldType && (
+                          <span className="shrink-0 text-[10px] text-muted-foreground">
+                            {r.fieldType}
+                          </span>
+                        )}
+                      </span>
+                      {r.snippet && (
+                        <span className="flex min-w-0 items-center gap-1 pl-1 font-sans text-[10px] text-muted-foreground">
+                          <span
+                            className={cn(
+                              "shrink-0 rounded px-1 py-0 text-[9px] uppercase leading-4",
+                              r.snippetKind === "deprecationReason"
+                                ? "bg-amber-400/15 text-amber-600 dark:text-amber-400"
+                                : "bg-secondary text-muted-foreground",
+                            )}
+                          >
+                            {r.snippetKind === "deprecationReason" ? "deprecated" : "desc"}
+                          </span>
+                          <HighlightedText
+                            text={r.snippet}
+                            indices={r.snippetIndices ?? []}
+                            className="min-w-0 flex-1 truncate italic"
+                          />
                         </span>
                       )}
                     </button>
