@@ -153,6 +153,24 @@ export function ViewRoute() {
     prevSelRef.current = sel;
   }, [focusStack, pinnedField, isLg, collapsed, setCollapsed]);
 
+  // Cmd/Ctrl+K opens the tree search even when the sidebar is collapsed:
+  // expand it first, then bump a key the TreePanel watches to focus its
+  // input. Focusing here (rather than inside TreePanel) guarantees the
+  // panel is un-hidden before the focus lands — on mobile a collapsed
+  // sidebar is display:none and can't receive focus until it re-renders.
+  const [searchFocusKey, setSearchFocusKey] = useState(0);
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "k") {
+        e.preventDefault();
+        setCollapsed(false);
+        setSearchFocusKey((k) => k + 1);
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [setCollapsed]);
+
   if (!hasSchema) return null;
 
   const reachableFocusId =
@@ -256,7 +274,7 @@ export function ViewRoute() {
         </div>
 
         {mode === "reachable" ? (
-          <TreePanel />
+          <TreePanel searchFocusKey={searchFocusKey} />
         ) : mode === "orphaned" ? (
           <OrphanPanel
             nodes={orphanedNodes}

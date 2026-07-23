@@ -188,7 +188,7 @@ function HighlightedText({ text, indices, className }: { text: string; indices: 
   );
 }
 
-export function TreePanel() {
+export function TreePanel({ searchFocusKey = 0 }: { searchFocusKey?: number }) {
   const {
     graph,
     visibleNodes,
@@ -209,18 +209,19 @@ export function TreePanel() {
   const inputRef = useRef<HTMLInputElement>(null);
   const selectedItemRef = useRef<HTMLButtonElement>(null);
 
-  // Cmd+K / Ctrl+K → focus search input
+  // Focus the search input when the parent bumps `searchFocusKey`
+  // (its Cmd/Ctrl+K handler, which also expands the sidebar first).
+  // Deferred to the next frame so focus lands after the panel has
+  // re-rendered un-collapsed — a collapsed sidebar is display:none on
+  // mobile and can't be focused until then. Skipped on initial mount.
   useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === "k") {
-        e.preventDefault();
-        inputRef.current?.focus();
-        inputRef.current?.select();
-      }
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, []);
+    if (searchFocusKey === 0) return;
+    const id = requestAnimationFrame(() => {
+      inputRef.current?.focus();
+      inputRef.current?.select();
+    });
+    return () => cancelAnimationFrame(id);
+  }, [searchFocusKey]);
 
   const byId = useMemo(
     () => new Map(visibleNodes.map((n) => [n.id, n])),
