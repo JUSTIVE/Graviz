@@ -197,6 +197,7 @@ export function TreePanel() {
     focusStack,
     pushFocus,
     popTo,
+    setPinnedField,
     name,
   } = useSchema();
   const [allTypesOpen, setAllTypesOpen] = useState(false);
@@ -511,9 +512,20 @@ export function TreePanel() {
     setSearchHistory((h) => pushSearchHistory(q, h));
   };
 
-  const jumpToAndClose = (id: string) => {
+  const jumpToAndClose = (r: SearchResult) => {
     if (query.trim()) saveQueryToHistory(query);
-    jumpTo(id);
+    jumpTo(r.typeId);
+    // When the hit is a field / enum value, pin it so the canvas draws
+    // its row highlight and the tree scrolls the row into view. A
+    // type-level hit clears any stale pin.
+    if (r.fieldName) {
+      const node = nodesById.get(r.typeId);
+      const list = node?.kind === "Enum" ? node.values : node?.fields;
+      const idx = list?.findIndex((x) => x.name === r.fieldName) ?? -1;
+      setPinnedField({ typeId: r.typeId, fieldName: r.fieldName, fieldIndex: idx });
+    } else {
+      setPinnedField(null);
+    }
     setQuery("");
     inputRef.current?.blur();
   };
@@ -528,7 +540,7 @@ export function TreePanel() {
       setSelectedIdx((i) => Math.max(i - 1, 0));
     } else if (e.key === "Enter") {
       const r = filteredResults[selectedIdx];
-      if (r) jumpToAndClose(r.typeId);
+      if (r) jumpToAndClose(r);
     }
   };
 
@@ -694,7 +706,7 @@ export function TreePanel() {
                     <button
                       ref={isSelected ? selectedItemRef : undefined}
                       type="button"
-                      onClick={() => jumpToAndClose(r.typeId)}
+                      onClick={() => jumpToAndClose(r)}
                       onMouseEnter={() => setSelectedIdx(i)}
                       className={cn(
                         "flex w-full flex-col gap-0.5 px-3 py-1.5 text-left font-mono text-xs transition-colors",
@@ -1058,11 +1070,23 @@ function TypeDetail({
   onNavigate: (id: string) => void;
   nodesById: Map<string, GraphNodeData>;
 }) {
-  const { setPinnedField } = useSchema();
+  const { setPinnedField, pinnedField } = useSchema();
   const style = KIND_STYLES[node.kind];
 
   const chainNavigable = (typeName: string) =>
     !BUILTIN.has(typeName) && nodesById.has(typeName);
+
+  // The field row currently pinned on *this* type (via search jump,
+  // canvas click, or a tree row click). Used to highlight the row and
+  // scroll it into view when the pin lands on a type we're showing.
+  const pinnedRowName =
+    pinnedField && pinnedField.typeId === node.id ? pinnedField.fieldName : null;
+  const pinnedRowRef = useRef<HTMLLIElement>(null);
+  useEffect(() => {
+    if (pinnedRowName) pinnedRowRef.current?.scrollIntoView({ block: "nearest" });
+    // Depend on the pin object (a fresh reference on every pin action)
+    // and node.id so re-pinning the same field still re-scrolls.
+  }, [pinnedField, pinnedRowName, node.id]);
 
   return (
     <div className="p-3">
@@ -1103,10 +1127,12 @@ function TypeDetail({
             return (
             <li
               key={v.name}
+              ref={pinnedRowName === v.name ? pinnedRowRef : undefined}
               className={cn(
                 "rounded px-2 py-1",
                 v.isDeprecated && !expired && "bg-amber-400/10",
                 expired && "bg-red-500/10",
+                pinnedRowName === v.name && "ring-1 ring-orange-500/60 bg-orange-400/10",
               )}
             >
               <div className="flex flex-col gap-0.5">
@@ -1162,7 +1188,7 @@ function TypeDetail({
               },
             ];
             return (
-              <li key={f.name}>
+              <li key={f.name} ref={pinnedRowName === f.name ? pinnedRowRef : undefined}>
                 <FieldRow
                   label={f.name}
                   chain={chain}
@@ -1171,6 +1197,7 @@ function TypeDetail({
                   isDeprecated={f.isDeprecated}
                   deprecationReason={f.deprecationReason}
                   expired={isUntilExpired(f.until)}
+                  highlighted={pinnedRowName === f.name}
                   onNavigate={onNavigate}
                   onPin={() =>
                     setPinnedField({
@@ -1207,6 +1234,7 @@ function FieldRow({
   isDeprecated,
   deprecationReason,
   expired,
+  highlighted,
   onNavigate,
   onPin,
 }: {
@@ -1218,6 +1246,9 @@ function FieldRow({
   deprecationReason?: string;
   /** The field's `[until …]` sunset date has passed — render it red. */
   expired?: boolean;
+  /** This row is the currently pinned field — draw an orange ring
+   *  matching the canvas highlight so the two views agree. */
+  highlighted?: boolean;
   onNavigate: (id: string) => void;
   /** Called whenever the row itself is clicked — used to pin this
    *  field's highlight on the canvas. Independent of navigation:
@@ -1349,6 +1380,7 @@ function FieldRow({
         "flex w-full cursor-pointer flex-col gap-0.5 rounded px-2 py-1 hover:bg-secondary/60",
         isDeprecated && !expired && "bg-amber-400/10 opacity-60 hover:bg-amber-400/20",
         expired && "bg-red-500/10 hover:bg-red-500/20",
+        highlighted && "bg-orange-400/10 ring-1 ring-orange-500/60",
       )}
       onMouseEnter={(ev) => {
         setHovered(true);
