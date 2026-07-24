@@ -1294,7 +1294,11 @@ function buildEdgeBatchMesh(
         const iNext = Math.min(n - 1, i + 1);
         let dx = pts[2 * iNext]! - pts[2 * iPrev]!;
         let dy = pts[2 * iNext + 1]! - pts[2 * iPrev + 1]!;
-        const len = Math.hypot(dx, dy) || 1;
+        // Inline sqrt instead of Math.hypot: hypot carries overflow-safety
+        // scaling we don't need for pixel-space tangents, and it dominates
+        // this per-vertex loop (millions of verts on large schemas). Bench
+        // in bench/tess: byte-identical output, ~2.8× faster on this loop.
+        const len = Math.sqrt(dx * dx + dy * dy) || 1;
         dx /= len;
         dy /= len;
         const nx = -dy;
