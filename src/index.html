@@ -40,8 +40,65 @@
         try { forced = localStorage.getItem("pwa:sw") === "force"; } catch (e) {}
         var h = location.hostname;
         if (!forced && (h === "localhost" || h === "127.0.0.1" || h === "[::1]")) return;
+
+        // Show a dismissible "new version" toast that reloads on demand.
+        function showUpdateToast(waiting) {
+          if (document.getElementById("pwa-update-toast")) return;
+          var bar = document.createElement("div");
+          bar.id = "pwa-update-toast";
+          bar.setAttribute("role", "status");
+          bar.style.cssText =
+            "position:fixed;left:50%;transform:translateX(-50%);" +
+            "bottom:calc(16px + env(safe-area-inset-bottom));z-index:2147483647;" +
+            "display:flex;align-items:center;gap:12px;padding:10px 12px 10px 16px;" +
+            "border-radius:12px;font:500 14px/1.2 system-ui,-apple-system,sans-serif;" +
+            "box-shadow:0 8px 30px rgba(0,0,0,.35);border:1px solid rgba(255,255,255,.12);" +
+            "background:#0b0f19;color:#f1f5f9;max-width:calc(100vw - 24px);";
+          var msg = document.createElement("span");
+          msg.textContent = "새 버전이 있습니다";
+          var btn = document.createElement("button");
+          btn.textContent = "새로고침";
+          btn.style.cssText =
+            "cursor:pointer;border:0;border-radius:8px;padding:6px 12px;" +
+            "font:inherit;font-weight:600;background:#6366f1;color:#fff;";
+          btn.addEventListener("click", function () {
+            btn.disabled = true;
+            btn.textContent = "적용 중…";
+            // Tell the waiting worker to take over; controllerchange then reloads.
+            if (waiting) waiting.postMessage({ type: "SKIP_WAITING" });
+          });
+          bar.appendChild(msg);
+          bar.appendChild(btn);
+          document.body.appendChild(bar);
+        }
+
         window.addEventListener("load", function () {
-          navigator.serviceWorker.register("/sw.js").catch(function () {});
+          navigator.serviceWorker.register("/sw.js").then(function (reg) {
+            // A worker already waiting from a previous visit.
+            if (reg.waiting && navigator.serviceWorker.controller) showUpdateToast(reg.waiting);
+            // A new worker started installing → prompt once it's ready.
+            reg.addEventListener("updatefound", function () {
+              var installing = reg.installing;
+              if (!installing) return;
+              installing.addEventListener("statechange", function () {
+                if (installing.state === "installed" && navigator.serviceWorker.controller) {
+                  showUpdateToast(reg.waiting || installing);
+                }
+              });
+            });
+            // Long-open tabs: re-check for a new deploy when refocused.
+            document.addEventListener("visibilitychange", function () {
+              if (document.visibilityState === "visible") reg.update().catch(function () {});
+            });
+          }).catch(function () {});
+
+          // The new worker activated (after SKIP_WAITING) → reload once.
+          var reloaded = false;
+          navigator.serviceWorker.addEventListener("controllerchange", function () {
+            if (reloaded) return;
+            reloaded = true;
+            window.location.reload();
+          });
         });
       })();
     </script>

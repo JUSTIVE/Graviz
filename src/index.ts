@@ -6,6 +6,12 @@ import setupLocatorUI from "@locator/runtime";
 if (process.env.NODE_ENV === "development") {
   setupLocatorUI();
 }
+
+// Build id stamped into the service worker so each deploy ships a
+// byte-different sw.js (mirrors build.ts). Falls back to "dev" when git
+// isn't available; the SW is skipped on localhost anyway.
+const BUILD_ID =
+  Bun.spawnSync(["git", "rev-parse", "--short=6", "HEAD"]).stdout.toString().trim() || "dev";
 /**
  * Bundle the layout worker on demand. Bun's HTML-entrypoint bundler
  * doesn't rewrite `new Worker(new URL(...))` into a separate emitted
@@ -58,15 +64,21 @@ const server = serve({
       new Response(Bun.file(join(import.meta.dir, "manifest.webmanifest")), {
         headers: { "content-type": "application/manifest+json; charset=utf-8" },
       }),
-    "/sw.js": () =>
-      new Response(Bun.file(join(import.meta.dir, "sw.js")), {
-        headers: {
-          "content-type": "application/javascript; charset=utf-8",
-          // Let the SW control the whole origin and never be stale.
-          "service-worker-allowed": "/",
-          "cache-control": "no-cache",
+    "/sw.js": async () =>
+      new Response(
+        (await Bun.file(join(import.meta.dir, "sw.js")).text()).replaceAll(
+          "__BUILD_ID__",
+          BUILD_ID,
+        ),
+        {
+          headers: {
+            "content-type": "application/javascript; charset=utf-8",
+            // Let the SW control the whole origin and never be stale.
+            "service-worker-allowed": "/",
+            "cache-control": "no-cache",
+          },
         },
-      }),
+      ),
     "/icon-192.png": () => new Response(Bun.file(join(import.meta.dir, "icon-192.png"))),
     "/icon-512.png": () => new Response(Bun.file(join(import.meta.dir, "icon-512.png"))),
 

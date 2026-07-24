@@ -169,7 +169,13 @@ const PWA_FILES = [
 ];
 for (const name of PWA_FILES) {
   const src = path.resolve("src", name);
-  if (existsSync(src)) {
+  if (!existsSync(src)) continue;
+  // Stamp the build id into the service worker so every deploy ships a
+  // byte-different sw.js → the browser installs it and purges old caches.
+  if (name === "sw.js") {
+    const source = await Bun.file(src).text();
+    await Bun.write(path.join(outdir, name), source.replaceAll("__BUILD_ID__", commitHash));
+  } else {
     await Bun.write(path.join(outdir, name), Bun.file(src));
   }
 }
