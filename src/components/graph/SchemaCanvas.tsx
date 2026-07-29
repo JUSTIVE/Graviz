@@ -5324,10 +5324,13 @@ export function SchemaCanvas({ nodes, edges: edgesProp, focusId, rootId, onNavig
           {/* Width lives on the inner wrapper — tooltipStyle sets an
               inline maxWidth on the box that would override a class. */}
           <div className="max-w-[380px]">
-            <div className="mb-0.5 flex items-center gap-1.5 font-semibold">
+            {/* Block (not flex) with break-words so a long field name +
+                return type wrap inside the tooltip instead of spilling
+                past its edge. */}
+            <div className="mb-0.5 break-words font-semibold">
               {hoveredFieldTip.kind && (
                 <span
-                  className="rounded px-1 py-0 text-[9px] font-normal uppercase tracking-wide"
+                  className="mr-1.5 rounded px-1 py-0 align-middle text-[9px] font-normal uppercase tracking-wide"
                   style={{
                     backgroundColor: KIND_COLORS[hoveredFieldTip.kind],
                     color: "white",
@@ -5338,7 +5341,7 @@ export function SchemaCanvas({ nodes, edges: edgesProp, focusId, rootId, onNavig
               )}
               {hoveredFieldTip.name}
               {hoveredFieldTip.type && (
-                <span className="font-normal" style={{ color: "#f59e0b" }}>
+                <span className="ml-1.5 font-normal" style={{ color: "#f59e0b" }}>
                   {hoveredFieldTip.type}
                 </span>
               )}
