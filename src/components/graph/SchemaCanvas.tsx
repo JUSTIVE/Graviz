@@ -1416,6 +1416,54 @@ function buildDotGridTexture(dotColor: number, alpha: number): Texture {
 
 // ─── Main component ───────────────────────────────────────────────────
 
+/** One token of tooltip text that must never break mid-word: it stays
+ *  on a single line and, when wider than the tooltip, marquees left and
+ *  back so the whole string is still readable. Rendered inline-block so
+ *  a sequence (name + return type) flows and wraps between tokens. */
+function MarqueeInline({
+  text,
+  className,
+  style,
+}: {
+  text: string;
+  className?: string;
+  style?: React.CSSProperties;
+}) {
+  const boxRef = useRef<HTMLSpanElement>(null);
+  const textRef = useRef<HTMLSpanElement>(null);
+  useLayoutEffect(() => {
+    const box = boxRef.current;
+    const inner = textRef.current;
+    if (!box || !inner) return;
+    const overflow = inner.scrollWidth - box.clientWidth;
+    if (overflow <= 1) return; // fits — no marquee needed
+    const dist = overflow + 6;
+    const dur = Math.max(2500, dist * 24);
+    const anim = inner.animate(
+      [
+        { transform: "translateX(0)", offset: 0 },
+        { transform: "translateX(0)", offset: 0.15 },
+        { transform: `translateX(-${dist}px)`, offset: 0.5 },
+        { transform: `translateX(-${dist}px)`, offset: 0.65 },
+        { transform: "translateX(0)", offset: 1 },
+      ],
+      { duration: dur, iterations: Infinity, easing: "ease-in-out" },
+    );
+    return () => anim.cancel();
+  }, [text]);
+  return (
+    <span
+      ref={boxRef}
+      className={cn("inline-block max-w-full overflow-hidden align-bottom", className)}
+      style={style}
+    >
+      <span ref={textRef} className="inline-block whitespace-nowrap">
+        {text}
+      </span>
+    </span>
+  );
+}
+
 /** True below the `lg` breakpoint — the canvas's overlays reflow for
  *  small / touch screens (bottom-docked Recent panel, fps-only perf). */
 function useIsMobile(): boolean {
@@ -5323,14 +5371,15 @@ export function SchemaCanvas({ nodes, edges: edgesProp, focusId, rootId, onNavig
         >
           {/* Width lives on the inner wrapper — tooltipStyle sets an
               inline maxWidth on the box that would override a class. */}
-          <div className="max-w-[380px]">
-            {/* Block (not flex) with break-words so a long field name +
-                return type wrap inside the tooltip instead of spilling
-                past its edge. */}
-            <div className="mb-0.5 break-words font-semibold">
+          <div className="max-w-[80vw]">
+            {/* Name + return type flow inline: when they fit they share
+                a line; when together they'd exceed the tooltip the type
+                wraps below (never breaking mid-word). A single token
+                wider than the tooltip marquees rather than truncating. */}
+            <div className="mb-0.5 font-semibold">
               {hoveredFieldTip.kind && (
                 <span
-                  className="mr-1.5 rounded px-1 py-0 align-middle text-[9px] font-normal uppercase tracking-wide"
+                  className="mr-1.5 rounded px-1 py-0 align-bottom text-[9px] font-normal uppercase tracking-wide"
                   style={{
                     backgroundColor: KIND_COLORS[hoveredFieldTip.kind],
                     color: "white",
@@ -5339,11 +5388,13 @@ export function SchemaCanvas({ nodes, edges: edgesProp, focusId, rootId, onNavig
                   {KIND_STYLES[hoveredFieldTip.kind].label}
                 </span>
               )}
-              {hoveredFieldTip.name}
+              <MarqueeInline text={hoveredFieldTip.name} />
               {hoveredFieldTip.type && (
-                <span className="ml-1.5 font-normal" style={{ color: "#f59e0b" }}>
-                  {hoveredFieldTip.type}
-                </span>
+                <MarqueeInline
+                  text={hoveredFieldTip.type}
+                  className="ml-1.5 font-normal"
+                  style={{ color: "#f59e0b" }}
+                />
               )}
             </div>
             <div className="whitespace-pre-wrap break-words leading-relaxed text-muted-foreground">
