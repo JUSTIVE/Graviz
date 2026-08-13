@@ -163,6 +163,10 @@ interface Props {
    *  header (replaces the floating expand button, which is desktop-only
    *  so it never overlaps the top dock). */
   onExpandSidebar?: () => void;
+  /** When true, everything the overlay didn't touch fades out, leaving
+   *  the new and augmented types alone on the canvas. The emerald aura
+   *  around those types is drawn either way — this only dims the rest. */
+  highlightOverlay?: boolean;
 }
 
 interface EdgeGroupSpec {
@@ -620,6 +624,11 @@ function drawColoredType(
 /** Red used to flag fields/values whose `[until …]` sunset date has
  *  passed — they should have been removed and are now overdue. */
 const EXPIRED_COLOR = "#ef4444"; // red-500
+/** Emerald used for everything the temporary overlay contributed —
+ *  whole new types get a dashed emerald card outline, fields added to
+ *  an existing type get an emerald gutter marker. */
+const OVERLAY_COLOR = "#10b981"; // emerald-500
+const OVERLAY_HEX = 0x10b981;
 const RELAY_COLOR = "#F26A03";
 const RELAY_SVG_PATH = new Path2D(
   "M2.264 4.937A2.264 2.264 0 1 0 4.456 7.77h10.339a1.792 1.792 0 0 1 0 3.583h-5.73a3.037 3.037 0 0 0-3.034 3.033a3.036 3.036 0 0 0 3.033 3.033h10.494a2.264 2.264 0 1 0 0-1.242H9.064a1.793 1.793 0 0 1-1.791-1.791c0-.988.803-1.792 1.791-1.792h5.73a3.036 3.036 0 0 0 3.034-3.033a3.036 3.036 0 0 0-3.033-3.033H4.427a2.265 2.265 0 0 0-2.163-1.592",
@@ -721,6 +730,9 @@ function drawNodeSprite(
   const headerH = n.headerH;
   const showDesc = rowH !== ROW_H;
   const color = KIND_COLORS[n.data.kind];
+  // A type the overlay introduced wholesale. Types that merely gained
+  // overlay fields are not flagged here — their rows are.
+  const overlayNode = n.data.isOverlay === true;
 
   if (lod === "chrome") {
     roundRect(ctx, 0, 0, w, h, 6);
@@ -732,11 +744,23 @@ function drawNodeSprite(
   roundRect(ctx, 0, 0, w, h, 6);
   ctx.fillStyle = cardColor;
   ctx.fill();
-  ctx.strokeStyle = color;
-  ctx.lineWidth = 1.25;
-  ctx.globalAlpha = 0.75;
-  ctx.stroke();
-  ctx.globalAlpha = 1;
+  // Overlay types keep their kind color inside but wear a heavier
+  // dashed emerald outline, so a scratch type is identifiable at a
+  // glance without losing which kind it is.
+  if (overlayNode) {
+    ctx.save();
+    ctx.setLineDash([4, 3]);
+    ctx.strokeStyle = OVERLAY_COLOR;
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.restore();
+  } else {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.25;
+    ctx.globalAlpha = 0.75;
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
 
   roundRectTopOnly(ctx, 0, 0, w, headerH, 6);
   ctx.fillStyle = color;
@@ -829,6 +853,18 @@ function drawNodeSprite(
   paintText(ctx, sink, n.data.kind.toUpperCase(), 8, 14);
   ctx.globalAlpha = 1;
 
+  // Right-aligned "OVERLAY" tag in the header band, so a new type is
+  // labelled even when its dashed outline is off-screen or overlapped.
+  if (overlayNode) {
+    ctx.font = `600 8px ${MONO}`;
+    const tag = "OVERLAY";
+    const tagW = ctx.measureText(tag).width;
+    ctx.fillStyle = "#ffffff";
+    ctx.globalAlpha = 0.9;
+    paintText(ctx, sink, tag, w - 8 - tagW, 14);
+    ctx.globalAlpha = 1;
+  }
+
   ctx.font = NODE_NAME_FONT;
   ctx.fillStyle = "#ffffff";
   paintText(ctx, sink, fitText(ctx, n.data.name, w - 16), 8, 30);
@@ -870,6 +906,10 @@ function drawNodeSprite(
       const v = values[i]!;
       const fy = bodyY + i * rowH + 10;
       const expired = isUntilExpired(v.until);
+      if (v.isOverlay) {
+        ctx.fillStyle = OVERLAY_COLOR;
+        ctx.fillRect(3, fy - 7, 2, 9);
+      }
       ctx.font = `10px ${MONO}`;
       ctx.fillStyle = expired ? EXPIRED_COLOR : mutedFg;
       paintText(ctx, sink, v.name, 10, fy);
@@ -914,6 +954,13 @@ function drawNodeSprite(
       // Expired rows render at full opacity in red; ordinary deprecated
       // rows keep the muted amber fade.
       const depAlpha = expired ? 1 : f.isDeprecated ? 0.4 : 1;
+      // Gutter marker for a row the overlay added to an existing type.
+      // Drawn in the 10px left margin the name already reserves, so it
+      // costs no layout width.
+      if (f.isOverlay) {
+        ctx.fillStyle = OVERLAY_COLOR;
+        ctx.fillRect(3, fy - 7, 2, 9);
+      }
       ctx.font = `10px ${MONO}`;
       ctx.fillStyle = expired ? EXPIRED_COLOR : fgColor;
       ctx.globalAlpha = depAlpha;
@@ -1480,7 +1527,7 @@ function useIsMobile(): boolean {
   return isMobile;
 }
 
-export function SchemaCanvas({ nodes, edges: edgesProp, focusId, rootId, onNavigate, onClearFocus, leftControlsInset, onExpandSidebar }: Props) {
+export function SchemaCanvas({ nodes, edges: edgesProp, focusId, rootId, onNavigate, onClearFocus, leftControlsInset, onExpandSidebar, highlightOverlay }: Props) {
   // "Bundle edges" toggle — collapse multi-field A→B references into a
   // single arrow (details surface on hover). Off by default. Changing
   // it swaps the edge set fed to layout, so the graph re-lays out.
@@ -1739,6 +1786,8 @@ export function SchemaCanvas({ nodes, edges: edgesProp, focusId, rootId, onNavig
     nodeContainer: Container | null;
     /** SDF text meshes, one per full-LOD node, above the card sprites. */
     textContainer: Container | null;
+    /** Emerald halo behind the cards the overlay added to or created. */
+    overlayAura: Graphics | null;
     investigateOverlay: Graphics | null;
     pinFieldGraphics: Graphics | null;
     /** Field-row highlights for the fields behind a focused edge. */
@@ -1754,6 +1803,7 @@ export function SchemaCanvas({ nodes, edges: edgesProp, focusId, rootId, onNavig
     hoverEdgeGraphics: null,
     nodeContainer: null,
     textContainer: null,
+    overlayAura: null,
     investigateOverlay: null,
     pinFieldGraphics: null,
     edgeFieldGraphics: null,
@@ -2166,6 +2216,23 @@ export function SchemaCanvas({ nodes, edges: edgesProp, focusId, rootId, onNavig
     return { nodeIds, nodeOutline, rowsByNode };
   }, [investigateMode, nodes]);
 
+  // Types the overlay touched: the ones it introduced outright, plus the
+  // ones it augmented with new rows. Both wear the emerald aura, and both
+  // are what highlight mode isolates.
+  const overlayNodeIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const n of nodes) {
+      if (
+        n.isOverlay ||
+        n.fields?.some((f) => f.isOverlay) ||
+        n.values?.some((v) => v.isOverlay)
+      ) {
+        ids.add(n.id);
+      }
+    }
+    return ids;
+  }, [nodes]);
+
   // Static per-group edge buckets — depends only on the laid-out edge
   // set, never on focus state. This is what the edge tiles are built
   // from, so navigating (focus changes) doesn't invalidate any tile
@@ -2216,11 +2283,15 @@ export function SchemaCanvas({ nodes, edges: edgesProp, focusId, rootId, onNavig
       };
     });
 
-    // Investigate mode overrides the active/dim partition for edges
-    // — we don't highlight edges at all, so every edge moves into
-    // the dim list. Node dimming stacks with any focus state so
-    // non-matched nodes also fade out.
-    if (investigateMatch) {
+    // Emphasis modes — investigate matches, overlay highlight — override
+    // the active/dim partition for edges: neither highlights an edge, so
+    // every edge moves into the dim list. Node dimming stacks with any
+    // focus state (and with each other) so anything outside every
+    // emphasized set fades out.
+    const emphasis: ReadonlySet<string>[] = [];
+    if (investigateMatch) emphasis.push(investigateMatch.nodeIds);
+    if (highlightOverlay && overlayNodeIds.size > 0) emphasis.push(overlayNodeIds);
+    if (emphasis.length > 0) {
       for (const g of groups) {
         if (g.active.length > 0) {
           g.dim = g.dim.length === 0 ? g.active : g.dim.concat(g.active);
@@ -2228,12 +2299,22 @@ export function SchemaCanvas({ nodes, edges: edgesProp, focusId, rootId, onNavig
         }
       }
       for (const n of laidNodes) {
-        if (!investigateMatch.nodeIds.has(n.id)) dimNodeIds.add(n.id);
+        if (emphasis.some((set) => !set.has(n.id))) dimNodeIds.add(n.id);
       }
     }
 
     return { groups, dimNodeIds };
-  }, [edgeBuckets, laidEdges, laidNodes, focusId, rootId, focusedEdge, investigateMatch]);
+  }, [
+    edgeBuckets,
+    laidEdges,
+    laidNodes,
+    focusId,
+    rootId,
+    focusedEdge,
+    investigateMatch,
+    highlightOverlay,
+    overlayNodeIds,
+  ]);
 
   // The focused-edge reference becomes stale when laidEdges rebuilds
   // (new layout / schema change). Clear it so the dim state doesn't
@@ -3138,6 +3219,7 @@ export function SchemaCanvas({ nodes, edges: edgesProp, focusId, rootId, onNavig
       const activeEdgeContainer = new Container();
       const focusEdgeGraphics = new Container();
       const hoverEdgeGraphics = new Container();
+      const overlayAura = new Graphics();
       const nodeContainer = new Container();
       nodeContainer.cullable = true;
       // SDF text layer — glyph quad meshes above the card chrome.
@@ -3160,6 +3242,11 @@ export function SchemaCanvas({ nodes, edges: edgesProp, focusId, rootId, onNavig
       // other edge in the tiles but covered by node cards, so the
       // emphasized line reads cleanly without spilling onto nodes.
       world.addChild(hoverEdgeGraphics);
+      // The overlay aura goes directly beneath the cards, so the halo
+      // spills out around them instead of tinting the card face — and so
+      // it keeps glowing at full strength while highlight mode dims the
+      // sprites themselves.
+      world.addChild(overlayAura);
       world.addChild(nodeContainer);
       // Text sits directly above the card sprites so field highlights
       // (pin/hover, added later) keep their existing z-order relative
@@ -3192,6 +3279,7 @@ export function SchemaCanvas({ nodes, edges: edgesProp, focusId, rootId, onNavig
         hoverEdgeGraphics,
         nodeContainer,
         textContainer,
+        overlayAura,
         investigateOverlay,
         pinFieldGraphics,
         edgeFieldGraphics,
@@ -4059,6 +4147,7 @@ export function SchemaCanvas({ nodes, edges: edgesProp, focusId, rootId, onNavig
         hoverEdgeGraphics: null,
         nodeContainer: null,
         textContainer: null,
+        overlayAura: null,
         investigateOverlay: null,
         pinFieldGraphics: null,
         edgeFieldGraphics: null,
@@ -4562,6 +4651,39 @@ export function SchemaCanvas({ nodes, edges: edgesProp, focusId, rootId, onNavig
     addRects();
     g.stroke({ width: 1.5, color: 0xf59e0b, alpha: 0.9 });
   }, [focusedEdge, nodeById]);
+
+  // Emerald aura behind every type the overlay added to or created.
+  // Three concentric fills of falling alpha make the glow, and a crisp
+  // ring at the card edge keeps it from reading as a blur. Drawn under
+  // the cards, so only the halo shows — and it survives highlight mode,
+  // which dims the sprites but not this layer.
+  useEffect(() => {
+    const g = sceneRef.current.overlayAura;
+    if (!g) return;
+    g.clear();
+    if (overlayNodeIds.size === 0) return;
+
+    const halo = [
+      { pad: 22, radius: 26, alpha: 0.12 },
+      { pad: 13, radius: 18, alpha: 0.22 },
+      { pad: 6, radius: 11, alpha: 0.38 },
+    ];
+    for (const { pad, radius, alpha } of halo) {
+      g.beginPath();
+      for (const n of laidNodes) {
+        if (!overlayNodeIds.has(n.id)) continue;
+        g.roundRect(n.cx - n.w / 2 - pad, n.cy - n.h / 2 - pad, n.w + pad * 2, n.h + pad * 2, radius);
+      }
+      g.fill({ color: OVERLAY_HEX, alpha });
+    }
+
+    g.beginPath();
+    for (const n of laidNodes) {
+      if (!overlayNodeIds.has(n.id)) continue;
+      g.roundRect(n.cx - n.w / 2 - 2, n.cy - n.h / 2 - 2, n.w + 4, n.h + 4, 8);
+    }
+    g.stroke({ width: 2, color: OVERLAY_HEX, alpha: 0.8 });
+  }, [overlayNodeIds, laidNodes]);
 
   // Redraw the investigate-mode overlay whenever the match set or
   // node layout changes. Two layers of highlight:

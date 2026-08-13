@@ -1,4 +1,5 @@
-import { createContext, useCallback, useContext, useMemo, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import { markOverlay, prepareOverlay, type OverlayDiff } from "./overlay";
 import { allReachableIds, reachableFrom } from "./reachable";
 import { sdlToGraph, type GraphEdgeData, type GraphNodeData, type NodeKind, type ParsedGraph } from "./sdl-to-graph";
 import { isUntilExpired } from "./until";
@@ -42,6 +43,27 @@ interface SchemaContextValue {
   setSchema: (input: { sdl: string; name?: string }) => void;
   clearSchema: () => void;
 
+  /** SDL currently laid over the loaded schema. Empty when none is
+   *  applied. Deliberately not persisted — an overlay is a scratch
+   *  experiment that should not survive a reload. */
+  overlaySdl: string;
+  /** Applies the given SDL on top of the loaded schema. A type the
+   *  schema already declares is augmented rather than redeclared, a
+   *  restated field overrides the existing one, and a `-name` line
+   *  removes that field — see `lib/overlay.ts`. */
+  applyOverlay: (sdl: string) => void;
+  /** Drops the applied overlay, restoring the pristine schema. */
+  clearOverlay: () => void;
+  /** Parse error from the merged document, when the overlay makes it
+   *  unparseable. The graph keeps showing the base schema in that case. */
+  overlayError: string | null;
+  /** What the applied overlay changed — empty when none applied. */
+  overlayDiff: OverlayDiff;
+  /** Problems that are the overlay's own: a `-name` that resolved to
+   *  nothing, an extension of an unknown type, and the like. Warnings the
+   *  base schema already had are not repeated here. */
+  overlayWarnings: string[];
+
   rootType: string | null;
   setRootType: (id: string) => void;
   focusStack: string[];
@@ -68,6 +90,14 @@ const EMPTY: ParsedGraph = {
   warnings: [],
   rootTypes: { query: null, mutation: null, subscription: null },
 };
+const EMPTY_DIFF: OverlayDiff = {
+  addedTypes: [],
+  addedFields: [],
+  changedFields: [],
+  removedTypes: [],
+  removedFields: [],
+};
+const EMPTY_WARNINGS: string[] = [];
 const STORAGE_KEY = "gompassql:current";
 const BUILTIN_SCALARS = new Set(["String", "Int", "Float", "Boolean", "ID"]);
 
@@ -103,11 +133,82 @@ export function SchemaProvider({ children }: { children: React.ReactNode }) {
   const [pinnedField, setPinnedField] = useState<
     SchemaContextValue["pinnedField"]
   >(null);
+  const [overlaySdl, setOverlaySdl] = useState("");
 
-  const graph = useMemo(
+  const baseGraph = useMemo(
     () => (sdl ? sdlToGraph(sdl, { hideRelayBoilerplate }) : EMPTY),
     [sdl, hideRelayBoilerplate],
   );
+
+  // With an overlay applied, the graph is parsed from base+overlay
+  // (with the overlay rewritten so redeclared types augment and `-name`
+  // lines subtract — see `prepareOverlay`), then diffed against the base
+  // so the changes can be painted distinctly. A merged document that
+  // fails to parse leaves the base graph on screen and surfaces the
+  // error instead — the user keeps their view while they fix the snippet.
+  //
+  // Warnings are reported as the overlay's own only when the base schema
+  // doesn't already produce them: the base is a prefix of the merged
+  // document, so its warnings come through verbatim and would otherwise
+  // read as the overlay's fault.
+  const { graph, overlayError, overlayDiff, overlayWarnings } = useMemo(() => {
+    if (!sdl || !overlaySdl.trim()) {
+      return {
+        graph: baseGraph,
+        overlayError: null,
+        overlayDiff: EMPTY_DIFF,
+        overlayWarnings: EMPTY_WARNINGS,
+      };
+    }
+    const prepared = prepareOverlay(sdl, overlaySdl);
+    const merged = sdlToGraph(prepared.sdl, {
+      hideRelayBoilerplate,
+      remove: prepared.removals,
+      // Restating an existing field is how the overlay changes it.
+      overrideDuplicates: true,
+    });
+    if (merged.error) {
+      return {
+        graph: baseGraph,
+        overlayError: merged.error,
+        overlayDiff: EMPTY_DIFF,
+        overlayWarnings: prepared.warnings,
+      };
+    }
+    const fromBase = new Set(baseGraph.warnings);
+    const marked = markOverlay(baseGraph, merged);
+    return {
+      graph: marked.graph,
+      overlayError: null,
+      overlayDiff: marked.diff,
+      overlayWarnings: [
+        ...prepared.warnings,
+        ...merged.warnings.filter((w) => !fromBase.has(w)),
+      ],
+    };
+  }, [sdl, overlaySdl, hideRelayBoilerplate, baseGraph]);
+
+  // An overlay can take a type away, which would leave the focus trail
+  // and the pinned field pointing at nodes the graph no longer has — the
+  // canvas dims everything when it can't find its focus target. Prune
+  // them whenever the graph changes.
+  useEffect(() => {
+    const ids = new Set(graph.nodes.map((n) => n.id));
+    setFocusStack((prev) => {
+      const next = prev.filter((id) => ids.has(id));
+      return next.length === prev.length ? prev : next;
+    });
+    // Removing a row also shifts the ones after it, so the pin's index is
+    // re-derived rather than merely validated.
+    setPinnedField((prev) => {
+      if (!prev) return prev;
+      const node = graph.nodes.find((n) => n.id === prev.typeId);
+      const rows = node?.kind === "Enum" ? node.values : node?.fields;
+      const idx = rows?.findIndex((r) => r.name === prev.fieldName) ?? -1;
+      if (idx < 0) return null;
+      return idx === prev.fieldIndex ? prev : { ...prev, fieldIndex: idx };
+    });
+  }, [graph]);
 
   // The schema's resolved root operation types, honoring any
   // `schema { query: QueryRoot }` override. Ordered query → mutation →
@@ -262,6 +363,10 @@ export function SchemaProvider({ children }: { children: React.ReactNode }) {
       setName(n);
       setFocusStack([]);
       setRootTypeState(null);
+      // An overlay is written against a specific schema; carrying it
+      // into a different one would mostly produce "cannot extend
+      // unknown type" noise.
+      setOverlaySdl("");
       try {
         sessionStorage.setItem(
           STORAGE_KEY,
@@ -279,11 +384,20 @@ export function SchemaProvider({ children }: { children: React.ReactNode }) {
     setName("");
     setFocusStack([]);
     setRootTypeState(null);
+    setOverlaySdl("");
     try {
       sessionStorage.removeItem(STORAGE_KEY);
     } catch {
       // ignore
     }
+  }, []);
+
+  const applyOverlay = useCallback((next: string) => {
+    setOverlaySdl(next);
+  }, []);
+
+  const clearOverlay = useCallback(() => {
+    setOverlaySdl("");
   }, []);
 
   const setRootType = useCallback((id: string) => {
@@ -318,6 +432,12 @@ export function SchemaProvider({ children }: { children: React.ReactNode }) {
       deprecatedFields,
       setSchema,
       clearSchema,
+      overlaySdl,
+      applyOverlay,
+      clearOverlay,
+      overlayError,
+      overlayDiff,
+      overlayWarnings,
       rootType: effectiveRoot,
       setRootType,
       focusStack,
@@ -343,6 +463,12 @@ export function SchemaProvider({ children }: { children: React.ReactNode }) {
       deprecatedFields,
       setSchema,
       clearSchema,
+      overlaySdl,
+      applyOverlay,
+      clearOverlay,
+      overlayError,
+      overlayDiff,
+      overlayWarnings,
       effectiveRoot,
       setRootType,
       focusStack,

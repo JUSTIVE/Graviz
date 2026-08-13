@@ -1,4 +1,20 @@
-import { getLocation, Kind, parse, type ConstDirectiveNode, type TypeNode } from "graphql";
+import {
+  getLocation,
+  Kind,
+  parse,
+  type ConstDirectiveNode,
+  type DefinitionNode,
+  type EnumTypeExtensionNode,
+  type EnumValueDefinitionNode,
+  type FieldDefinitionNode,
+  type InputObjectTypeExtensionNode,
+  type InputValueDefinitionNode,
+  type InterfaceTypeExtensionNode,
+  type ObjectTypeExtensionNode,
+  type TypeExtensionNode,
+  type TypeNode,
+  type UnionTypeExtensionNode,
+} from "graphql";
 import { parseUntil } from "./until";
 
 export type NodeKind = "Object" | "Interface" | "Union" | "Enum" | "Scalar" | "Input";
@@ -16,6 +32,10 @@ export interface GraphField {
   /** Sunset date (`YYYY-MM-DD`) parsed from a `[until …]` marker in the
    *  deprecation reason, when present. Used to flag overdue fields. */
   until?: string;
+  /** Set when this field came from the temporary overlay SDL rather
+   *  than the loaded schema. Painted with an accent marker so the
+   *  addition is obvious against the base schema. */
+  isOverlay?: boolean;
 }
 
 export interface EnumValue {
@@ -25,6 +45,8 @@ export interface EnumValue {
   deprecationReason?: string;
   /** See {@link GraphField.until}. */
   until?: string;
+  /** See {@link GraphField.isOverlay}. */
+  isOverlay?: boolean;
 }
 
 export interface GraphNodeData {
@@ -40,6 +62,10 @@ export interface GraphNodeData {
    *  a member (reverse of {@link members}). Rendered as an extra card
    *  section, like `interfaces`. */
   memberOfUnions?: string[];
+  /** Set when the whole type is new in the overlay (it has no
+   *  counterpart in the loaded schema). Types that merely gained
+   *  overlay fields are not flagged here — their fields are. */
+  isOverlay?: boolean;
 }
 
 export interface GraphEdgeData {
@@ -109,11 +135,36 @@ function resolveRootTypes(
   return map;
 }
 
+/**
+ * A member — or a whole type — to delete from the graph once every
+ * `extend` block has been folded in. This is how the overlay's `-name`
+ * lines are expressed (see `overlay.ts`): SDL has no syntax for taking
+ * something away, so subtraction is passed alongside the document
+ * instead of inside it.
+ */
+export interface SchemaRemoval {
+  /** Name of the type the removal targets. */
+  type: string;
+  /** Field, enum value, union member or implemented interface to drop.
+   *  Omitted to drop the whole type. */
+  member?: string;
+}
+
 export interface SdlToGraphOptions {
   /** When true (default), the standard Relay `Node` interface, `PageInfo`,
    *  and `*Edge` / `*Connection` types are folded away and field types are
    *  unwrapped to the underlying node. Set to false to surface them. */
   hideRelayBoilerplate?: boolean;
+  /** Members to delete after extensions are applied. Runs before Relay
+   *  unwrapping and edge building, so a removed field takes its edges —
+   *  and any reachability it granted — with it. */
+  remove?: readonly SchemaRemoval[];
+  /** When true, a field or enum value an extension re-declares replaces
+   *  the existing one (in place, keeping its row position) instead of
+   *  being skipped with a duplicate warning. This is what lets the
+   *  overlay change an existing field by simply restating it; a plain
+   *  schema keeps the stricter reading, where a duplicate is a mistake. */
+  overrideDuplicates?: boolean;
 }
 
 const BUILTIN_SCALARS = new Set(["String", "Int", "Float", "Boolean", "ID"]);
@@ -156,6 +207,258 @@ function parseDeprecated(directives: readonly ConstDirectiveNode[] | undefined):
   return { isDeprecated: true, deprecationReason: reasonValue, until };
 }
 
+/** Builds the graph-level field list for an object/interface/input
+ *  definition or extension. Shared so `extend type` blocks produce
+ *  fields identical to the ones a plain definition would. */
+function buildFields(
+  defFields: readonly (FieldDefinitionNode | InputValueDefinitionNode)[] | undefined,
+): GraphField[] {
+  const fields: GraphField[] = [];
+  for (const f of defFields ?? []) {
+    const t = renderType(f.type);
+    const dep = parseDeprecated(f.directives);
+    fields.push({
+      name: f.name.value,
+      type: t.rendered,
+      typeName: t.base,
+      nullable: f.type.kind !== Kind.NON_NULL_TYPE,
+      description: f.description?.value,
+      args:
+        "arguments" in f && f.arguments
+          ? f.arguments.map((a) => ({
+              name: a.name.value,
+              type: renderType(a.type).rendered,
+              typeName: renderType(a.type).base,
+            }))
+          : undefined,
+      ...(dep.isDeprecated && { isDeprecated: true, deprecationReason: dep.deprecationReason, until: dep.until }),
+    });
+  }
+  return fields;
+}
+
+/** See {@link buildFields} — the enum-value counterpart. */
+function buildEnumValues(
+  defValues: readonly EnumValueDefinitionNode[] | undefined,
+): EnumValue[] {
+  return (defValues ?? []).map((v) => {
+    const dep = parseDeprecated(v.directives);
+    return {
+      name: v.name.value,
+      description: v.description?.value,
+      ...(dep.isDeprecated && { isDeprecated: true, deprecationReason: dep.deprecationReason, until: dep.until }),
+    };
+  });
+}
+
+/** Node kind each extension keyword may legally extend. */
+const EXTENSION_KINDS: Partial<Record<string, NodeKind>> = {
+  [Kind.OBJECT_TYPE_EXTENSION]: "Object",
+  [Kind.INTERFACE_TYPE_EXTENSION]: "Interface",
+  [Kind.INPUT_OBJECT_TYPE_EXTENSION]: "Input",
+  [Kind.ENUM_TYPE_EXTENSION]: "Enum",
+  [Kind.UNION_TYPE_EXTENSION]: "Union",
+  [Kind.SCALAR_TYPE_EXTENSION]: "Scalar",
+};
+
+const EXTENSION_LABELS: Partial<Record<NodeKind, string>> = {
+  Object: "type",
+  Interface: "interface",
+  Input: "input",
+  Enum: "enum",
+  Union: "union",
+  Scalar: "scalar",
+};
+
+/**
+ * Folds every `extend type|interface|input|enum|union|scalar` block into
+ * the node it targets, mutating `nodes` in place. Runs before Relay
+ * unwrapping and edge building so extended members are indistinguishable
+ * from ones declared inline.
+ *
+ * This is what makes the overlay editor useful: an overlay saying
+ * `extend type Query { report: Report }` grows the existing Query node
+ * instead of colliding with it.
+ *
+ * Anything that can't be applied — extending a type that doesn't exist,
+ * or a kind mismatch (`extend type` against an interface) — is reported
+ * as a warning and skipped rather than throwing, so a half-written
+ * overlay still renders the parts that do resolve.
+ *
+ * With `override` set, re-declaring an existing field or enum value
+ * replaces it in place instead of being refused as a duplicate — see
+ * {@link SdlToGraphOptions.overrideDuplicates}.
+ */
+function applyExtensions(
+  definitions: readonly DefinitionNode[],
+  nodes: GraphNodeData[],
+  override: boolean,
+): string[] {
+  const warnings: string[] = [];
+  const byName = new Map<string, GraphNodeData>();
+  for (const n of nodes) byName.set(n.name, n);
+
+  for (const def of definitions) {
+    const expectedKind = EXTENSION_KINDS[def.kind];
+    if (!expectedKind) continue;
+    const ext = def as TypeExtensionNode;
+    const name = ext.name.value;
+    const label = EXTENSION_LABELS[expectedKind] ?? "type";
+    const where = ext.loc
+      ? (() => {
+          const p = getLocation(ext.loc!.source, ext.loc!.start);
+          return ` at ${p.line}:${p.column}`;
+        })()
+      : "";
+
+    const target = byName.get(name);
+    if (!target) {
+      warnings.push(`Cannot extend unknown ${label} "${name}"${where}`);
+      continue;
+    }
+    if (target.kind !== expectedKind) {
+      warnings.push(
+        `Cannot extend "${name}" as ${label}${where} — it is declared as ${EXTENSION_LABELS[target.kind] ?? target.kind}`,
+      );
+      continue;
+    }
+
+    if (expectedKind === "Enum") {
+      const values = [...(target.values ?? [])];
+      const at = new Map(values.map((v, i) => [v.name, i] as const));
+      for (const v of buildEnumValues((ext as EnumTypeExtensionNode).values)) {
+        const idx = at.get(v.name);
+        if (idx == null) {
+          at.set(v.name, values.length);
+          values.push(v);
+        } else if (override) {
+          values[idx] = v;
+        } else {
+          warnings.push(`Duplicate value "${name}.${v.name}" in extension${where}`);
+        }
+      }
+      target.values = values;
+      continue;
+    }
+
+    if (expectedKind === "Union") {
+      const existing = new Set(target.members ?? []);
+      const added = ((ext as UnionTypeExtensionNode).types ?? [])
+        .map((t) => t.name.value)
+        .filter((m) => !existing.has(m) && (existing.add(m), true));
+      if (added.length > 0) target.members = [...(target.members ?? []), ...added];
+      continue;
+    }
+
+    // Scalar extensions only ever carry directives — nothing to merge
+    // into the graph, but the target existing means it's still valid.
+    if (expectedKind === "Scalar") continue;
+
+    const fieldExt = ext as
+      | ObjectTypeExtensionNode
+      | InterfaceTypeExtensionNode
+      | InputObjectTypeExtensionNode;
+    const fields = [...(target.fields ?? [])];
+    const at = new Map(fields.map((f, i) => [f.name, i] as const));
+    for (const f of buildFields(fieldExt.fields)) {
+      const idx = at.get(f.name);
+      if (idx == null) {
+        at.set(f.name, fields.length);
+        fields.push(f);
+      } else if (override) {
+        // In place, so an overridden field keeps its row position —
+        // the card doesn't reshuffle just because a type changed. A
+        // block that states the same field twice lands here too, so the
+        // last one written is the one that stands.
+        fields[idx] = f;
+      } else {
+        warnings.push(`Duplicate field "${name}.${f.name}" in extension${where}`);
+      }
+    }
+    target.fields = fields;
+
+    const newInterfaces = (
+      "interfaces" in fieldExt ? (fieldExt.interfaces ?? []) : []
+    ).map((i) => i.name.value);
+    if (newInterfaces.length > 0) {
+      const existingIfaces = new Set(target.interfaces ?? []);
+      const addedIfaces = newInterfaces.filter((i) => !existingIfaces.has(i));
+      if (addedIfaces.length > 0) {
+        target.interfaces = [...(target.interfaces ?? []), ...addedIfaces];
+      }
+    }
+  }
+  return warnings;
+}
+
+/**
+ * Deletes the requested members from `nodes`, mutating it in place.
+ * Counterpart to {@link applyExtensions}: together they let the overlay
+ * both grow and shrink the loaded schema.
+ *
+ * A member name is looked up in whichever list the target kind renders —
+ * enum values, union members, otherwise fields — falling back to the
+ * implemented-interface list, so `-Node` inside an object block drops the
+ * `implements Node` rather than reporting a missing field.
+ *
+ * As with extensions, anything that can't be resolved is warned about and
+ * skipped: a half-written overlay still renders the parts that do apply.
+ */
+function applyRemovals(
+  nodes: GraphNodeData[],
+  removals: readonly SchemaRemoval[],
+): string[] {
+  const warnings: string[] = [];
+
+  for (const r of removals) {
+    const idx = nodes.findIndex((n) => n.name === r.type);
+    if (idx < 0) {
+      warnings.push(
+        r.member
+          ? `Cannot remove "${r.type}.${r.member}" — no type "${r.type}"`
+          : `Cannot remove unknown type "${r.type}"`,
+      );
+      continue;
+    }
+    const target = nodes[idx]!;
+
+    if (!r.member) {
+      nodes.splice(idx, 1);
+      continue;
+    }
+
+    const dropped = (() => {
+      if (target.kind === "Enum") {
+        const before = target.values?.length ?? 0;
+        target.values = (target.values ?? []).filter((v) => v.name !== r.member);
+        return target.values.length < before;
+      }
+      if (target.kind === "Union") {
+        const before = target.members?.length ?? 0;
+        target.members = (target.members ?? []).filter((m) => m !== r.member);
+        return target.members.length < before;
+      }
+      const before = target.fields?.length ?? 0;
+      target.fields = (target.fields ?? []).filter((f) => f.name !== r.member);
+      if (target.fields.length < before) return true;
+      const ifacesBefore = target.interfaces?.length ?? 0;
+      if (ifacesBefore > 0) {
+        target.interfaces = target.interfaces!.filter((i) => i !== r.member);
+        return target.interfaces.length < ifacesBefore;
+      }
+      return false;
+    })();
+
+    if (!dropped) {
+      const what =
+        target.kind === "Enum" ? "value" : target.kind === "Union" ? "member" : "field";
+      warnings.push(`Cannot remove "${r.type}.${r.member}" — no such ${what}`);
+    }
+  }
+
+  return warnings;
+}
+
 function renderType(t: TypeNode): { rendered: string; base: string } {
   if (t.kind === Kind.NON_NULL_TYPE) {
     const inner = renderType(t.type);
@@ -169,7 +472,7 @@ function renderType(t: TypeNode): { rendered: string; base: string } {
 }
 
 export function sdlToGraph(sdl: string, options: SdlToGraphOptions = {}): ParsedGraph {
-  const { hideRelayBoilerplate = true } = options;
+  const { hideRelayBoilerplate = true, remove, overrideDuplicates = false } = options;
   const nodes: GraphNodeData[] = [];
 
   if (!sdl.trim()) return { nodes: [], edges: [], error: null, warnings: [], rootTypes: EMPTY_ROOT_TYPES };
@@ -232,27 +535,7 @@ export function sdlToGraph(sdl: string, options: SdlToGraphOptions = {}): Parsed
               ? "Interface"
               : "Input";
 
-        const fields: GraphField[] = [];
-        for (const f of def.fields ?? []) {
-          const t = renderType(f.type);
-          const dep = parseDeprecated(f.directives);
-          fields.push({
-            name: f.name.value,
-            type: t.rendered,
-            typeName: t.base,
-            nullable: f.type.kind !== Kind.NON_NULL_TYPE,
-            description: f.description?.value,
-            args:
-              "arguments" in f && f.arguments
-                ? f.arguments.map((a) => ({
-                    name: a.name.value,
-                    type: renderType(a.type).rendered,
-                    typeName: renderType(a.type).base,
-                  }))
-                : undefined,
-            ...(dep.isDeprecated && { isDeprecated: true, deprecationReason: dep.deprecationReason, until: dep.until }),
-          });
-        }
+        const fields = buildFields(def.fields);
 
         const interfaces =
           "interfaces" in def && def.interfaces
@@ -275,15 +558,7 @@ export function sdlToGraph(sdl: string, options: SdlToGraphOptions = {}): Parsed
           name: def.name.value,
           kind: "Enum",
           description: def.description?.value,
-          values:
-            def.values?.map((v) => {
-              const dep = parseDeprecated(v.directives);
-              return {
-                name: v.name.value,
-                description: v.description?.value,
-                ...(dep.isDeprecated && { isDeprecated: true, deprecationReason: dep.deprecationReason, until: dep.until }),
-              };
-            }) ?? [],
+          values: buildEnumValues(def.values),
         });
         break;
       case Kind.UNION_TYPE_DEFINITION: {
@@ -309,6 +584,16 @@ export function sdlToGraph(sdl: string, options: SdlToGraphOptions = {}): Parsed
         break;
     }
   }
+
+  // Fold `extend …` blocks into their targets before anything reads the
+  // node list — Relay unwrapping, edge building and reachability all
+  // then see the extended shape.
+  const extensionWarnings = applyExtensions(doc.definitions, nodes, overrideDuplicates);
+
+  // Subtraction comes after addition, so `-foo` can take away a field an
+  // `extend` block in the same overlay just added.
+  const removalWarnings =
+    remove && remove.length > 0 ? applyRemovals(nodes, remove) : [];
 
   // Resolve Relay Connection/Edge types to their underlying node type.
   // Two passes — Edges first, then Connections (which resolve through
@@ -507,5 +792,11 @@ export function sdlToGraph(sdl: string, options: SdlToGraphOptions = {}): Parsed
 
   const rootTypes = resolveRootTypes(doc.definitions, new Set(keptNodes.map((n) => n.name)));
 
-  return { nodes: keptNodes, edges, error: null, warnings: duplicateWarnings, rootTypes };
+  return {
+    nodes: keptNodes,
+    edges,
+    error: null,
+    warnings: [...duplicateWarnings, ...extensionWarnings, ...removalWarnings],
+    rootTypes,
+  };
 }

@@ -1,7 +1,11 @@
 import { useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  ChevronDown,
+  ChevronUp,
   Clock,
+  Highlighter,
+  Layers,
   PanelLeftClose,
   PanelLeftOpen,
   Unlink,
@@ -9,14 +13,41 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { SchemaCanvas } from "@/components/graph/SchemaCanvas";
+import { SdlEditor } from "@/components/SdlEditor";
 import { TreePanel } from "@/components/tree/TreePanel";
 import { KIND_STYLES } from "@/components/graph/node-style";
 import { Badge } from "@/components/ui/badge";
+import type { OverlayDiff } from "@/lib/overlay";
 import { useSchema, type UntilField } from "@/lib/schema-context";
 import type { GraphNodeData } from "@/lib/sdl-to-graph";
 import { cn } from "@/lib/utils";
 
 type Mode = "reachable" | "orphaned" | "until";
+
+const OVERLAY_PLACEHOLDER = `# Sketch on top of the loaded schema — nothing here modifies it.
+# A type the schema already declares is augmented, so you can paste
+# one in and just add to it. Restating a field overrides it, and a
+# "-name" line takes it away.
+
+type Query {
+  report(id: ID!): Report
+}
+
+type Report {
+  id: ID!
+  title: String!
+}
+
+type User {
+  name: String!      # override: was nullable
+  -legacyName        # drop a field
+  displayName: String
+}`;
+
+const OVERLAY_MIN_H = 160;
+const OVERLAY_MAX_H = 720;
+const OVERLAY_DEFAULT_H = 280;
+const OVERLAY_HEIGHT_KEY = "gompassql:overlayHeight";
 
 const SIDEBAR_MIN_W = 260;
 const SIDEBAR_MAX_W = 720;
@@ -43,6 +74,34 @@ function useSidebarWidth() {
     }
   }, [width]);
   return [width, setWidth] as const;
+}
+
+/** Overlay dock height, clamped so the canvas always keeps a usable
+ *  slice of the viewport even on a short window. */
+const clampHeight = (h: number) => {
+  const ceiling =
+    typeof window === "undefined"
+      ? OVERLAY_MAX_H
+      : Math.max(OVERLAY_MIN_H, Math.min(OVERLAY_MAX_H, window.innerHeight * 0.7));
+  return Math.min(ceiling, Math.max(OVERLAY_MIN_H, h));
+};
+
+/** Persisted overlay dock height. */
+function useOverlayHeight() {
+  const [height, setHeight] = useState<number>(() => {
+    if (typeof window === "undefined") return OVERLAY_DEFAULT_H;
+    const raw = window.localStorage.getItem(OVERLAY_HEIGHT_KEY);
+    const n = raw ? Number.parseInt(raw, 10) : NaN;
+    return Number.isFinite(n) ? clampHeight(n) : OVERLAY_DEFAULT_H;
+  });
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(OVERLAY_HEIGHT_KEY, String(height));
+    } catch {
+      // ignore
+    }
+  }, [height]);
+  return [height, setHeight] as const;
 }
 
 /** Persisted collapsed flag. */
@@ -94,11 +153,28 @@ export function ViewRoute() {
     popTo,
     pinnedField,
     setPinnedField,
+    overlaySdl,
+    applyOverlay,
+    clearOverlay,
+    overlayError,
+    overlayDiff,
+    overlayWarnings,
   } = useSchema();
   const navigate = useNavigate();
   const [mode, setMode] = useState<Mode>("reachable");
   const [orphanFocus, setOrphanFocus] = useState<string | null>(null);
   const [untilFocus, setUntilFocus] = useState<string | null>(null);
+  // Highlight mode lives here, not in the dock: the canvas needs it too,
+  // and it has to survive collapsing the dock.
+  const [highlightOverlay, setHighlightOverlay] = useState(false);
+
+  // Only additions and overrides produce overlay-marked nodes, so an
+  // overlay that merely removes things has nothing to highlight.
+  const hasOverlayTypes =
+    overlayDiff.addedTypes.length +
+      overlayDiff.addedFields.length +
+      overlayDiff.changedFields.length >
+    0;
 
   // The "Deprecated" tab exists whenever the schema has any deprecated
   // field — expired, upcoming, or undated.
@@ -135,6 +211,24 @@ export function ViewRoute() {
   useEffect(() => {
     if (mode === "until" && !hasDeprecated) setMode("reachable");
   }, [mode, hasDeprecated]);
+
+  // Focusing an overlay type and then clearing (or breaking) the overlay
+  // leaves a focus id pointing at a node that no longer exists — the
+  // canvas would dim every node against a target it can't find. Drop the
+  // focus as soon as its node goes away. (`focusStack` and `pinnedField`
+  // get the same treatment inside the schema context.)
+  useEffect(() => {
+    const gone = (id: string | null) => id != null && !graph.nodes.some((n) => n.id === id);
+    if (gone(orphanFocus)) setOrphanFocus(null);
+    if (gone(untilFocus)) setUntilFocus(null);
+  }, [orphanFocus, untilFocus, graph]);
+
+  // Clearing (or breaking) the overlay leaves highlight mode dimming the
+  // whole canvas against an empty set — drop it as soon as there's
+  // nothing left to highlight.
+  useEffect(() => {
+    if (!hasOverlayTypes && highlightOverlay) setHighlightOverlay(false);
+  }, [hasOverlayTypes, highlightOverlay]);
 
   // Mobile is single-pane: the tree fills the screen and the canvas is
   // hidden behind it. When the user selects something in the tree
@@ -309,46 +403,67 @@ export function ViewRoute() {
         )}
       </aside>
 
+      {/* The canvas column stacks the graph over the overlay dock, so the
+          dock spans the graph only — the tree keeps its full height, the
+          way an editor's bottom panel leaves the file tree alone. */}
       <section
         className={cn(
-          "relative min-w-0 flex-1 overflow-hidden lg:min-h-[500px]",
+          "flex min-w-0 flex-1 flex-col overflow-hidden lg:min-h-[500px]",
           // On mobile the canvas hides behind the full-screen tree while
           // the sidebar is open; it returns when the sidebar collapses.
           !collapsed && !isLg && "hidden",
         )}
       >
-        {/* Desktop: floating expand affordance at the canvas top-left
-            (the canvas pushes its own controls down to clear it). On
-            mobile the expand button lives inside the merged view-controls
-            header instead (see SchemaCanvas onExpandSidebar), so it never
-            overlaps the top dock. */}
-        {collapsed && isLg && (
-          <button
-            type="button"
-            onClick={() => setCollapsed(false)}
-            title="Show sidebar"
-            aria-label="Show sidebar"
-            className="absolute left-4 top-4 z-30 flex items-center justify-center rounded-lg border border-border bg-popover/95 p-1.5 text-muted-foreground shadow-lg backdrop-blur transition-colors hover:bg-secondary hover:text-foreground"
-          >
-            <PanelLeftOpen className="h-4 w-4" />
-          </button>
-        )}
-        <SchemaCanvas
-          nodes={canvasNodes}
-          edges={canvasEdges}
-          focusId={canvasFocusId}
-          rootId={canvasRootId}
-          onNavigate={onCanvasNavigate}
-          onClearFocus={onCanvasClearFocus}
-          leftControlsInset={collapsed}
-          onExpandSidebar={() => setCollapsed(false)}
+        <div className="relative min-h-0 flex-1">
+          {/* Desktop: floating expand affordance at the canvas top-left
+              (the canvas pushes its own controls down to clear it). On
+              mobile the expand button lives inside the merged view-controls
+              header instead (see SchemaCanvas onExpandSidebar), so it never
+              overlaps the top dock. */}
+          {collapsed && isLg && (
+            <button
+              type="button"
+              onClick={() => setCollapsed(false)}
+              title="Show sidebar"
+              aria-label="Show sidebar"
+              className="absolute left-4 top-4 z-30 flex items-center justify-center rounded-lg border border-border bg-popover/95 p-1.5 text-muted-foreground shadow-lg backdrop-blur transition-colors hover:bg-secondary hover:text-foreground"
+            >
+              <PanelLeftOpen className="h-4 w-4" />
+            </button>
+          )}
+          <SchemaCanvas
+            nodes={canvasNodes}
+            edges={canvasEdges}
+            focusId={canvasFocusId}
+            rootId={canvasRootId}
+            onNavigate={onCanvasNavigate}
+            onClearFocus={onCanvasClearFocus}
+            leftControlsInset={collapsed}
+            onExpandSidebar={() => setCollapsed(false)}
+            highlightOverlay={highlightOverlay}
+          />
+        </div>
+
+        <OverlayDock
+          applied={overlaySdl}
+          onApply={applyOverlay}
+          onClear={clearOverlay}
+          error={overlayError}
+          diff={overlayDiff}
+          warnings={overlayWarnings}
+          highlight={highlightOverlay}
+          canHighlight={hasOverlayTypes}
+          onToggleHighlight={() => setHighlightOverlay((v) => !v)}
+          // Chips focus through whichever mode the canvas is in, so
+          // clicking one lands the same way a canvas click would.
+          onFocusType={onCanvasNavigate}
         />
       </section>
     </div>
   );
 }
 
-type Tone = "sky" | "amber" | "red";
+type Tone = "sky" | "amber" | "red" | "emerald";
 
 // Each tab carries one accent color, shared by its icon and — when
 // active — its underline, label text, and count badge, so the active
@@ -371,6 +486,12 @@ const TAB_TONE: Record<Tone, { icon: string; text: string; border: string; badge
     text: "text-red-600 dark:text-red-400",
     border: "border-red-500",
     badge: "bg-red-500/15 text-red-600 dark:text-red-400",
+  },
+  emerald: {
+    icon: "text-emerald-500",
+    text: "text-emerald-600 dark:text-emerald-400",
+    border: "border-emerald-500",
+    badge: "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400",
   },
 };
 
@@ -564,6 +685,380 @@ function OrphanPanel({
           </div>
         );
       })}
+    </div>
+  );
+}
+
+/**
+ * A thin drag strip along the overlay dock's top edge. Mirror of
+ * {@link ResizeHandle}, one axis over. Double-click resets the height.
+ */
+function VerticalResizeHandle({
+  onResize,
+  onReset,
+}: {
+  onResize: (clientY: number) => void;
+  onReset: () => void;
+}) {
+  const [dragging, setDragging] = useState(false);
+
+  useEffect(() => {
+    if (!dragging) return;
+    const move = (e: PointerEvent) => onResize(e.clientY);
+    const up = () => setDragging(false);
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+    const prevSelect = document.body.style.userSelect;
+    const prevCursor = document.body.style.cursor;
+    document.body.style.userSelect = "none";
+    document.body.style.cursor = "row-resize";
+    return () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      document.body.style.userSelect = prevSelect;
+      document.body.style.cursor = prevCursor;
+    };
+  }, [dragging, onResize]);
+
+  return (
+    <div
+      role="separator"
+      aria-orientation="horizontal"
+      onPointerDown={(e) => {
+        e.preventDefault();
+        setDragging(true);
+      }}
+      onDoubleClick={onReset}
+      className={cn(
+        "absolute left-0 top-0 z-10 h-1.5 w-full -translate-y-1/2 cursor-row-resize transition-colors",
+        dragging ? "bg-primary/40" : "hover:bg-primary/25",
+      )}
+    />
+  );
+}
+
+/** `+3 ~1 −1` pills summarizing an applied overlay. */
+function OverlayCounts({
+  added,
+  changed,
+  removed,
+}: {
+  added: number;
+  changed: number;
+  removed: number;
+}) {
+  if (added === 0 && changed === 0 && removed === 0) {
+    return <span className="text-[10px] text-muted-foreground">no change</span>;
+  }
+  return (
+    <span className="flex items-center gap-1">
+      {added > 0 && (
+        <span className="rounded-full bg-emerald-500/15 px-1.5 py-px text-[10px] leading-none text-emerald-600 dark:text-emerald-400">
+          +{added}
+        </span>
+      )}
+      {changed > 0 && (
+        <span className="rounded-full bg-sky-500/15 px-1.5 py-px text-[10px] leading-none text-sky-600 dark:text-sky-400">
+          ~{changed}
+        </span>
+      )}
+      {removed > 0 && (
+        <span className="rounded-full bg-red-500/15 px-1.5 py-px text-[10px] leading-none text-red-600 dark:text-red-400">
+          −{removed}
+        </span>
+      )}
+    </span>
+  );
+}
+
+/**
+ * The overlay dock: a GraphQL editor pinned under the canvas whose
+ * contents are laid over the loaded schema on Apply. The schema itself is
+ * never modified — Clear puts the graph back exactly as it was.
+ *
+ * Collapsed, it's a one-line strip reporting whatever is applied; open, it
+ * splits the canvas column and can be dragged taller. It never unmounts,
+ * so the draft survives collapsing — and keeping the buffer here rather
+ * than in the schema context means a keystroke doesn't re-render the
+ * canvas and the tree.
+ *
+ * Three things the editor understands (see `lib/overlay.ts`): a bare type
+ * the schema already declares is augmented rather than redeclared, a
+ * `-name` line removes that field, and everything the overlay adds is
+ * painted emerald on the canvas.
+ */
+function OverlayDock({
+  applied,
+  onApply,
+  onClear,
+  error,
+  diff,
+  warnings,
+  highlight,
+  canHighlight,
+  onToggleHighlight,
+  onFocusType,
+}: {
+  applied: string;
+  onApply: (sdl: string) => void;
+  onClear: () => void;
+  error: string | null;
+  diff: OverlayDiff;
+  warnings: string[];
+  highlight: boolean;
+  canHighlight: boolean;
+  onToggleHighlight: () => void;
+  onFocusType: (typeName: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  // The editor always starts from whatever is applied, so remounting the
+  // route never leaves an applied overlay with an empty buffer to edit it
+  // from. Clearing keeps the text — that's the point of Re-apply.
+  const [draft, setDraft] = useState(applied);
+  const [height, setHeight] = useOverlayHeight();
+  const dockRef = useRef<HTMLDivElement>(null);
+
+  // Same guarantee for an apply this dock didn't originate. Keyed on the
+  // applied value changing, never on the draft, so emptying the editor by
+  // hand doesn't get undone under the user's cursor.
+  const syncedRef = useRef(applied);
+  useEffect(() => {
+    if (applied === syncedRef.current) return;
+    syncedRef.current = applied;
+    if (applied.trim() && !draft.trim()) setDraft(applied);
+  }, [applied, draft]);
+
+  const isApplied = applied.trim().length > 0;
+  const dirty = draft.trim() !== applied.trim();
+  const added = diff.addedTypes.length + diff.addedFields.length;
+  const changed = diff.changedFields.length;
+  const removed = diff.removedTypes.length + diff.removedFields.length;
+
+  // Pointer Y → height, measured up from the dock's bottom edge — which
+  // stays put, since the dock is flush with the bottom of the column.
+  const resizeTo = useCallback(
+    (clientY: number) => {
+      const bottom = dockRef.current?.getBoundingClientRect().bottom ?? 0;
+      setHeight(clampHeight(bottom - clientY));
+    },
+    [setHeight],
+  );
+
+  if (!open) {
+    return (
+      <button
+        type="button"
+        onClick={() => setOpen(true)}
+        title="Open the overlay editor"
+        className="flex shrink-0 items-center gap-2 border-t border-border bg-card/40 px-3 py-1.5 text-left transition-colors hover:bg-secondary/50"
+      >
+        <Layers className="h-3.5 w-3.5 shrink-0 text-emerald-500" />
+        <span className="shrink-0 text-xs font-medium">Overlay</span>
+        {error ? (
+          <span className="truncate text-[10px] text-red-600 dark:text-red-400">
+            not applied — {error}
+          </span>
+        ) : isApplied ? (
+          <OverlayCounts added={added} changed={changed} removed={removed} />
+        ) : (
+          <span className="truncate text-[10px] text-muted-foreground">
+            Sketch SDL on top of this schema
+          </span>
+        )}
+        <ChevronUp className="ml-auto h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+      </button>
+    );
+  }
+
+  const changeLabel =
+    [
+      added > 0 ? `${added} addition${added !== 1 ? "s" : ""}` : null,
+      changed > 0 ? `${changed} override${changed !== 1 ? "s" : ""}` : null,
+      removed > 0 ? `${removed} removal${removed !== 1 ? "s" : ""}` : null,
+    ]
+      .filter(Boolean)
+      .join(", ") || "no change";
+
+  return (
+    <div
+      ref={dockRef}
+      style={{ height }}
+      className="relative flex shrink-0 flex-col border-t border-border bg-card/40"
+      // Cmd/Ctrl+Enter applies from anywhere in the dock, including
+      // inside CodeMirror — the editor doesn't bind that chord itself.
+      onKeyDown={(e) => {
+        if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+          e.preventDefault();
+          onApply(draft);
+        }
+      }}
+    >
+      <VerticalResizeHandle onResize={resizeTo} onReset={() => setHeight(OVERLAY_DEFAULT_H)} />
+
+      <div className="flex shrink-0 items-center gap-2 border-b border-border px-3 py-1.5">
+        <Layers className="h-3.5 w-3.5 shrink-0 text-emerald-500" />
+        <span className="shrink-0 text-xs font-medium">Overlay</span>
+        {isApplied && !error && <OverlayCounts added={added} changed={changed} removed={removed} />}
+
+        <div className="ml-auto flex shrink-0 items-center gap-1.5">
+          {/* Isolate what the overlay contributed: everything it didn't
+              touch fades out on the canvas. The aura stays on either
+              way, so this is emphasis, not the only cue. */}
+          <button
+            type="button"
+            onClick={onToggleHighlight}
+            disabled={!canHighlight}
+            title={
+              canHighlight
+                ? "Dim everything the overlay didn't touch"
+                : "Nothing overlaid to highlight yet"
+            }
+            aria-pressed={highlight}
+            className={cn(
+              "flex items-center gap-1 rounded-md border px-2 py-1 text-xs font-medium transition-colors",
+              !canHighlight
+                ? "cursor-default border-border opacity-40"
+                : highlight
+                  ? "border-emerald-500 bg-emerald-500/15 text-emerald-600 dark:text-emerald-400"
+                  : "border-border text-muted-foreground hover:bg-secondary hover:text-foreground",
+            )}
+          >
+            <Highlighter className="h-3.5 w-3.5" />
+            <span className="hidden sm:inline">Highlight</span>
+          </button>
+          <span className="hidden text-[10px] text-muted-foreground sm:inline">
+            {dirty && isApplied ? "Unapplied edits · " : ""}⌘↵
+          </span>
+          <button
+            type="button"
+            onClick={() => onApply(draft)}
+            disabled={!dirty && isApplied}
+            className={cn(
+              "rounded-md px-2.5 py-1 text-xs font-medium transition-colors",
+              !dirty && isApplied
+                ? "cursor-default bg-secondary text-muted-foreground"
+                : "bg-emerald-500 text-white hover:bg-emerald-600",
+            )}
+          >
+            {isApplied && dirty ? "Re-apply" : "Apply"}
+          </button>
+          <button
+            type="button"
+            onClick={onClear}
+            disabled={!isApplied}
+            className={cn(
+              "rounded-md border border-border px-2.5 py-1 text-xs font-medium transition-colors",
+              isApplied
+                ? "text-muted-foreground hover:bg-secondary hover:text-foreground"
+                : "cursor-default opacity-40",
+            )}
+          >
+            Clear
+          </button>
+          <button
+            type="button"
+            onClick={() => setOpen(false)}
+            title="Collapse the overlay editor"
+            aria-label="Collapse the overlay editor"
+            className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+          >
+            <ChevronDown className="h-4 w-4" />
+          </button>
+        </div>
+      </div>
+
+      <div className="relative min-h-0 flex-1">
+        <SdlEditor value={draft} onChange={setDraft} placeholder={OVERLAY_PLACEHOLDER} />
+      </div>
+
+      {/* Status strips. A parse failure wins over the applied summary,
+          since a failing overlay contributes nothing; warnings stack
+          underneath either, because they are about individual lines
+          rather than the document as a whole. */}
+      {(error || isApplied || warnings.length > 0) && (
+        <div className="max-h-[45%] shrink-0 overflow-auto border-t border-border">
+          {error ? (
+            <div className="bg-red-500/10 px-3 py-2">
+              <div className="text-[10px] font-semibold uppercase tracking-wider text-red-600 dark:text-red-400">
+                Overlay not applied
+              </div>
+              <div className="mt-0.5 break-words font-mono text-[10px] leading-snug text-red-600/90 dark:text-red-400/90">
+                {error}
+              </div>
+              <div className="mt-1 text-[10px] text-muted-foreground">
+                The graph is still showing the schema without the overlay.
+              </div>
+            </div>
+          ) : isApplied ? (
+            <div className="bg-emerald-500/10 px-3 py-2">
+              <div className="text-[10px] font-semibold uppercase tracking-wider text-emerald-600 dark:text-emerald-400">
+                Overlay applied
+                <span className="ml-1 opacity-70">({changeLabel})</span>
+              </div>
+              {added + changed + removed === 0 && (
+                <div className="mt-0.5 text-[10px] text-muted-foreground">
+                  Nothing changed — every type and field already matches the schema.
+                </div>
+              )}
+              {diff.addedTypes.length > 0 && (
+                <div className="mt-1 flex flex-wrap gap-1">
+                  {diff.addedTypes.map((t) => (
+                    <button
+                      key={t}
+                      type="button"
+                      onClick={() => onFocusType(t)}
+                      title={`Focus ${t}`}
+                      className="rounded bg-emerald-500/20 px-1.5 py-px font-mono text-[10px] text-emerald-700 transition-colors hover:bg-emerald-500/35 dark:text-emerald-300"
+                    >
+                      {t}
+                    </button>
+                  ))}
+                </div>
+              )}
+              {diff.addedFields.length > 0 && (
+                <div className="mt-1 flex flex-wrap gap-x-2 gap-y-0.5 font-mono text-[10px] text-muted-foreground">
+                  {diff.addedFields.map((f) => (
+                    <span key={f}>+{f}</span>
+                  ))}
+                </div>
+              )}
+              {/* Overrides: the row existed, the overlay redefined it. */}
+              {diff.changedFields.length > 0 && (
+                <div className="mt-1 flex flex-wrap gap-x-2 gap-y-0.5 font-mono text-[10px] text-sky-600/90 dark:text-sky-400/90">
+                  {diff.changedFields.map((f) => (
+                    <span key={f}>~{f}</span>
+                  ))}
+                </div>
+              )}
+              {/* Removals get no focus affordance — the node they name is
+                  gone from the graph, so there is nothing to focus. */}
+              {(diff.removedTypes.length > 0 || diff.removedFields.length > 0) && (
+                <div className="mt-1 flex flex-wrap gap-x-2 gap-y-0.5 font-mono text-[10px] text-red-600/80 dark:text-red-400/80">
+                  {diff.removedTypes.map((t) => (
+                    <span key={t}>−{t}</span>
+                  ))}
+                  {diff.removedFields.map((f) => (
+                    <span key={f}>−{f}</span>
+                  ))}
+                </div>
+              )}
+            </div>
+          ) : null}
+
+          {warnings.length > 0 && (
+            <div className="bg-amber-500/10 px-3 py-2">
+              <div className="text-[10px] font-semibold uppercase tracking-wider text-amber-600 dark:text-amber-500">
+                {warnings.length} warning{warnings.length !== 1 ? "s" : ""}
+              </div>
+              <ul className="mt-0.5 space-y-0.5 font-mono text-[10px] leading-snug text-amber-700/90 dark:text-amber-400/90">
+                {warnings.map((w) => (
+                  <li key={w}>{w}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
