@@ -48,6 +48,19 @@ impl TreePanel {
         self.focus.clone()
     }
 
+    /// Swap in a different slice of the schema (mode change).
+    pub fn set_model(&mut self, model: Rc<Model>, cx: &mut Context<Self>) {
+        let mut all_sorted: Vec<u32> = (0..model.cards.len() as u32).collect();
+        all_sorted.sort_by(|&a, &b| {
+            model.cards[a as usize].name.cmp(&model.cards[b as usize].name)
+        });
+        self.model = model;
+        self.all_sorted = all_sorted;
+        self.query.clear();
+        self.refresh();
+        cx.notify();
+    }
+
     fn item_count(&self) -> usize {
         if self.query.is_empty() {
             self.all_sorted.len()

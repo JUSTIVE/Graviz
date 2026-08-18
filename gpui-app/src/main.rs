@@ -5,7 +5,6 @@ mod workspace;
 
 use workspace::Workspace;
 use gpui::{prelude::*, px, size, App, Bounds, WindowBounds, WindowOptions};
-use std::rc::Rc;
 
 fn main() {
     let path = std::env::args().nth(1).unwrap_or_else(|| {
@@ -42,15 +41,10 @@ fn main() {
     }
     let parse_ms = t0.elapsed().as_millis();
 
-    let t1 = std::time::Instant::now();
-    let model = Rc::new(model::build_model(graph, schema_name));
     eprintln!(
-        "parsed in {parse_ms}ms, layout+model in {}ms — {} types, {} edges, world {:.0}×{:.0}",
-        t1.elapsed().as_millis(),
-        model.cards.len(),
-        model.edges.len(),
-        model.world_w,
-        model.world_h,
+        "parsed in {parse_ms}ms — {} types, {} edges",
+        graph.nodes.len(),
+        graph.edges.len(),
     );
 
     gpui_platform::application().run(move |cx: &mut App| {
@@ -61,7 +55,7 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_, cx| cx.new(|cx| Workspace::new(model, cx)),
+            |_, cx| cx.new(|cx| Workspace::new(graph, schema_name, cx)),
         )
         .unwrap();
         cx.activate(true);

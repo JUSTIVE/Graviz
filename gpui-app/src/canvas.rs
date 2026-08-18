@@ -74,6 +74,18 @@ impl GraphCanvas {
         }
     }
 
+    /// Swap in a different slice of the schema (mode change).
+    pub fn set_model(&mut self, model: Rc<Model>, cx: &mut Context<Self>) {
+        self.model = model;
+        self.fitted = false;
+        self.hover = None;
+        self.drag = None;
+        self.focus = None;
+        self.pending_center = None;
+        self.pinned = None;
+        cx.notify();
+    }
+
     /// Called from the workspace when the tree selects a type.
     pub fn navigate_to(&mut self, card: u32, row: Option<usize>, cx: &mut Context<Self>) {
         self.pending_center = Some(card);

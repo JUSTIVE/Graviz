@@ -4,9 +4,11 @@
 //! trailingSectionGeom, hitTestField) and drifted. Here `Card::row_y` /
 //! `Card::row_at` are the single source of truth.
 
-use gompass_core::graph::{NodeKind, ParsedGraph};
+use gompass_core::graph::{
+    all_reachable_ids, default_root_ops, reachable_from, EdgeKind, NodeKind, ParsedGraph,
+};
 use gompass_core::layout::{self, LayoutConfig, LayoutEdge, LayoutNode};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub const HEADER_H: f32 = 42.0;
 pub const ROW_H: f32 = 16.0;
@@ -109,6 +111,127 @@ pub struct Model {
     pub world_h: f32,
     pub index_of: HashMap<String, u32>,
     pub schema_name: String,
+}
+
+/// The three canvas modes of the web app's `/view` tabs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Types reachable from the effective root (default view).
+    Reachable,
+    /// Types no root operation can reach.
+    Orphaned,
+    /// Types owning deprecated members, plus the targets of those members.
+    Deprecated,
+}
+
+impl Mode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Mode::Reachable => "Reachable",
+            Mode::Orphaned => "Orphaned",
+            Mode::Deprecated => "Deprecated",
+        }
+    }
+}
+
+fn root_ops_of(graph: &ParsedGraph) -> HashSet<String> {
+    let rt = &graph.root_types;
+    let set: HashSet<String> = [rt.query.clone(), rt.mutation.clone(), rt.subscription.clone()]
+        .into_iter()
+        .flatten()
+        .collect();
+    if set.is_empty() {
+        default_root_ops()
+    } else {
+        set
+    }
+}
+
+/// Cut the full graph down to the slice a mode shows.
+pub fn slice_graph(full: &ParsedGraph, mode: Mode) -> ParsedGraph {
+    let root_ops = root_ops_of(full);
+    let (nodes, edges): (Vec<_>, Vec<_>) = match mode {
+        Mode::Reachable => {
+            let root = full
+                .root_types
+                .query
+                .clone()
+                .or_else(|| full.root_types.mutation.clone())
+                .or_else(|| full.root_types.subscription.clone());
+            let Some(root) = root else {
+                return full.clone();
+            };
+            let sub = reachable_from(&full.nodes, &full.edges, &root, &root_ops);
+            (
+                sub.nodes.into_iter().cloned().collect(),
+                sub.edges.into_iter().cloned().collect(),
+            )
+        }
+        Mode::Orphaned => {
+            let reach = all_reachable_ids(&full.nodes, &full.edges, &root_ops);
+            let nodes: Vec<_> = full
+                .nodes
+                .iter()
+                .filter(|n| !reach.contains(&n.id))
+                .cloned()
+                .collect();
+            let keep: HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+            let edges = full
+                .edges
+                .iter()
+                .filter(|e| keep.contains(e.source.as_str()) && keep.contains(e.target.as_str()))
+                .cloned()
+                .collect();
+            (nodes, edges)
+        }
+        Mode::Deprecated => {
+            let mut keep: HashSet<String> = HashSet::new();
+            for n in &full.nodes {
+                let fields = n.fields.as_deref().unwrap_or(&[]);
+                let has_deprecated = fields.iter().any(|f| f.is_deprecated)
+                    || n.values.as_deref().unwrap_or(&[]).iter().any(|v| v.is_deprecated);
+                if has_deprecated {
+                    keep.insert(n.id.clone());
+                    for f in fields.iter().filter(|f| f.is_deprecated) {
+                        keep.insert(f.type_name.clone());
+                    }
+                }
+            }
+            let nodes: Vec<_> = full
+                .nodes
+                .iter()
+                .filter(|n| keep.contains(&n.id))
+                .cloned()
+                .collect();
+            let by_id: HashMap<&str, &gompass_core::graph::GraphNodeData> =
+                full.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+            let edges = full
+                .edges
+                .iter()
+                .filter(|e| {
+                    if !keep.contains(&e.source) || !keep.contains(&e.target) {
+                        return false;
+                    }
+                    if e.kind != EdgeKind::Field {
+                        return true;
+                    }
+                    // keep only edges leaving a deprecated field
+                    e.source_field_index
+                        .and_then(|i| by_id.get(e.source.as_str())?.fields.as_deref()?.get(i))
+                        .is_some_and(|f| f.is_deprecated)
+                })
+                .cloned()
+                .collect();
+            (nodes, edges)
+        }
+    };
+    ParsedGraph {
+        nodes,
+        edges,
+        error: None,
+        warnings: Vec::new(),
+        root_types: full.root_types.clone(),
+    }
 }
 
 fn mono_w(text: &str, font_px: f32) -> f32 {

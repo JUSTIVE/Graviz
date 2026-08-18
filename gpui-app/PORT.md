@@ -32,12 +32,14 @@ gpui-app/
 ## 상태
 
 - [x] GPUI 빌드 환경 (Rust stable 업데이트, Metal Toolchain 설치)
-- [x] core/layout.rs — 계층형 레이아웃 + 컴포넌트 셸프 패킹 + 싱글턴 그리드 (테스트 포함)
-- [~] core/graph.rs — sdl-to-graph 충실 포팅 (진행 중)
-- [~] canvas/model/main — 1차 렌더링 (카드, 엣지, 팬/줌/호버/클릭 내비게이션, 상태바)
-- [ ] 트리 패널 (검색 fuzzyScore, kind 필터, referencedBy, 가상 리스트 → uniform_list)
-- [ ] Cmd+K 검색, 포커스 스택/브레드크럼
-- [ ] 모드 탭 (reachable / orphaned / deprecated-until)
+- [x] core/layout.rs — 계층형 레이아웃 + 과높이 랭크 컬럼 분할 + 셸프 패킹 (테스트 포함)
+- [x] core/graph/ — sdl-to-graph 충실 포팅 (68 테스트, GitHub 스키마 파싱 ~80ms)
+- [x] core/search.rs — fuzzyScore/proseMatch/snippet/dotted-query (6 테스트)
+- [x] canvas/model — 1차 렌더링 (카드, 엣지, 팬/줌/호버/클릭 내비게이션, LOD, 컬링, 상태바)
+- [x] 트리 패널 — uniform_list + 키 캡처 검색, ↑/↓/Enter, 클릭 → 캔버스 포커스
+- [x] Cmd+K 검색 포커스, Cmd+B 사이드바 토글
+- [x] 모드 탭 (Reachable / Orphaned / Deprecated) — 모드 전환 = 슬라이스 후 전체 재레이아웃(~10ms)
+- [ ] kind 필터 칩, referencedBy 패널, 포커스 스택/브레드크럼
 - [ ] SDL 오버레이 (overlay.ts 포팅 + 하단 도크 + diff 하이라이트)
 - [ ] 랜딩(파일 열기/드롭/히스토리), 테마, 설정 영속화
 - [ ] 필드 툴팁/설명 표시, Investigate 모드, 엣지 번들 토글
