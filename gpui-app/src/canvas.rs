@@ -5,12 +5,13 @@
 //! web app to survive WebGL texture-upload limits; GPUI draws quads, paths and
 //! glyphs directly, so culling + text LOD is all that's needed.
 
+use crate::theme::Theme;
 use crate::model::{
     EdgeGroup, Model, RowKind, CARD_PAD_X, HEADER_H, NAME_FONT_PX, ROW_FONT_PX, ROW_H,
 };
 use gompass_core::graph::NodeKind;
 use gpui::{
-    canvas, div, fill, point, prelude::*, px, quad, rgb, rgba, size, App, BorderStyle, Bounds,
+    canvas, div, fill, point, prelude::*, px, quad, size, App, BorderStyle, Bounds,
     Context, Corners, Edges, Font, FontWeight, Hsla, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, PathBuilder, Pixels, Point, ScrollDelta, ScrollWheelEvent, SharedString,
     TextAlign, TextRun, Window,
@@ -20,7 +21,6 @@ use std::rc::Rc;
 
 const ZOOM_MIN: f32 = 0.01;
 const ZOOM_MAX: f32 = 4.0;
-const ZOOM_STEP: f32 = 1.12;
 const CLICK_DRAG_THRESHOLD: f32 = 4.0;
 /// Below this zoom, rows are not drawn (and not clickable).
 const LOD_ROWS: f32 = 0.35;
@@ -347,44 +347,12 @@ impl GraphCanvas {
     }
 }
 
-pub struct Palette {
-    pub bg: Hsla,
-    pub card_bg: Hsla,
-    pub card_border: Hsla,
-    pub text: Hsla,
-    pub text_muted: Hsla,
-    pub type_amber: Hsla,
-}
-
-pub fn palette() -> Palette {
-    Palette {
-        bg: rgb(0x101216).into(),
-        card_bg: rgb(0x1a1e26).into(),
-        card_border: rgb(0x2c3340).into(),
-        text: rgb(0xe6e9ef).into(),
-        text_muted: rgb(0x8b93a3).into(),
-        type_amber: rgb(0xd9a441).into(),
-    }
-}
-
-pub fn kind_color(kind: NodeKind) -> Hsla {
-    match kind {
-        NodeKind::Object => rgb(0x4c8dff).into(),
-        NodeKind::Interface => rgb(0x9d7bff).into(),
-        NodeKind::Union => rgb(0xd9a441).into(),
-        NodeKind::Enum => rgb(0x4dbd82).into(),
-        NodeKind::Input => rgb(0x3fb6c9).into(),
-        NodeKind::Scalar => rgb(0x8b93a3).into(),
-    }
-}
-
-fn edge_color(group: EdgeGroup) -> Hsla {
+fn edge_color(th: &Theme, group: EdgeGroup) -> Hsla {
     let c: Hsla = match group {
-        EdgeGroup::FieldNonNull => rgb(0x4c8dff).into(),
-        EdgeGroup::FieldNullable => rgb(0x4c8dff).into(),
-        EdgeGroup::Union => rgb(0xd9a441).into(),
-        EdgeGroup::Implements => rgb(0x9d7bff).into(),
-        EdgeGroup::Arg => rgb(0xe08a4a).into(),
+        EdgeGroup::FieldNonNull | EdgeGroup::FieldNullable => th.kind_color(NodeKind::Object),
+        EdgeGroup::Union => th.kind_color(NodeKind::Union),
+        EdgeGroup::Implements => th.kind_color(NodeKind::Interface),
+        EdgeGroup::Arg => th.arg_orange,
     };
     match group {
         EdgeGroup::FieldNullable => c.opacity(0.45),
@@ -392,11 +360,6 @@ fn edge_color(group: EdgeGroup) -> Hsla {
         EdgeGroup::Arg => c.opacity(0.55),
         _ => c.opacity(0.85),
     }
-}
-
-fn overlay_green() -> Hsla {
-    let c: Hsla = rgb(0x34d399).into();
-    c
 }
 
 fn mono(weight: FontWeight) -> Font {
@@ -478,8 +441,8 @@ impl Render for GraphCanvas {
         };
         let hover_pos = self.hover_pos;
         let investigate = self.investigate;
-        let pal = palette();
-        let bg = pal.bg;
+        let th = crate::theme::theme(window.appearance());
+        let bg = th.bg;
         let status = self.status_line();
 
         div()
@@ -521,9 +484,9 @@ impl Render for GraphCanvas {
                     .px_3()
                     .py_1()
                     .rounded_md()
-                    .bg(rgba(0x1a1e26f0))
+                    .bg(th.chrome_bg)
                     .shadow_md()
-                    .text_color(pal.text_muted)
+                    .text_color(th.text_muted)
                     .text_xs()
                     .font_family("Menlo")
                     .child(SharedString::from(status)),
@@ -550,8 +513,8 @@ impl Render for GraphCanvas {
                         .p_2()
                         .rounded_md()
                         .border_1()
-                        .border_color(rgb(0x2c3340))
-                        .bg(rgba(0x1a1e26f5))
+                        .border_color(th.card_border)
+                        .bg(th.chrome_bg)
                         .shadow_lg()
                         .flex()
                         .flex_col()
@@ -560,14 +523,14 @@ impl Render for GraphCanvas {
                         .child(
                             div()
                                 .text_xs()
-                                .text_color(pal.text)
+                                .text_color(th.text)
                                 .child(SharedString::from(tip.title)),
                         )
                         .when_some(tip.description, |el, d| {
                             el.child(
                                 div()
                                     .text_xs()
-                                    .text_color(pal.text_muted)
+                                    .text_color(th.text_muted)
                                     .max_h(px(120.0))
                                     .overflow_hidden()
                                     .child(SharedString::from(d)),
@@ -575,9 +538,9 @@ impl Render for GraphCanvas {
                         })
                         .when_some(tip.deprecation, |el, d| {
                             let color: Hsla = if tip.expired {
-                                rgb(0xe5534b).into()
+                                th.red
                             } else {
-                                pal.type_amber
+                                th.type_amber
                             };
                             el.child(
                                 div()
@@ -602,7 +565,7 @@ fn paint_scene(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let pal = palette();
+    let th = crate::theme::theme(window.appearance());
     let k = view.k;
     let ox = f32::from(bounds.origin.x) + view.x;
     let oy = f32::from(bounds.origin.y) + view.y;
@@ -645,9 +608,6 @@ fn paint_scene(
     // With a focused card, incident edges stay bright and the rest dim —
     // the web app's focus behavior, minus its re-tessellation dodge.
     for (group, dim_pass) in groups.iter().flat_map(|&g| [(g, false), (g, true)]) {
-        if dim_pass && focus.is_none() {
-            continue;
-        }
         let mut builder = PathBuilder::stroke(px(stroke_w));
         let mut any = false;
         let mut arrows = PathBuilder::fill();
@@ -656,8 +616,12 @@ fn paint_scene(
             if e.group != group {
                 continue;
             }
-            let dimmed =
-                matches!(focus, Some(f) if e.from != f && e.to != f);
+            // With a focus, everything non-incident dims; without one, only
+            // hub-star edges dim (the web app's hub fading).
+            let dimmed = match focus {
+                Some(f) => e.from != f && e.to != f,
+                None => e.hub_faded,
+            };
             if dimmed != dim_pass {
                 continue;
             }
@@ -695,9 +659,9 @@ fn paint_scene(
             any_arrow = true;
         }
         let color = if dim_pass {
-            edge_color(group).opacity(0.22)
+            edge_color(&th, group).opacity(0.22)
         } else {
-            edge_color(group)
+            edge_color(&th, group)
         };
         if any {
             if let Ok(path) = builder.build() {
@@ -733,7 +697,7 @@ fn paint_scene(
             origin,
             size: size(px(card.w * k), px(card.h * k)),
         };
-        let kc = kind_color(card.kind);
+        let kc = th.kind_color(card.kind);
         let is_hovered = matches!(hover, Some(h) if h.card == i as u32);
         let is_focused = focus == Some(i as u32);
         let radius = px(6.0 * k);
@@ -742,7 +706,7 @@ fn paint_scene(
                 card_bounds,
                 Corners::all(radius),
                 &[gpui::BoxShadow {
-                    color: gpui::black().opacity(0.35),
+                    color: th.shadow,
                     offset: point(px(0.0), px(2.0 * k)),
                     blur_radius: px(10.0 * k),
                     spread_radius: px(0.0),
@@ -752,16 +716,16 @@ fn paint_scene(
         }
         let border_w = if is_focused || card.is_overlay { 2.0 } else { 1.25 };
         let border_color = if card.is_overlay {
-            overlay_green()
+            th.overlay_green
         } else if is_focused || is_hovered {
             kc
         } else {
-            pal.card_border
+            th.card_border
         };
         window.paint_quad(quad(
             card_bounds,
             Corners::all(radius),
-            pal.card_bg,
+            th.card_bg,
             Edges::all(px((border_w * k).clamp(0.5, 3.0))),
             border_color,
             if card.is_overlay { BorderStyle::Dashed } else { BorderStyle::Solid },
@@ -794,7 +758,7 @@ fn paint_scene(
                     Corners::all(radius),
                     gpui::transparent_black(),
                     Edges::all(px((1.5 * k).clamp(0.6, 2.5))),
-                    rgb(0xe5534b),
+                    th.red,
                     BorderStyle::Solid,
                 ));
             }
@@ -807,7 +771,7 @@ fn paint_scene(
                             origin: to_screen(pos.x, pos.y + card.row_y(ri) + 4.0),
                             size: size(px(2.0 * k), px((card.row_h - 8.0) * k)),
                         };
-                        window.paint_quad(fill(tick, rgb(0xe5534b)));
+                        window.paint_quad(fill(tick, th.red));
                     }
                 }
             }
@@ -821,7 +785,7 @@ fn paint_scene(
                         origin: to_screen(pos.x + 2.0, pos.y + card.row_y(ri) + 2.0),
                         size: size(px(3.0 * k), px((card.row_h - 4.0) * k)),
                     };
-                    window.paint_quad(fill(gutter, overlay_green()));
+                    window.paint_quad(fill(gutter, th.overlay_green));
                 }
             }
         }
@@ -833,7 +797,7 @@ fn paint_scene(
                     origin: to_screen(pos.x, pos.y + card.row_y(row)),
                     size: size(px(card.w * k), px(card.row_h * k)),
                 };
-                window.paint_quad(fill(row_bounds, pal.type_amber.opacity(0.18)));
+                window.paint_quad(fill(row_bounds, th.type_amber.opacity(0.18)));
             }
         }
 
@@ -854,7 +818,7 @@ fn paint_scene(
             continue;
         }
         let name_size = px(NAME_FONT_PX * kt);
-        let name_run = [run(card.name.len(), &name_font, pal.text)];
+        let name_run = [run(card.name.len(), &name_font, th.text)];
         let line = text_system.shape_line(card.name.clone(), name_size, &name_run, None);
         text_errors += line
             .paint(
@@ -897,21 +861,21 @@ fn paint_scene(
             let left_color = match row.kind {
                 RowKind::Field | RowKind::EnumValue => {
                     if row.deprecated {
-                        pal.text_muted.opacity(0.6)
+                        th.text_muted.opacity(0.6)
                     } else {
-                        pal.text.opacity(0.92)
+                        th.text.opacity(0.92)
                     }
                 }
-                RowKind::Implements => kind_color(NodeKind::Interface).opacity(0.9),
+                RowKind::Implements => th.kind_color(NodeKind::Interface).opacity(0.9),
                 RowKind::UnionMember | RowKind::MemberOfUnion => {
-                    kind_color(NodeKind::Union).opacity(0.9)
+                    th.kind_color(NodeKind::Union).opacity(0.9)
                 }
             };
             let mut left_run = run(row.left.len(), &row_font, left_color);
             if row.deprecated {
                 left_run.strikethrough = Some(gpui::StrikethroughStyle {
                     thickness: px(1.0),
-                    color: Some(pal.text_muted),
+                    color: Some(th.text_muted),
                 });
             }
             let line = text_system.shape_line(row.left.clone(), row_size, &[left_run], None);
@@ -927,9 +891,9 @@ fn paint_scene(
                 .is_err() as usize;
             if !row.right.is_empty() {
                 let rt_color: Hsla = if row.until_expired {
-                    rgb(0xe5534b).into()
+                    th.red
                 } else {
-                    pal.type_amber
+                    th.type_amber
                 };
                 let right_run = [run(row.right.len(), &row_font, rt_color)];
                 let rline =
@@ -947,7 +911,7 @@ fn paint_scene(
                             size: size(px(d), px(d)),
                         },
                         Corners::all(px(d / 2.0)),
-                        kind_color(NodeKind::Input),
+                        th.kind_color(NodeKind::Input),
                         Edges::default(),
                         gpui::transparent_black(),
                         BorderStyle::Solid,
@@ -955,7 +919,7 @@ fn paint_scene(
                 }
             }
             if let Some(desc) = &row.description_line {
-                let drun = [run(desc.len(), &row_font, pal.text_muted.opacity(0.8))];
+                let drun = [run(desc.len(), &row_font, th.text_muted.opacity(0.8))];
                 let dline = text_system.shape_line(desc.clone(), px(8.5 * kt), &drun, None);
                 text_errors += dline
                     .paint(

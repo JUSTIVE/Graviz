@@ -3,12 +3,12 @@
 //! The search box is a minimal key-capture input (schema identifiers are
 //! ASCII); results come from `gompass_core::search::search_graph`.
 
-use crate::canvas::kind_color;
 use crate::model::Model;
 use gompass_core::graph::{EdgeKind, NodeKind};
 use gompass_core::search::{search_graph, SearchResult};
+use crate::theme::Theme;
 use gpui::{
-    div, prelude::*, px, rgb, uniform_list, App, Context, EventEmitter, FocusHandle, Focusable,
+    div, prelude::*, px, uniform_list, App, Context, EventEmitter, FocusHandle, Focusable,
     KeyDownEvent, ScrollStrategy, SharedString, UniformListScrollHandle, Window,
 };
 use std::collections::HashSet;
@@ -190,14 +190,14 @@ impl TreePanel {
         cx.notify();
     }
 
-    fn render_row(&self, ix: usize, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn render_row(&self, ix: usize, th: Theme, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let is_active = ix == self.active;
         let (dot, main, detail): (gpui::Hsla, SharedString, Option<String>) = if self
             .query
             .is_empty()
         {
             let card = &self.model.cards[self.all_sorted[ix] as usize];
-            (kind_color(card.kind), card.name.clone(), None)
+            (th.kind_color(card.kind), card.name.clone(), None)
         } else {
             let r = &self.results[ix];
             let main = match &r.field_name {
@@ -209,7 +209,7 @@ impl TreePanel {
                 .as_ref()
                 .map(|s| s.snippet.clone())
                 .or_else(|| r.field_type.clone());
-            (kind_color(r.type_kind), main.into(), detail)
+            (th.kind_color(r.type_kind), main.into(), detail)
         };
 
         div()
@@ -220,14 +220,14 @@ impl TreePanel {
             .items_center()
             .gap_2()
             .cursor_pointer()
-            .when(is_active, |el| el.bg(rgb(0x2a3140)))
-            .hover(|el| el.bg(rgb(0x232936)))
+            .when(is_active, |el| el.bg(th.active_bg))
+            .hover(|el| el.bg(th.hover_bg))
             .on_click(cx.listener(move |this, _, _, cx| this.select(ix, cx)))
             .child(div().size(px(7.0)).rounded_full().bg(dot).flex_none())
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(0xdde1e8))
+                    .text_color(th.text)
                     .whitespace_nowrap()
                     .overflow_hidden()
                     .child(SharedString::from(main)),
@@ -236,7 +236,7 @@ impl TreePanel {
                 el.child(
                     div()
                         .text_xs()
-                        .text_color(rgb(0x778092))
+                        .text_color(th.text_muted)
                         .whitespace_nowrap()
                         .overflow_hidden()
                         .child(SharedString::from(d)),
@@ -257,6 +257,7 @@ impl Focusable for TreePanel {
 
 impl Render for TreePanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let th = crate::theme::theme(window.appearance());
         let focused = self.focus.is_focused(window);
         let count = self.item_count();
         let query_display: SharedString = if self.query.is_empty() {
@@ -269,9 +270,9 @@ impl Render for TreePanel {
             .flex()
             .flex_col()
             .size_full()
-            .bg(rgb(0x14171d))
+            .bg(th.panel)
             .border_r_1()
-            .border_color(rgb(0x242a35))
+            .border_color(th.panel_border)
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key_down))
             .child(
@@ -281,14 +282,14 @@ impl Render for TreePanel {
                     .py_1()
                     .rounded_md()
                     .border_1()
-                    .border_color(if focused { rgb(0x4c8dff) } else { rgb(0x2c3340) })
-                    .bg(rgb(0x1a1e26))
+                    .border_color(if focused { th.accent } else { th.card_border })
+                    .bg(th.input_bg)
                     .text_sm()
                     .font_family("Menlo")
                     .text_color(if self.query.is_empty() {
-                        rgb(0x687083)
+                        th.text_faint
                     } else {
-                        rgb(0xdde1e8)
+                        th.text
                     })
                     .whitespace_nowrap()
                     .overflow_hidden()
@@ -299,7 +300,7 @@ impl Render for TreePanel {
                     .px_3()
                     .pb_1()
                     .text_xs()
-                    .text_color(rgb(0x687083))
+                    .text_color(th.text_faint)
                     .child(SharedString::from(if self.query.is_empty() {
                         format!("All types · {count}")
                     } else {
@@ -323,10 +324,10 @@ impl Render for TreePanel {
                                 .rounded_full()
                                 .cursor_pointer()
                                 .border_1()
-                                .border_color(if active { kind_color(kind) } else { rgb(0x2c3340).into() })
-                                .when(active, |el| el.bg(rgb(0x232936)))
+                                .border_color(if active { th.kind_color(kind) } else { th.card_border })
+                                .when(active, |el| el.bg(th.hover_bg))
                                 .text_xs()
-                                .text_color(kind_color(kind))
+                                .text_color(th.kind_color(kind))
                                 .on_click(cx.listener(move |this, _, _, cx| this.toggle_kind(kind, cx)))
                                 .child(SharedString::from(label))
                         })),
@@ -336,8 +337,9 @@ impl Render for TreePanel {
                 uniform_list(
                     "tree-items",
                     count,
-                    cx.processor(|this, range: std::ops::Range<usize>, _window, cx| {
-                        range.map(|ix| this.render_row(ix, cx)).collect::<Vec<_>>()
+                    cx.processor(|this, range: std::ops::Range<usize>, window, cx| {
+                        let th = crate::theme::theme(window.appearance());
+                        range.map(|ix| this.render_row(ix, th, cx)).collect::<Vec<_>>()
                     }),
                 )
                 .flex_1()
@@ -352,7 +354,7 @@ impl Render for TreePanel {
                         .flex_none()
                         .max_h(px(320.0))
                         .border_t_1()
-                        .border_color(rgb(0x242a35))
+                        .border_color(th.panel_border)
                         .flex()
                         .flex_col()
                         .child(
@@ -362,18 +364,18 @@ impl Render for TreePanel {
                                 .flex()
                                 .items_center()
                                 .gap_2()
-                                .child(div().size(px(7.0)).rounded_full().bg(kind_color(c.kind)).flex_none())
+                                .child(div().size(px(7.0)).rounded_full().bg(th.kind_color(c.kind)).flex_none())
                                 .child(
                                     div()
                                         .text_sm()
                                         .font_family("Menlo")
-                                        .text_color(rgb(0xe6e9ef))
+                                        .text_color(th.text)
                                         .child(c.name.clone()),
                                 )
                                 .child(
                                     div()
                                         .text_xs()
-                                        .text_color(kind_color(c.kind))
+                                        .text_color(th.kind_color(c.kind))
                                         .child(SharedString::from(c.kind_label)),
                                 ),
                         )
@@ -383,7 +385,7 @@ impl Render for TreePanel {
                                     .px_3()
                                     .pt_1()
                                     .text_xs()
-                                    .text_color(rgb(0x8b93a3))
+                                    .text_color(th.text_muted)
                                     .max_h(px(80.0))
                                     .overflow_hidden()
                                     .child(SharedString::from(d)),
@@ -395,7 +397,7 @@ impl Render for TreePanel {
                                 .pt_2()
                                 .pb_1()
                                 .text_xs()
-                                .text_color(rgb(0x687083))
+                                .text_color(th.text_faint)
                                 .child(SharedString::from(format!(
                                     "Referenced by · {}",
                                     refs.len()
@@ -416,10 +418,10 @@ impl Render for TreePanel {
                                                 .flex()
                                                 .items_center()
                                                 .cursor_pointer()
-                                                .hover(|el| el.bg(rgb(0x232936)))
+                                                .hover(|el| el.bg(th.hover_bg))
                                                 .text_xs()
                                                 .font_family("Menlo")
-                                                .text_color(rgb(0x9aa3b5))
+                                                .text_color(th.text_muted)
                                                 .whitespace_nowrap()
                                                 .overflow_hidden()
                                                 .on_click(cx.listener(move |this, _, _, cx| {

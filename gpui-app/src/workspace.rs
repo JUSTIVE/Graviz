@@ -8,8 +8,9 @@ use crate::loader;
 use crate::model::{build_model, slice_graph, Mode, ModelOptions};
 use crate::tree::{TreeEvent, TreePanel};
 use gompass_core::graph::ParsedGraph;
+use crate::theme::Theme;
 use gpui::{
-    actions, div, prelude::*, px, rgb, rgba, App, Context, Entity, KeyBinding, PathPromptOptions,
+    actions, div, prelude::*, px, App, Context, Entity, KeyBinding, PathPromptOptions,
     SharedString, Window,
 };
 use std::path::PathBuf;
@@ -183,14 +184,15 @@ impl Workspace {
         .detach();
     }
 
-    fn mode_tab(&self, mode: Mode, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn mode_tab(&self, th: Theme, mode: Mode, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let active = self.mode == mode;
-        toolbar_button(mode.label(), active)
+        toolbar_button(th, mode.label(), active)
             .on_click(cx.listener(move |this, _, _, cx| this.set_mode(mode, cx)))
     }
 
     fn toggle_button<F>(
         &self,
+        th: Theme,
         label: &'static str,
         active: bool,
         on_click: F,
@@ -199,12 +201,12 @@ impl Workspace {
     where
         F: Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     {
-        toolbar_button(label, active)
+        toolbar_button(th, label, active)
             .on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx)))
     }
 }
 
-fn toolbar_button(label: &'static str, active: bool) -> gpui::Stateful<gpui::Div> {
+fn toolbar_button(th: Theme, label: &'static str, active: bool) -> gpui::Stateful<gpui::Div> {
     div()
         .id(label)
         .px_3()
@@ -212,14 +214,15 @@ fn toolbar_button(label: &'static str, active: bool) -> gpui::Stateful<gpui::Div
         .rounded_md()
         .cursor_pointer()
         .text_xs()
-        .when(active, |el| el.bg(rgb(0x2a3140)).text_color(rgb(0xe6e9ef)))
-        .when(!active, |el| el.text_color(rgb(0x8b93a3)))
-        .hover(|el| el.bg(rgb(0x232936)))
+        .when(active, |el| el.bg(th.active_bg).text_color(th.text))
+        .when(!active, |el| el.text_color(th.text_muted))
+        .hover(|el| el.bg(th.hover_bg))
         .child(SharedString::from(label))
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let th = crate::theme::theme(window.appearance());
         let toolbar = div()
             .absolute()
             .top_2()
@@ -229,15 +232,16 @@ impl Render for Workspace {
             .gap_1()
             .p_1()
             .rounded_lg()
-            .bg(rgba(0x14171df0))
+            .bg(th.chrome_bg)
             .border_1()
-            .border_color(rgb(0x242a35))
+            .border_color(th.panel_border)
             .shadow_md()
-            .child(self.mode_tab(Mode::Reachable, cx))
-            .child(self.mode_tab(Mode::Orphaned, cx))
-            .child(self.mode_tab(Mode::Deprecated, cx))
-            .child(div().w(px(1.0)).h_4().bg(rgb(0x2c3340)))
+            .child(self.mode_tab(th, Mode::Reachable, cx))
+            .child(self.mode_tab(th, Mode::Orphaned, cx))
+            .child(self.mode_tab(th, Mode::Deprecated, cx))
+            .child(div().w(px(1.0)).h_4().bg(th.card_border))
             .child(self.toggle_button(
+                th,
                 "Desc",
                 self.options.show_descriptions,
                 |this, _, cx| {
@@ -247,6 +251,7 @@ impl Render for Workspace {
                 cx,
             ))
             .child(self.toggle_button(
+                th,
                 "Bundle",
                 self.options.bundle_edges,
                 |this, _, cx| {
@@ -256,6 +261,7 @@ impl Render for Workspace {
                 cx,
             ))
             .child(self.toggle_button(
+                th,
                 "Investigate",
                 self.investigate,
                 |this, _, cx| {
@@ -278,13 +284,13 @@ impl Render for Workspace {
                     .px_3()
                     .py_1()
                     .rounded_md()
-                    .bg(rgba(0x14171df0))
+                    .bg(th.chrome_bg)
                     .border_1()
-                    .border_color(rgb(0x242a35))
+                    .border_color(th.panel_border)
                     .shadow_md()
                     .text_xs()
                     .font_family("Menlo")
-                    .text_color(rgb(0x8b93a3))
+                    .text_color(th.text_muted)
                     .child(SharedString::from(format!("⌘[ ← {}", trail.join(" ‹ "))))
             })
         };

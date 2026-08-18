@@ -118,7 +118,13 @@ pub struct EdgeVisual {
     pub bbox: [f32; 4],
     /// Number of parallel field edges collapsed into this one (≥1).
     pub bundled: u32,
+    /// Incident to a hub node (degree ≥ HUB_FADE_DEGREE) — drawn faded so
+    /// Relay `Node`-style stars don't dominate the picture.
+    pub hub_faded: bool,
 }
+
+/// In- or out-degree at which a node's edges get faded.
+pub const HUB_FADE_DEGREE: u32 = 50;
 
 /// Knobs on [`build_model`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -479,6 +485,11 @@ pub fn build_model(graph: ParsedGraph, schema_name: String, options: &ModelOptio
     let result = layout::layout(&layout_nodes, &layout_edges, &roots, &LayoutConfig::default());
 
     // ---- flatten edge paths ----
+    let mut degree = vec![0u32; cards.len()];
+    for le in &layout_edges {
+        degree[le.from as usize] += 1;
+        degree[le.to as usize] += 1;
+    }
     const STEPS: usize = 16;
     let mut edges: Vec<EdgeVisual> = Vec::with_capacity(result.edges.len());
     for path in &result.edges {
@@ -512,6 +523,8 @@ pub fn build_model(graph: ParsedGraph, schema_name: String, options: &ModelOptio
             points,
             bbox,
             bundled: bundle_counts[path.edge_index as usize],
+            hub_faded: degree[le.from as usize] >= HUB_FADE_DEGREE
+                || degree[le.to as usize] >= HUB_FADE_DEGREE,
         });
     }
 

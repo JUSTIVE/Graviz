@@ -1,5 +1,6 @@
 mod canvas;
 mod loader;
+mod theme;
 mod model;
 #[cfg(target_os = "macos")]
 mod selfshot;

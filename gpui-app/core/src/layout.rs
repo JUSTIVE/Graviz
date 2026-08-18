@@ -64,9 +64,9 @@ pub struct LayoutConfig {
 impl Default for LayoutConfig {
     fn default() -> Self {
         Self {
-            rank_sep: 130.0,
-            node_sep: 26.0,
-            component_sep: 90.0,
+            rank_sep: 110.0,
+            node_sep: 22.0,
+            component_sep: 60.0,
             ordering_sweeps: 8,
         }
     }
