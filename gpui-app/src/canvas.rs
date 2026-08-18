@@ -15,6 +15,7 @@ use gpui::{
     MouseUpEvent, PathBuilder, Pixels, Point, ScrollDelta, ScrollWheelEvent, SharedString,
     TextAlign, TextRun, Window,
 };
+use std::cell::Cell;
 use std::rc::Rc;
 
 const ZOOM_MIN: f32 = 0.01;
@@ -58,6 +59,11 @@ pub struct GraphCanvas {
     pending_center: Option<u32>,
     /// Row pinned from a search hit: (card, row index).
     pinned: Option<(u32, usize)>,
+    /// Window-space origin of the canvas element, recorded at paint time so
+    /// event coordinates (window-relative) can be mapped into the canvas.
+    canvas_origin: Rc<Cell<(f32, f32)>>,
+    /// EMA of paint_scene duration, for the status bar.
+    frame_ms: Rc<Cell<f32>>,
 }
 
 impl GraphCanvas {
@@ -71,6 +77,8 @@ impl GraphCanvas {
             focus: None,
             pending_center: None,
             pinned: None,
+            canvas_origin: Rc::new(Cell::new((0.0, 0.0))),
+            frame_ms: Rc::new(Cell::new(0.0)),
         }
     }
 
@@ -97,6 +105,15 @@ impl GraphCanvas {
         let (gw, gh) = (self.model.world_w.max(1.0), self.model.world_h.max(1.0));
         let pad = 80.0;
         let k = ((vw - pad) / gw).min((vh - pad) / gh).min(1.2).max(ZOOM_MIN);
+        // On huge graphs a full fit is an unreadable speck field — land on the
+        // query root instead, zoomed in enough that text is legible.
+        if k < 0.15 {
+            if let Some(&root) = self.model.roots.first() {
+                self.view.k = 0.8;
+                self.center_on(root, vw, vh);
+                return;
+            }
+        }
         self.view = ViewTransform {
             x: (vw - gw * k) / 2.0,
             y: (vh - gh * k) / 2.0,
@@ -105,9 +122,10 @@ impl GraphCanvas {
     }
 
     fn screen_to_world(&self, p: Point<Pixels>) -> (f32, f32) {
+        let (ox, oy) = self.canvas_origin.get();
         (
-            (f32::from(p.x) - self.view.x) / self.view.k,
-            (f32::from(p.y) - self.view.y) / self.view.k,
+            (f32::from(p.x) - ox - self.view.x) / self.view.k,
+            (f32::from(p.y) - oy - self.view.y) / self.view.k,
         )
     }
 
@@ -142,27 +160,29 @@ impl GraphCanvas {
 
     fn on_scroll(&mut self, ev: &ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
         let _ = window;
-        match ev.delta {
-            ScrollDelta::Pixels(d) if !ev.modifiers.platform && !ev.modifiers.control => {
-                // trackpad two-finger scroll pans
+        // Like the web app: scroll/wheel zooms (anchored at the cursor);
+        // hold shift to pan. Dragging pans as well.
+        if ev.modifiers.shift {
+            if let ScrollDelta::Pixels(d) = ev.delta {
                 self.view.x += f32::from(d.x);
                 self.view.y += f32::from(d.y);
-            }
-            _ => {
-                // mouse wheel / cmd+scroll zooms, anchored at the cursor
-                let dy = match ev.delta {
-                    ScrollDelta::Pixels(d) => f32::from(d.y),
-                    ScrollDelta::Lines(d) => d.y * 20.0,
-                };
-                let ratio = if dy > 0.0 { ZOOM_STEP } else { 1.0 / ZOOM_STEP };
-                let new_k = (self.view.k * ratio).clamp(ZOOM_MIN, ZOOM_MAX);
-                let ratio = new_k / self.view.k;
-                let (mx, my) = (f32::from(ev.position.x), f32::from(ev.position.y));
-                self.view.x = mx - (mx - self.view.x) * ratio;
-                self.view.y = my - (my - self.view.y) * ratio;
-                self.view.k = new_k;
+                cx.notify();
+                return;
             }
         }
+        let dy = match ev.delta {
+            ScrollDelta::Pixels(d) => f32::from(d.y),
+            ScrollDelta::Lines(d) => d.y * 20.0,
+        };
+        // smooth exponential zoom: ±100px of scroll ≈ ×/÷ 1.4
+        let ratio = 2f32.powf(dy / 200.0);
+        let new_k = (self.view.k * ratio).clamp(ZOOM_MIN, ZOOM_MAX);
+        let ratio = new_k / self.view.k;
+        let (ox, oy) = self.canvas_origin.get();
+        let (mx, my) = (f32::from(ev.position.x) - ox, f32::from(ev.position.y) - oy);
+        self.view.x = mx - (mx - self.view.x) * ratio;
+        self.view.y = my - (my - self.view.y) * ratio;
+        self.view.k = new_k;
         cx.notify();
     }
 
@@ -222,6 +242,10 @@ impl GraphCanvas {
         );
         if m.overlay_marks > 0 {
             base.push_str(&format!("  ·  overlay +{}", m.overlay_marks));
+        }
+        let ms = self.frame_ms.get();
+        if ms > 0.0 {
+            base.push_str(&format!("  ·  {ms:.1}ms"));
         }
         match self.hover {
             Some(Hover { card, row: Some(row) }) => {
@@ -335,6 +359,8 @@ impl Render for GraphCanvas {
         let hover = self.hover;
         let focus = self.focus;
         let pinned = self.pinned;
+        let canvas_origin = self.canvas_origin.clone();
+        let frame_ms = self.frame_ms.clone();
         let pal = palette();
         let bg = pal.bg;
         let status = self.status_line();
@@ -357,7 +383,13 @@ impl Render for GraphCanvas {
                 canvas(
                     |_, _, _| (),
                     move |bounds, _, window, cx| {
+                        canvas_origin
+                            .set((f32::from(bounds.origin.x), f32::from(bounds.origin.y)));
+                        let t0 = std::time::Instant::now();
                         paint_scene(&model, view, hover, focus, pinned, bounds, window, cx);
+                        let ms = t0.elapsed().as_secs_f32() * 1000.0;
+                        let prev = frame_ms.get();
+                        frame_ms.set(if prev == 0.0 { ms } else { prev * 0.8 + ms * 0.2 });
                     },
                 )
                 .size_full(),
@@ -412,6 +444,19 @@ fn paint_scene(
         EdgeGroup::Arg,
     ];
     let stroke_w = (1.5 * k).clamp(0.6, 2.5);
+    // Zoomed out, bezier detail is subpixel: sample the flattened polyline at
+    // a stride (straight-ish lines) so tessellation stays cheap at overview
+    // zoom, where every one of the ~5k edges is on screen.
+    let stride: usize = if k < 0.08 {
+        16
+    } else if k < 0.2 {
+        4
+    } else if k < 0.5 {
+        2
+    } else {
+        1
+    };
+    let draw_arrows = k >= 0.3;
     // With a focused card, incident edges stay bright and the rest dim —
     // the web app's focus behavior, minus its re-tessellation dodge.
     for (group, dim_pass) in groups.iter().flat_map(|&g| [(g, false), (g, true)]) {
@@ -436,13 +481,19 @@ fn paint_scene(
             }
             let pts = &e.points;
             builder.move_to(to_screen(pts[0], pts[1]));
-            for i in (2..pts.len()).step_by(2) {
+            let mut i = 2 * stride;
+            while i + 1 < pts.len() {
                 builder.line_to(to_screen(pts[i], pts[i + 1]));
+                i += 2 * stride;
             }
+            let n = pts.len();
+            builder.line_to(to_screen(pts[n - 2], pts[n - 1]));
             any = true;
+            if !draw_arrows {
+                continue;
+            }
             // arrowhead: screen-space triangle at the end, oriented by the
             // last polyline segment
-            let n = pts.len();
             let (ex, ey) = (pts[n - 2], pts[n - 1]);
             let (px_, py_) = (pts[n - 4], pts[n - 3]);
             let (dx, dy) = (ex - px_, ey - py_);
@@ -479,6 +530,11 @@ fn paint_scene(
     let name_font = mono(FontWeight::SEMIBOLD);
     let row_font = mono(FontWeight::NORMAL);
     let text_system = window.text_system().clone();
+    // Text is shaped at a quantized zoom (√2/4 ladder, ~9% steps) so that a
+    // continuous zoom gesture hits the text system's layout cache instead of
+    // re-shaping every visible glyph run each frame.
+    let kt = 2f32.powf((k.log2() * 8.0).round() / 8.0);
+    let mut text_errors = 0usize;
 
     for (i, card) in model.cards.iter().enumerate() {
         let pos = model.positions[i];
@@ -569,24 +625,21 @@ fn paint_scene(
         if k < LOD_HEADER {
             continue;
         }
-        let name_size = px(NAME_FONT_PX * k);
+        let name_size = px(NAME_FONT_PX * kt);
         let name_run = [run(card.name.len(), &name_font, pal.text)];
-        let line = text_system.shape_line(
-            SharedString::from(card.name.clone()),
-            name_size,
-            &name_run,
-            None,
-        );
-        let _ = line.paint(
-            to_screen(pos.x + CARD_PAD_X, pos.y + 8.0),
-            px(NAME_FONT_PX * 1.4 * k),
-            TextAlign::Left,
-            None,
-            window,
-            cx,
-        );
+        let line = text_system.shape_line(card.name.clone(), name_size, &name_run, None);
+        text_errors += line
+            .paint(
+                to_screen(pos.x + CARD_PAD_X, pos.y + 8.0),
+                px(NAME_FONT_PX * 1.4 * kt),
+                TextAlign::Left,
+                None,
+                window,
+                cx,
+            )
+            .is_err() as usize;
         // kind label, small, right of header
-        let kl_size = px(9.0 * k);
+        let kl_size = px(9.0 * kt);
         let kl_run = [run(card.kind_label.len(), &row_font, kc)];
         let kl_line = text_system.shape_line(
             SharedString::from(card.kind_label),
@@ -595,20 +648,22 @@ fn paint_scene(
             None,
         );
         let kl_x = pos.x + card.w - CARD_PAD_X - f32::from(kl_line.width) / k;
-        let _ = kl_line.paint(
-            to_screen(kl_x, pos.y + 10.0),
-            px(9.0 * 1.4 * k),
-            TextAlign::Left,
-            None,
-            window,
-            cx,
-        );
+        text_errors += kl_line
+            .paint(
+                to_screen(kl_x, pos.y + 10.0),
+                px(9.0 * 1.4 * kt),
+                TextAlign::Left,
+                None,
+                window,
+                cx,
+            )
+            .is_err() as usize;
 
         if k < LOD_ROWS {
             continue;
         }
-        let row_size = px(ROW_FONT_PX * k);
-        let row_line_h = px(ROW_H * k);
+        let row_size = px(ROW_FONT_PX * kt);
+        let row_line_h = px(ROW_H * kt);
         for (ri, row) in card.rows.iter().enumerate() {
             let ry = pos.y + card.row_y(ri) + (ROW_H - ROW_FONT_PX * 1.2) / 2.0;
             let left_color = match row.kind {
@@ -631,31 +686,29 @@ fn paint_scene(
                     color: Some(pal.text_muted),
                 });
             }
-            let line = text_system.shape_line(
-                SharedString::from(row.left.clone()),
-                row_size,
-                &[left_run],
-                None,
-            );
-            let _ = line.paint(
-                to_screen(pos.x + CARD_PAD_X, ry),
-                row_line_h,
-                TextAlign::Left,
-                None,
-                window,
-                cx,
-            );
+            let line = text_system.shape_line(row.left.clone(), row_size, &[left_run], None);
+            text_errors += line
+                .paint(
+                    to_screen(pos.x + CARD_PAD_X, ry),
+                    row_line_h,
+                    TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                )
+                .is_err() as usize;
             if !row.right.is_empty() {
                 let right_run = [run(row.right.len(), &row_font, pal.type_amber)];
-                let rline = text_system.shape_line(
-                    SharedString::from(row.right.clone()),
-                    row_size,
-                    &right_run,
-                    None,
-                );
+                let rline =
+                    text_system.shape_line(row.right.clone(), row_size, &right_run, None);
                 let rx = pos.x + card.w - CARD_PAD_X - f32::from(rline.width) / k;
-                let _ = rline.paint(to_screen(rx, ry), row_line_h, TextAlign::Left, None, window, cx);
+                text_errors += rline
+                    .paint(to_screen(rx, ry), row_line_h, TextAlign::Left, None, window, cx)
+                    .is_err() as usize;
             }
         }
+    }
+    if text_errors > 0 {
+        eprintln!("canvas: {text_errors} text paint errors this frame");
     }
 }

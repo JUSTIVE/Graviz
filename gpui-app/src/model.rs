@@ -34,9 +34,9 @@ pub enum RowKind {
 #[derive(Debug, Clone)]
 pub struct Row {
     pub kind: RowKind,
-    pub left: String,
+    pub left: gpui::SharedString,
     /// Right-aligned type expression (empty for enum values / sections).
-    pub right: String,
+    pub right: gpui::SharedString,
     /// Card index this row navigates to on click, if any.
     pub target: Option<u32>,
     pub deprecated: bool,
@@ -48,7 +48,7 @@ pub struct Row {
 pub struct Card {
     /// Index into `ParsedGraph::nodes` / `Model::cards`.
     pub index: u32,
-    pub name: String,
+    pub name: gpui::SharedString,
     pub kind: NodeKind,
     pub kind_label: &'static str,
     pub rows: Vec<Row>,
@@ -116,6 +116,8 @@ pub struct Model {
     pub schema_name: String,
     /// Count of overlay-marked cards + rows (0 when no overlay is applied).
     pub overlay_marks: usize,
+    /// Card indices of the root operation types present in this slice.
+    pub roots: Vec<u32>,
 }
 
 /// The three canvas modes of the web app's `/view` tabs.
@@ -267,8 +269,8 @@ pub fn build_model(graph: ParsedGraph, schema_name: String) -> Model {
         for f in n.fields.as_deref().unwrap_or(&[]) {
             rows.push(Row {
                 kind: RowKind::Field,
-                left: f.name.clone(),
-                right: f.type_.clone(),
+                left: f.name.clone().into(),
+                right: f.type_.clone().into(),
                 target: index_of.get(&f.type_name).copied(),
                 deprecated: f.is_deprecated,
                 is_overlay: f.is_overlay,
@@ -278,8 +280,8 @@ pub fn build_model(graph: ParsedGraph, schema_name: String) -> Model {
         for v in n.values.as_deref().unwrap_or(&[]) {
             rows.push(Row {
                 kind: RowKind::EnumValue,
-                left: v.name.clone(),
-                right: String::new(),
+                left: v.name.clone().into(),
+                right: gpui::SharedString::default(),
                 target: None,
                 deprecated: v.is_deprecated,
                 is_overlay: false,
@@ -289,8 +291,8 @@ pub fn build_model(graph: ParsedGraph, schema_name: String) -> Model {
         for m in n.members.as_deref().unwrap_or(&[]) {
             rows.push(Row {
                 kind: RowKind::UnionMember,
-                left: m.clone(),
-                right: String::new(),
+                left: m.clone().into(),
+                right: gpui::SharedString::default(),
                 target: index_of.get(m).copied(),
                 deprecated: false,
                 is_overlay: false,
@@ -300,8 +302,8 @@ pub fn build_model(graph: ParsedGraph, schema_name: String) -> Model {
         for iface in n.interfaces.as_deref().unwrap_or(&[]) {
             rows.push(Row {
                 kind: RowKind::Implements,
-                left: format!("implements {iface}"),
-                right: String::new(),
+                left: format!("implements {iface}").into(),
+                right: gpui::SharedString::default(),
                 target: index_of.get(iface).copied(),
                 deprecated: false,
                 is_overlay: false,
@@ -311,8 +313,8 @@ pub fn build_model(graph: ParsedGraph, schema_name: String) -> Model {
         for u in n.member_of_unions.as_deref().unwrap_or(&[]) {
             rows.push(Row {
                 kind: RowKind::MemberOfUnion,
-                left: format!("in union {u}"),
-                right: String::new(),
+                left: format!("in union {u}").into(),
+                right: gpui::SharedString::default(),
                 target: index_of.get(u).copied(),
                 deprecated: false,
                 is_overlay: false,
@@ -332,7 +334,7 @@ pub fn build_model(graph: ParsedGraph, schema_name: String) -> Model {
 
         cards.push(Card {
             index: i as u32,
-            name: n.name.clone(),
+            name: n.name.clone().into(),
             kind: n.kind,
             kind_label: kind_label(n.kind),
             rows,
@@ -411,6 +413,7 @@ pub fn build_model(graph: ParsedGraph, schema_name: String) -> Model {
         index_of,
         schema_name,
         overlay_marks,
+        roots,
         graph,
     }
 }

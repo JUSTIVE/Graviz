@@ -140,7 +140,10 @@ impl TreePanel {
 
     fn render_row(&self, ix: usize, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let is_active = ix == self.active;
-        let (dot, main, detail): (gpui::Hsla, String, Option<String>) = if self.query.is_empty() {
+        let (dot, main, detail): (gpui::Hsla, SharedString, Option<String>) = if self
+            .query
+            .is_empty()
+        {
             let card = &self.model.cards[self.all_sorted[ix] as usize];
             (kind_color(card.kind), card.name.clone(), None)
         } else {
@@ -154,7 +157,7 @@ impl TreePanel {
                 .as_ref()
                 .map(|s| s.snippet.clone())
                 .or_else(|| r.field_type.clone());
-            (kind_color(r.type_kind), main, detail)
+            (kind_color(r.type_kind), main.into(), detail)
         };
 
         div()
