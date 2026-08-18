@@ -70,6 +70,10 @@ pub struct Card {
     pub row_h: f32,
     /// Whole type came from the overlay SDL.
     pub is_overlay: bool,
+    /// Graph row (field idx, then enum-value idx) → display row, `None` when
+    /// hidden by the primitive-fields filter. Ports, pins and search hits go
+    /// through this map.
+    pub row_map: Vec<Option<u32>>,
 }
 
 impl Card {
@@ -90,8 +94,13 @@ impl Card {
         (i < self.rows.len()).then_some(i)
     }
 
+    /// Display row for a graph-space row index (field, then enum value).
+    pub fn display_row(&self, graph_row: usize) -> Option<usize> {
+        self.row_map.get(graph_row).copied().flatten().map(|i| i as usize)
+    }
+
     pub fn port_y(&self, field_index: Option<usize>) -> f32 {
-        match field_index {
+        match field_index.and_then(|i| self.display_row(i)) {
             Some(i) if i < self.rows.len() => self.row_y(i) + self.row_h / 2.0,
             _ => self.h / 2.0,
         }
@@ -133,6 +142,8 @@ pub struct ModelOptions {
     pub show_descriptions: bool,
     /// Collapse parallel field edges sharing source→target into one arrow.
     pub bundle_edges: bool,
+    /// Hide fields whose return type is a builtin scalar (String/Int/…).
+    pub hide_primitive_fields: bool,
     /// Today as `YYYY-MM-DD`, for `[until]` expiry coloring.
     pub today: String,
 }
@@ -142,10 +153,13 @@ impl Default for ModelOptions {
         ModelOptions {
             show_descriptions: false,
             bundle_edges: true,
+            hide_primitive_fields: false,
             today: today_string(),
         }
     }
 }
+
+const BUILTIN_SCALARS: [&str; 5] = ["String", "Int", "Float", "Boolean", "ID"];
 
 /// Today's civil date (UTC) as `YYYY-MM-DD` without pulling in chrono.
 pub fn today_string() -> String {
@@ -220,15 +234,33 @@ fn root_ops_of(graph: &ParsedGraph) -> HashSet<String> {
     }
 }
 
+/// Root candidates for the Reachable slice, declared roots first.
+pub fn root_candidates(full: &ParsedGraph) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let rt = &full.root_types;
+    for name in [&rt.query, &rt.mutation, &rt.subscription].into_iter().flatten() {
+        if !out.contains(name) {
+            out.push(name.clone());
+        }
+    }
+    for conventional in ["Query", "Mutation", "Subscription"] {
+        if !out.iter().any(|n| n == conventional)
+            && full.nodes.iter().any(|n| n.id == conventional)
+        {
+            out.push(conventional.to_string());
+        }
+    }
+    out
+}
+
 /// Cut the full graph down to the slice a mode shows.
-pub fn slice_graph(full: &ParsedGraph, mode: Mode) -> ParsedGraph {
+pub fn slice_graph(full: &ParsedGraph, mode: Mode, root_override: Option<&str>) -> ParsedGraph {
     let root_ops = root_ops_of(full);
     let (nodes, edges): (Vec<_>, Vec<_>) = match mode {
         Mode::Reachable => {
-            let root = full
-                .root_types
-                .query
-                .clone()
+            let root = root_override
+                .map(str::to_string)
+                .or_else(|| full.root_types.query.clone())
                 .or_else(|| full.root_types.mutation.clone())
                 .or_else(|| full.root_types.subscription.clone());
             let Some(root) = root else {
@@ -345,7 +377,15 @@ pub fn build_model(graph: ParsedGraph, schema_name: String, options: &ModelOptio
             is_relay: false,
         };
         let mut rows: Vec<Row> = Vec::new();
+        let mut row_map: Vec<Option<u32>> = Vec::new();
         for f in n.fields.as_deref().unwrap_or(&[]) {
+            if options.hide_primitive_fields
+                && BUILTIN_SCALARS.contains(&f.type_name.as_str())
+            {
+                row_map.push(None);
+                continue;
+            }
+            row_map.push(Some(rows.len() as u32));
             let mut r = base_row(
                 RowKind::Field,
                 f.name.clone().into(),
@@ -361,6 +401,7 @@ pub fn build_model(graph: ParsedGraph, schema_name: String, options: &ModelOptio
             rows.push(r);
         }
         for v in n.values.as_deref().unwrap_or(&[]) {
+            row_map.push(Some(rows.len() as u32));
             let mut r = base_row(RowKind::EnumValue, v.name.clone().into(), None);
             r.deprecated = v.is_deprecated;
             r.is_overlay = v.is_overlay;
@@ -428,6 +469,7 @@ pub fn build_model(graph: ParsedGraph, schema_name: String, options: &ModelOptio
             h,
             row_h,
             is_overlay: n.is_overlay,
+            row_map,
         });
     }
     let overlay_marks = cards

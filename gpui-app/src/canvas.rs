@@ -158,10 +158,14 @@ impl GraphCanvas {
         cx.notify();
     }
 
-    /// Called from the workspace when the tree selects a type.
+    /// Called from the workspace when the tree selects a type. `row` is in
+    /// graph space (field index, then enum-value index) and is mapped through
+    /// the card's display-row map (primitive fields may be hidden).
     pub fn navigate_to(&mut self, card: u32, row: Option<usize>, cx: &mut Context<Self>) {
         self.pending_center = Some(card);
-        self.pinned = row.map(|r| (card, r));
+        self.pinned = row
+            .and_then(|r| self.model.cards[card as usize].display_row(r))
+            .map(|r| (card, r));
         cx.notify();
     }
 

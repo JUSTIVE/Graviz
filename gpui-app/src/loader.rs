@@ -11,7 +11,11 @@ pub struct LoadedSchema {
     pub diff: Option<OverlayDiff>,
 }
 
-pub fn load(schema_path: &Path, overlay_path: Option<&Path>) -> Result<LoadedSchema> {
+pub fn load(
+    schema_path: &Path,
+    overlay_sdl: Option<&str>,
+    hide_relay: bool,
+) -> Result<LoadedSchema> {
     let sdl = std::fs::read_to_string(schema_path)
         .with_context(|| format!("reading {}", schema_path.display()))?;
     let name = schema_path
@@ -20,7 +24,7 @@ pub fn load(schema_path: &Path, overlay_path: Option<&Path>) -> Result<LoadedSch
         .unwrap_or_else(|| schema_path.display().to_string());
 
     let base_options = SdlToGraphOptions {
-        hide_relay_boilerplate: true,
+        hide_relay_boilerplate: hide_relay,
         ..Default::default()
     };
     let mut graph = graph::sdl_to_graph(&sdl, &base_options);
@@ -29,17 +33,15 @@ pub fn load(schema_path: &Path, overlay_path: Option<&Path>) -> Result<LoadedSch
     }
 
     let mut applied_diff = None;
-    if let Some(overlay_path) = overlay_path {
-        let overlay_sdl = std::fs::read_to_string(overlay_path)
-            .with_context(|| format!("reading {}", overlay_path.display()))?;
-        let prepared = graph::prepare_overlay(&sdl, &overlay_sdl);
+    if let Some(overlay_sdl) = overlay_sdl.filter(|s| !s.trim().is_empty()) {
+        let prepared = graph::prepare_overlay(&sdl, overlay_sdl);
         for w in &prepared.warnings {
             eprintln!("overlay warning: {w}");
         }
         let merged = graph::sdl_to_graph(
             &prepared.sdl,
             &SdlToGraphOptions {
-                hide_relay_boilerplate: true,
+                hide_relay_boilerplate: hide_relay,
                 remove: prepared.removals,
                 override_duplicates: true,
             },
@@ -65,7 +67,7 @@ pub fn load(schema_path: &Path, overlay_path: Option<&Path>) -> Result<LoadedSch
 }
 
 /// Combined mtime fingerprint of the schema + overlay files.
-pub fn fingerprint(schema_path: &Path, overlay_path: Option<&Path>) -> u128 {
+pub fn fingerprint(schema_path: &Path) -> u128 {
     fn mtime(p: &Path) -> u128 {
         std::fs::metadata(p)
             .and_then(|m| m.modified())
@@ -74,5 +76,5 @@ pub fn fingerprint(schema_path: &Path, overlay_path: Option<&Path>) -> u128 {
             .map(|d| d.as_millis())
             .unwrap_or(0)
     }
-    mtime(schema_path) ^ overlay_path.map(mtime).unwrap_or(0).rotate_left(1)
+    mtime(schema_path)
 }
