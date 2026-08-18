@@ -1,0 +1,12 @@
+[package]
+name = "gompass-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+async-graphql-parser = "7"
+# Directive arguments are `async_graphql_value::ConstValue`; the parser does
+# not re-export the type, so reading `@deprecated(reason:)` needs it by name.
+# Already in the tree as a dependency of the parser — no new code pulled in.
+async-graphql-value = "7"
+anyhow = "1"
