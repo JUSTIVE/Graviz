@@ -169,7 +169,6 @@ impl Workspace {
             canvas.set_model(model, cx);
             canvas.set_investigate(self.investigate, cx);
         });
-        self.save_settings();
         cx.notify();
     }
 
@@ -313,6 +312,7 @@ impl Render for Workspace {
                 |this, _, cx| {
                     this.options.show_descriptions = !this.options.show_descriptions;
                     this.rebuild(cx);
+                    this.save_settings();
                 },
                 cx,
             ))
@@ -323,6 +323,7 @@ impl Render for Workspace {
                 |this, _, cx| {
                     this.options.bundle_edges = !this.options.bundle_edges;
                     this.rebuild(cx);
+                    this.save_settings();
                 },
                 cx,
             ))
@@ -505,10 +506,12 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &ToggleDescriptions, _, cx| {
                 this.options.show_descriptions = !this.options.show_descriptions;
                 this.rebuild(cx);
+                this.save_settings();
             }))
             .on_action(cx.listener(|this, _: &ToggleBundling, _, cx| {
                 this.options.bundle_edges = !this.options.bundle_edges;
                 this.rebuild(cx);
+                this.save_settings();
             }))
             .on_action(cx.listener(|this, _: &ToggleInvestigate, _, cx| {
                 this.investigate = !this.investigate;

@@ -307,7 +307,7 @@ pub fn slice_graph(full: &ParsedGraph, mode: Mode) -> ParsedGraph {
     }
 }
 
-fn mono_w(text: &str, font_px: f32) -> f32 {
+pub fn mono_w(text: &str, font_px: f32) -> f32 {
     text.chars().count() as f32 * font_px * MONO_ADVANCE
 }
 

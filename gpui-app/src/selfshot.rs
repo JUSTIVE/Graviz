@@ -100,10 +100,15 @@ pub fn arm_if_requested() {
     };
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_secs(4));
-        if let Err(e) = capture_to(&path) {
-            eprintln!("selfshot failed: {e:#}");
-            std::process::exit(1);
+        for attempt in 0..3 {
+            match capture_to(&path) {
+                Ok(()) => std::process::exit(0),
+                Err(e) if attempt == 2 => {
+                    eprintln!("selfshot failed: {e:#}");
+                    std::process::exit(1);
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_secs(1)),
+            }
         }
-        std::process::exit(0);
     });
 }

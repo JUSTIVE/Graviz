@@ -22,10 +22,12 @@ use std::rc::Rc;
 const ZOOM_MIN: f32 = 0.01;
 const ZOOM_MAX: f32 = 4.0;
 const CLICK_DRAG_THRESHOLD: f32 = 4.0;
-/// Below this zoom, rows are not drawn (and not clickable).
-const LOD_ROWS: f32 = 0.35;
+/// Below this zoom, row text gives way to placeholder bars.
+const LOD_ROWS: f32 = 0.12;
+/// Below this zoom, rows are not drawn at all (sub-pixel pitch).
+const LOD_ROW_BARS: f32 = 0.075;
 /// Below this zoom, header text is not drawn.
-const LOD_HEADER: f32 = 0.12;
+const LOD_HEADER: f32 = 0.03;
 
 #[derive(Clone, Copy, PartialEq)]
 pub struct ViewTransform {
@@ -79,12 +81,23 @@ pub struct GraphCanvas {
 
 impl GraphCanvas {
     pub fn new(model: Rc<Model>) -> Self {
+        // Debug: GOMPASS_VIEW="x,y,k" presets the transform (skips auto-fit)
+        // so selfshots can reproduce specific view states.
+        let preset = std::env::var("GOMPASS_VIEW").ok().and_then(|s| {
+            let mut it = s.split(',').map(|v| v.trim().parse::<f32>());
+            match (it.next(), it.next(), it.next()) {
+                (Some(Ok(x)), Some(Ok(y)), Some(Ok(k))) => {
+                    Some(ViewTransform { x, y, k })
+                }
+                _ => None,
+            }
+        });
         Self {
             model,
-            view: ViewTransform { x: 40.0, y: 40.0, k: 1.0 },
+            view: preset.unwrap_or(ViewTransform { x: 40.0, y: 40.0, k: 1.0 }),
             hover: None,
             drag: None,
-            fitted: false,
+            fitted: preset.is_some(),
             focus: None,
             pending_center: None,
             pinned: None,
@@ -466,8 +479,16 @@ impl Render for GraphCanvas {
                         canvas_origin
                             .set((f32::from(bounds.origin.x), f32::from(bounds.origin.y)));
                         let t0 = std::time::Instant::now();
-                        paint_scene(
-                            &model, view, hover, focus, pinned, investigate, bounds, window, cx,
+                        // Clip all canvas painting to the element bounds —
+                        // paint_layer orders, only a content mask clips.
+                        window.with_content_mask(
+                            Some(gpui::ContentMask { bounds }),
+                            |window| {
+                                paint_scene(
+                                    &model, view, hover, focus, pinned, investigate, bounds,
+                                    window, cx,
+                                );
+                            },
                         );
                         let ms = t0.elapsed().as_secs_f32() * 1000.0;
                         let prev = frame_ms.get();
@@ -852,6 +873,37 @@ fn paint_scene(
             .is_err() as usize;
 
         if k < LOD_ROWS {
+            // Placeholder bars stand in for row text so zoomed-out cards keep
+            // their texture (the web app's "bar" sprite LOD).
+            if k >= LOD_ROW_BARS {
+                let bar_h = (ROW_FONT_PX * k).max(1.0);
+                for (ri, row) in card.rows.iter().enumerate() {
+                    let by = pos.y + card.row_y(ri) + (card.row_h - ROW_FONT_PX) / 2.0;
+                    let left_w = crate::model::mono_w(&row.left, ROW_FONT_PX)
+                        .min(card.w * 0.55);
+                    window.paint_quad(fill(
+                        Bounds {
+                            origin: to_screen(pos.x + CARD_PAD_X, by),
+                            size: size(px(left_w * k), px(bar_h)),
+                        },
+                        th.text_muted.opacity(0.3),
+                    ));
+                    if !row.right.is_empty() {
+                        let right_w = crate::model::mono_w(&row.right, ROW_FONT_PX)
+                            .min(card.w * 0.4);
+                        window.paint_quad(fill(
+                            Bounds {
+                                origin: to_screen(
+                                    pos.x + card.w - CARD_PAD_X - right_w,
+                                    by,
+                                ),
+                                size: size(px(right_w * k), px(bar_h)),
+                            },
+                            th.type_amber.opacity(0.25),
+                        ));
+                    }
+                }
+            }
             continue;
         }
         let row_size = px(ROW_FONT_PX * kt);
