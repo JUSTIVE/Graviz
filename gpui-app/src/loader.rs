@@ -1,12 +1,14 @@
 //! Schema loading: SDL file (+ optional overlay file) → marked ParsedGraph.
 
 use anyhow::{bail, Context, Result};
-use gompass_core::graph::{self, ParsedGraph, SdlToGraphOptions};
+use gompass_core::graph::{self, OverlayDiff, ParsedGraph, SdlToGraphOptions};
 use std::path::Path;
 
 pub struct LoadedSchema {
     pub graph: ParsedGraph,
     pub name: String,
+    /// Present when an overlay was applied.
+    pub diff: Option<OverlayDiff>,
 }
 
 pub fn load(schema_path: &Path, overlay_path: Option<&Path>) -> Result<LoadedSchema> {
@@ -26,6 +28,7 @@ pub fn load(schema_path: &Path, overlay_path: Option<&Path>) -> Result<LoadedSch
         bail!("schema parse error: {err}");
     }
 
+    let mut applied_diff = None;
     if let Some(overlay_path) = overlay_path {
         let overlay_sdl = std::fs::read_to_string(overlay_path)
             .with_context(|| format!("reading {}", overlay_path.display()))?;
@@ -54,9 +57,11 @@ pub fn load(schema_path: &Path, overlay_path: Option<&Path>) -> Result<LoadedSch
             diff.removed_fields.len(),
         );
         graph = marked;
+        applied_diff = Some(diff);
     }
 
-    Ok(LoadedSchema { graph, name })
+    crate::config::push_recent(schema_path);
+    Ok(LoadedSchema { graph, name, diff: applied_diff })
 }
 
 /// Combined mtime fingerprint of the schema + overlay files.

@@ -4,11 +4,12 @@
 //! ⌘I investigate, ⌘O open, ⌘[ back).
 
 use crate::canvas::GraphCanvas;
+use crate::config;
 use crate::loader;
-use crate::model::{build_model, slice_graph, Mode, ModelOptions};
-use crate::tree::{TreeEvent, TreePanel};
-use gompass_core::graph::ParsedGraph;
+use crate::model::{build_model, slice_graph, Mode, Model, ModelOptions};
 use crate::theme::Theme;
+use crate::tree::{TreeEvent, TreePanel};
+use gompass_core::graph::{OverlayDiff, ParsedGraph};
 use gpui::{
     actions, div, prelude::*, px, App, Context, Entity, KeyBinding, PathPromptOptions,
     SharedString, Window,
@@ -25,7 +26,9 @@ actions!(
         ToggleDescriptions,
         ToggleBundling,
         ToggleInvestigate,
+        ToggleOverlayDock,
         OpenSchema,
+        OpenOverlay,
         Back
     ]
 );
@@ -37,7 +40,9 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-d", ToggleDescriptions, None),
         KeyBinding::new("cmd-e", ToggleBundling, None),
         KeyBinding::new("cmd-i", ToggleInvestigate, None),
+        KeyBinding::new("cmd-u", ToggleOverlayDock, None),
         KeyBinding::new("cmd-o", OpenSchema, None),
+        KeyBinding::new("cmd-shift-o", OpenOverlay, None),
         KeyBinding::new("cmd-[", Back, None),
     ]);
 }
@@ -53,6 +58,10 @@ pub struct Workspace {
     tree: Entity<TreePanel>,
     canvas: Entity<GraphCanvas>,
     sidebar_open: bool,
+    /// Latest built model, for name→card navigation from the overlay dock.
+    model: Rc<Model>,
+    overlay_diff: Option<OverlayDiff>,
+    dock_open: bool,
 }
 
 impl Workspace {
@@ -63,7 +72,13 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Self {
         let mode = Mode::Reachable;
-        let mut options = ModelOptions::default();
+        let settings = config::load_settings();
+        let mut options = ModelOptions {
+            show_descriptions: settings.show_descriptions,
+            bundle_edges: settings.bundle_edges,
+            ..Default::default()
+        };
+        let sidebar_open = settings.sidebar_open;
         // Debug presets so automated selfshots can exercise toggle states.
         if std::env::var("GOMPASS_DESC").is_ok() {
             options.show_descriptions = true;
@@ -76,7 +91,7 @@ impl Workspace {
         ));
         let tree = cx.new(|cx| TreePanel::new(model.clone(), cx));
         let canvas = cx.new(|cx| {
-            let mut c = GraphCanvas::new(model);
+            let mut c = GraphCanvas::new(model.clone());
             c.set_investigate(investigate, cx);
             c
         });
@@ -92,28 +107,30 @@ impl Workspace {
 
         // Watch the schema (and overlay) file and hot-reload on change — the
         // native replacement for the web app's File System Access "linked
-        // file" flow.
-        {
-            let schema_path = schema_path.clone();
-            let overlay_path = overlay_path.clone();
-            cx.spawn(async move |this, cx| {
-                let mut last = loader::fingerprint(&schema_path, overlay_path.as_deref());
-                loop {
-                    cx.background_executor().timer(Duration::from_secs(1)).await;
-                    let cur = loader::fingerprint(&schema_path, overlay_path.as_deref());
-                    if cur != last {
-                        last = cur;
-                        if this
-                            .update(cx, |this: &mut Self, cx| this.reload_from_disk(cx))
-                            .is_err()
-                        {
-                            break;
-                        }
+        // file" flow. Paths are re-read from the entity each tick so ⌘O /
+        // overlay changes are picked up.
+        cx.spawn(async move |this, cx| {
+            let mut last = 0u128;
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                let Ok((schema, overlay)) = this.update(cx, |this: &mut Self, _| {
+                    (this.schema_path.clone(), this.overlay_path.clone())
+                }) else {
+                    break;
+                };
+                let cur = loader::fingerprint(&schema, overlay.as_deref());
+                if last != 0 && cur != last {
+                    if this
+                        .update(cx, |this: &mut Self, cx| this.reload_from_disk(cx))
+                        .is_err()
+                    {
+                        break;
                     }
                 }
-            })
-            .detach();
-        }
+                last = cur;
+            }
+        })
+        .detach();
 
         Self {
             schema_path,
@@ -125,8 +142,19 @@ impl Workspace {
             investigate,
             tree,
             canvas,
-            sidebar_open: true,
+            sidebar_open,
+            model,
+            overlay_diff: loaded.diff,
+            dock_open: std::env::var("GOMPASS_DOCK").is_ok(),
         }
+    }
+
+    fn save_settings(&self) {
+        config::save_settings(&config::Settings {
+            show_descriptions: self.options.show_descriptions,
+            bundle_edges: self.options.bundle_edges,
+            sidebar_open: self.sidebar_open,
+        });
     }
 
     fn rebuild(&mut self, cx: &mut Context<Self>) {
@@ -135,11 +163,13 @@ impl Workspace {
             self.schema_name.clone(),
             &self.options,
         ));
+        self.model = model.clone();
         self.tree.update(cx, |tree, cx| tree.set_model(model.clone(), cx));
         self.canvas.update(cx, |canvas, cx| {
             canvas.set_model(model, cx);
             canvas.set_investigate(self.investigate, cx);
         });
+        self.save_settings();
         cx.notify();
     }
 
@@ -149,9 +179,45 @@ impl Workspace {
                 eprintln!("reloaded {}", self.schema_path.display());
                 self.full_graph = loaded.graph;
                 self.schema_name = loaded.name;
+                self.overlay_diff = loaded.diff;
                 self.rebuild(cx);
             }
             Err(e) => eprintln!("reload failed: {e:#}"),
+        }
+    }
+
+    fn set_overlay(&mut self, path: Option<PathBuf>, cx: &mut Context<Self>) {
+        self.overlay_path = path;
+        if self.overlay_path.is_none() {
+            self.overlay_diff = None;
+        }
+        self.dock_open = true;
+        self.reload_from_disk(cx);
+    }
+
+    fn open_overlay(&mut self, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Choose overlay SDL".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(mut paths))) = rx.await {
+                if let Some(path) = paths.pop() {
+                    let _ = this.update(cx, |this: &mut Self, cx| {
+                        this.set_overlay(Some(path), cx);
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn navigate_to_type(&mut self, name: &str, cx: &mut Context<Self>) {
+        if let Some(&card) = self.model.index_of.get(name) {
+            self.canvas
+                .update(cx, |canvas, cx| canvas.navigate_to(card, None, cx));
         }
     }
 
@@ -271,7 +337,130 @@ impl Render for Workspace {
                         .update(cx, |canvas, cx| canvas.set_investigate(investigate, cx));
                 },
                 cx,
+            ))
+            .child(self.toggle_button(
+                th,
+                "Overlay",
+                self.dock_open,
+                |this, _, cx| {
+                    this.dock_open = !this.dock_open;
+                    cx.notify();
+                },
+                cx,
             ));
+
+        let dock = self.dock_open.then(|| {
+            let overlay_label: SharedString = self
+                .overlay_path
+                .as_ref()
+                .map(|p| SharedString::from(p.display().to_string()))
+                .unwrap_or_else(|| "no overlay file".into());
+            let diff = self.overlay_diff.clone();
+            let section = |title: &'static str,
+                           color: gpui::Hsla,
+                           items: Vec<String>,
+                           cx: &mut Context<Self>| {
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(color)
+                            .child(SharedString::from(format!("{title} · {}", items.len()))),
+                    )
+                    .children(items.into_iter().take(8).enumerate().map(|(i, name)| {
+                        let type_name: String =
+                            name.split('.').next().unwrap_or(&name).to_string();
+                        div()
+                            .id((title, i))
+                            .text_xs()
+                            .font_family("Menlo")
+                            .text_color(th.text_muted)
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .cursor_pointer()
+                            .hover(|el| el.bg(th.hover_bg))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.navigate_to_type(&type_name, cx)
+                            }))
+                            .child(SharedString::from(name))
+                    }))
+            };
+            div()
+                .absolute()
+                .bottom_0()
+                .left_0()
+                .right_0()
+                .h(px(190.0))
+                .bg(th.chrome_bg)
+                .border_t_1()
+                .border_color(th.panel_border)
+                .shadow_lg()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .p_3()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(div().text_sm().text_color(th.text).child("Overlay"))
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_family("Menlo")
+                                .text_color(th.text_faint)
+                                .whitespace_nowrap()
+                                .overflow_hidden()
+                                .child(overlay_label),
+                        )
+                        .child(div().flex_1())
+                        .child(self.toggle_button(
+                            th,
+                            "Choose… ⌘⇧O",
+                            false,
+                            |this, _, cx| this.open_overlay(cx),
+                            cx,
+                        ))
+                        .when(self.overlay_path.is_some(), |el| {
+                            el.child(self.toggle_button(
+                                th,
+                                "Clear",
+                                false,
+                                |this, _, cx| this.set_overlay(None, cx),
+                                cx,
+                            ))
+                        }),
+                )
+                .child(match diff {
+                    Some(d) => div()
+                        .flex()
+                        .gap_4()
+                        .min_h_0()
+                        .child(section("added types", th.overlay_green, d.added_types, cx))
+                        .child(section("added fields", th.overlay_green, d.added_fields, cx))
+                        .child(section("changed", th.accent, d.changed_fields, cx))
+                        .child(section(
+                            "removed",
+                            th.red,
+                            d.removed_types
+                                .into_iter()
+                                .chain(d.removed_fields)
+                                .collect(),
+                            cx,
+                        )),
+                    None => div().text_xs().text_color(th.text_faint).child(
+                        "Choose an overlay SDL to augment / override / remove types on top \
+                         of the loaded schema. Lines like `- Type.field` remove members. \
+                         The file is watched — edits apply live.",
+                    ),
+                })
+        });
 
         let breadcrumb = {
             let names = self.canvas.read(cx).history_names();
@@ -310,6 +499,7 @@ impl Render for Workspace {
                 let offset = if this.sidebar_open { 300.0 } else { 0.0 };
                 this.canvas
                     .update(cx, |canvas, cx| canvas.set_pane_offset(offset, cx));
+                this.save_settings();
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ToggleDescriptions, _, cx| {
@@ -327,6 +517,11 @@ impl Render for Workspace {
                     .update(cx, |canvas, cx| canvas.set_investigate(investigate, cx));
             }))
             .on_action(cx.listener(|this, _: &OpenSchema, _, cx| this.open_schema(cx)))
+            .on_action(cx.listener(|this, _: &OpenOverlay, _, cx| this.open_overlay(cx)))
+            .on_action(cx.listener(|this, _: &ToggleOverlayDock, _, cx| {
+                this.dock_open = !this.dock_open;
+                cx.notify();
+            }))
             .on_action(cx.listener(|this, _: &Back, _, cx| {
                 this.canvas.update(cx, |canvas, cx| canvas.go_back(cx));
             }))
@@ -341,7 +536,8 @@ impl Render for Workspace {
                     .relative()
                     .child(self.canvas.clone())
                     .child(toolbar)
-                    .when_some(breadcrumb, |el, b| el.child(b)),
+                    .when_some(breadcrumb, |el, b| el.child(b))
+                    .when_some(dock, |el, d| el.child(d)),
             )
     }
 }
