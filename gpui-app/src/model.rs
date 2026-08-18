@@ -41,6 +41,7 @@ pub struct Row {
     pub target: Option<u32>,
     pub deprecated: bool,
     pub is_overlay: bool,
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -267,6 +268,7 @@ pub fn build_model(graph: ParsedGraph, schema_name: String) -> Model {
                 target: index_of.get(&f.type_name).copied(),
                 deprecated: f.is_deprecated,
                 is_overlay: f.is_overlay,
+                description: f.description.clone(),
             });
         }
         for v in n.values.as_deref().unwrap_or(&[]) {
@@ -277,6 +279,7 @@ pub fn build_model(graph: ParsedGraph, schema_name: String) -> Model {
                 target: None,
                 deprecated: v.is_deprecated,
                 is_overlay: false,
+                description: v.description.clone(),
             });
         }
         for m in n.members.as_deref().unwrap_or(&[]) {
@@ -287,6 +290,7 @@ pub fn build_model(graph: ParsedGraph, schema_name: String) -> Model {
                 target: index_of.get(m).copied(),
                 deprecated: false,
                 is_overlay: false,
+                description: None,
             });
         }
         for iface in n.interfaces.as_deref().unwrap_or(&[]) {
@@ -297,6 +301,7 @@ pub fn build_model(graph: ParsedGraph, schema_name: String) -> Model {
                 target: index_of.get(iface).copied(),
                 deprecated: false,
                 is_overlay: false,
+                description: None,
             });
         }
         for u in n.member_of_unions.as_deref().unwrap_or(&[]) {
@@ -307,6 +312,7 @@ pub fn build_model(graph: ParsedGraph, schema_name: String) -> Model {
                 target: index_of.get(u).copied(),
                 deprecated: false,
                 is_overlay: false,
+                description: None,
             });
         }
 

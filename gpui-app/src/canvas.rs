@@ -224,11 +224,18 @@ impl GraphCanvas {
             Some(Hover { card, row: Some(row) }) => {
                 let c = &m.cards[card as usize];
                 let r = &c.rows[row];
-                if r.right.is_empty() {
+                let mut line = if r.right.is_empty() {
                     format!("{base}   —   {}::{}", c.name, r.left)
                 } else {
                     format!("{base}   —   {}.{}: {}", c.name, r.left, r.right)
+                };
+                if let Some(desc) = &r.description {
+                    let one_line: String = desc.split_whitespace().collect::<Vec<_>>().join(" ");
+                    let excerpt: String = one_line.chars().take(120).collect();
+                    let ellipsis = if one_line.chars().count() > 120 { "…" } else { "" };
+                    line.push_str(&format!("   “{excerpt}{ellipsis}”"));
                 }
+                line
             }
             Some(Hover { card, row: None }) => {
                 let c = &m.cards[card as usize];
@@ -397,13 +404,23 @@ fn paint_scene(
         EdgeGroup::Arg,
     ];
     let stroke_w = (1.5 * k).clamp(0.6, 2.5);
-    for group in groups {
+    // With a focused card, incident edges stay bright and the rest dim —
+    // the web app's focus behavior, minus its re-tessellation dodge.
+    for (group, dim_pass) in groups.iter().flat_map(|&g| [(g, false), (g, true)]) {
+        if dim_pass && focus.is_none() {
+            continue;
+        }
         let mut builder = PathBuilder::stroke(px(stroke_w));
         let mut any = false;
         let mut arrows = PathBuilder::fill();
         let mut any_arrow = false;
         for e in &model.edges {
             if e.group != group {
+                continue;
+            }
+            let dimmed =
+                matches!(focus, Some(f) if e.from != f && e.to != f);
+            if dimmed != dim_pass {
                 continue;
             }
             if e.bbox[2] < wx0 || e.bbox[0] > wx1 || e.bbox[3] < wy0 || e.bbox[1] > wy1 {
@@ -433,14 +450,19 @@ fn paint_scene(
             arrows.close();
             any_arrow = true;
         }
+        let color = if dim_pass {
+            edge_color(group).opacity(0.22)
+        } else {
+            edge_color(group)
+        };
         if any {
             if let Ok(path) = builder.build() {
-                window.paint_path(path, edge_color(group));
+                window.paint_path(path, color);
             }
         }
         if any_arrow {
             if let Ok(path) = arrows.build() {
-                window.paint_path(path, edge_color(group));
+                window.paint_path(path, color);
             }
         }
     }
