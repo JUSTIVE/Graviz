@@ -4,14 +4,21 @@
 //! - [`parse_until`] / [`is_until_expired`] — deprecation sunset dates (`until.ts`)
 //! - [`reachable_from`] / [`all_reachable_ids`] — root-relative reachability (`reachable.ts`)
 //! - [`weakly_connected_components`] — union-find islands (`components.ts`)
+//! - [`prepare_overlay`] / [`mark_overlay`] — scratch SDL laid over the loaded
+//!   schema (`overlay.ts`)
 
 mod components;
+mod overlay;
 mod reachable;
 mod sdl;
 mod types;
 mod until;
 
 pub use components::{weakly_connected_components, Component};
+pub use overlay::{
+    declared_members, declared_type_names, mark_overlay, merge_sdl, prepare_overlay,
+    rewrite_overlay, MemberNames, OverlayDiff, PreparedOverlay,
+};
 pub use reachable::{
     all_reachable_ids, default_root_ops, reachable_from, ReachableSubgraph, ROOT_OPS,
 };

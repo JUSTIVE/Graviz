@@ -54,6 +54,8 @@ pub struct Card {
     pub rows: Vec<Row>,
     pub w: f32,
     pub h: f32,
+    /// Whole type came from the overlay SDL.
+    pub is_overlay: bool,
 }
 
 impl Card {
@@ -112,6 +114,8 @@ pub struct Model {
     pub world_h: f32,
     pub index_of: HashMap<String, u32>,
     pub schema_name: String,
+    /// Count of overlay-marked cards + rows (0 when no overlay is applied).
+    pub overlay_marks: usize,
 }
 
 /// The three canvas modes of the web app's `/view` tabs.
@@ -334,8 +338,13 @@ pub fn build_model(graph: ParsedGraph, schema_name: String) -> Model {
             rows,
             w,
             h,
+            is_overlay: n.is_overlay,
         });
     }
+    let overlay_marks = cards
+        .iter()
+        .map(|c| c.is_overlay as usize + c.rows.iter().filter(|r| r.is_overlay).count())
+        .sum();
 
     // ---- layout ----
     let layout_nodes: Vec<LayoutNode> =
@@ -401,6 +410,7 @@ pub fn build_model(graph: ParsedGraph, schema_name: String) -> Model {
         world_h: result.height,
         index_of,
         schema_name,
+        overlay_marks,
         graph,
     }
 }

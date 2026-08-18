@@ -39,7 +39,11 @@ gpui-app/
 - [x] 트리 패널 — uniform_list + 키 캡처 검색, ↑/↓/Enter, 클릭 → 캔버스 포커스
 - [x] Cmd+K 검색 포커스, Cmd+B 사이드바 토글
 - [x] 모드 탭 (Reachable / Orphaned / Deprecated) — 모드 전환 = 슬라이스 후 전체 재레이아웃(~10ms)
+- [x] SDL 오버레이 엔진 — overlay.ts 충실 포팅 (62 테스트) + `--overlay <file>` CLI 통합,
+      오버레이 카드 에메랄드 대시 보더 / 추가·변경 행 거터 마커 / 상태바 카운트
+- [ ] 오버레이 하단 도크(인앱 SDL 에디터) — 현재는 파일 기반(`--overlay`)
 - [ ] kind 필터 칩, referencedBy 패널, 포커스 스택/브레드크럼
+- [ ] 랜딩 화면(파일 드롭/히스토리), 라이트 테마, 설정 영속화
 - [ ] SDL 오버레이 (overlay.ts 포팅 + 하단 도크 + diff 하이라이트)
 - [ ] 랜딩(파일 열기/드롭/히스토리), 테마, 설정 영속화
 - [ ] 필드 툴팁/설명 표시, Investigate 모드, 엣지 번들 토글

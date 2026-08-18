@@ -213,13 +213,16 @@ impl GraphCanvas {
 
     fn status_line(&self) -> String {
         let m = &self.model;
-        let base = format!(
+        let mut base = format!(
             "{}  ·  {} types  ·  {} edges  ·  {:.0}%",
             m.schema_name,
             m.cards.len(),
             m.edges.len(),
             self.view.k * 100.0
         );
+        if m.overlay_marks > 0 {
+            base.push_str(&format!("  ·  overlay +{}", m.overlay_marks));
+        }
         match self.hover {
             Some(Hover { card, row: Some(row) }) => {
                 let c = &m.cards[card as usize];
@@ -291,6 +294,11 @@ fn edge_color(group: EdgeGroup) -> Hsla {
         EdgeGroup::Arg => c.opacity(0.55),
         _ => c.opacity(0.85),
     }
+}
+
+fn overlay_green() -> Hsla {
+    let c: Hsla = rgb(0x34d399).into();
+    c
 }
 
 fn mono(weight: FontWeight) -> Font {
@@ -486,14 +494,21 @@ fn paint_scene(
         let is_hovered = matches!(hover, Some(h) if h.card == i as u32);
         let is_focused = focus == Some(i as u32);
         let radius = px(6.0 * k);
-        let border_w = if is_focused { 2.0 } else { 1.25 };
+        let border_w = if is_focused || card.is_overlay { 2.0 } else { 1.25 };
+        let border_color = if card.is_overlay {
+            overlay_green()
+        } else if is_focused || is_hovered {
+            kc
+        } else {
+            pal.card_border
+        };
         window.paint_quad(quad(
             card_bounds,
             Corners::all(radius),
             pal.card_bg,
             Edges::all(px((border_w * k).clamp(0.5, 3.0))),
-            if is_focused || is_hovered { kc } else { pal.card_border },
-            BorderStyle::Solid,
+            border_color,
+            if card.is_overlay { BorderStyle::Dashed } else { BorderStyle::Solid },
         ));
         // header band
         let header_bounds = Bounds {
@@ -513,6 +528,19 @@ fn paint_scene(
             gpui::transparent_black(),
             BorderStyle::Solid,
         ));
+
+        // overlay row gutter markers
+        if !card.is_overlay {
+            for (ri, row) in card.rows.iter().enumerate() {
+                if row.is_overlay {
+                    let gutter = Bounds {
+                        origin: to_screen(pos.x + 2.0, pos.y + card.row_y(ri) + 2.0),
+                        size: size(px(3.0 * k), px((ROW_H - 4.0) * k)),
+                    };
+                    window.paint_quad(fill(gutter, overlay_green()));
+                }
+            }
+        }
 
         // pinned row (search hit) highlight
         if let Some((pc, row)) = pinned {
