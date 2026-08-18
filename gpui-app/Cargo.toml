@@ -8,9 +8,16 @@ edition = "2021"
 
 [dependencies]
 gpui = { git = "https://github.com/zed-industries/zed" }
-gpui_platform = { git = "https://github.com/zed-industries/zed" }
+# font-kit is NOT in gpui_platform's default features — without it macOS falls
+# back to a placeholder text system that lays out text but renders no glyphs.
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
 gompass-core = { path = "core" }
 anyhow = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.24"
+core-foundation = "0.10"
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [profile.dev]
 opt-level = 1

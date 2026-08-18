@@ -1,10 +1,33 @@
 mod canvas;
 mod model;
+#[cfg(target_os = "macos")]
+mod selfshot;
 mod tree;
 mod workspace;
 
 use workspace::Workspace;
 use gpui::{prelude::*, px, size, App, Bounds, WindowBounds, WindowOptions};
+
+/// Prints whether monospace text actually shapes into glyphs on this system —
+/// a zero width means the font never resolved and canvas text would be
+/// invisible without any paint error.
+fn font_probe(window: &gpui::Window) {
+    for family in ["Menlo", "Monaco", "Courier New"] {
+        let text: gpui::SharedString = "QueryMutation".into();
+        let run = gpui::TextRun {
+            len: text.len(),
+            font: gpui::font(family),
+            color: gpui::black(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let line = window
+            .text_system()
+            .shape_line(text, px(13.0), &[run], None);
+        eprintln!("font probe: {family} -> width {:?}", line.width);
+    }
+}
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -88,6 +111,9 @@ fn main() {
         graph.edges.len(),
     );
 
+    #[cfg(target_os = "macos")]
+    selfshot::arm_if_requested();
+
     gpui_platform::application().run(move |cx: &mut App| {
         workspace::init(cx);
         let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
@@ -96,7 +122,10 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_, cx| cx.new(|cx| Workspace::new(graph, schema_name, cx)),
+            |window, cx| {
+                font_probe(window);
+                cx.new(|cx| Workspace::new(graph, schema_name, cx))
+            },
         )
         .unwrap();
         cx.activate(true);
