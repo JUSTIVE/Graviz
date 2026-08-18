@@ -1,0 +1,73 @@
+//! Schema loading: SDL file (+ optional overlay file) → marked ParsedGraph.
+
+use anyhow::{bail, Context, Result};
+use gompass_core::graph::{self, ParsedGraph, SdlToGraphOptions};
+use std::path::Path;
+
+pub struct LoadedSchema {
+    pub graph: ParsedGraph,
+    pub name: String,
+}
+
+pub fn load(schema_path: &Path, overlay_path: Option<&Path>) -> Result<LoadedSchema> {
+    let sdl = std::fs::read_to_string(schema_path)
+        .with_context(|| format!("reading {}", schema_path.display()))?;
+    let name = schema_path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| schema_path.display().to_string());
+
+    let base_options = SdlToGraphOptions {
+        hide_relay_boilerplate: true,
+        ..Default::default()
+    };
+    let mut graph = graph::sdl_to_graph(&sdl, &base_options);
+    if let Some(err) = &graph.error {
+        bail!("schema parse error: {err}");
+    }
+
+    if let Some(overlay_path) = overlay_path {
+        let overlay_sdl = std::fs::read_to_string(overlay_path)
+            .with_context(|| format!("reading {}", overlay_path.display()))?;
+        let prepared = graph::prepare_overlay(&sdl, &overlay_sdl);
+        for w in &prepared.warnings {
+            eprintln!("overlay warning: {w}");
+        }
+        let merged = graph::sdl_to_graph(
+            &prepared.sdl,
+            &SdlToGraphOptions {
+                hide_relay_boilerplate: true,
+                remove: prepared.removals,
+                override_duplicates: true,
+            },
+        );
+        if let Some(err) = &merged.error {
+            bail!("overlay parse error: {err}");
+        }
+        let (marked, diff) = graph::mark_overlay(&graph, merged);
+        eprintln!(
+            "overlay: +{} types, +{} fields, ~{} fields, -{} types, -{} fields",
+            diff.added_types.len(),
+            diff.added_fields.len(),
+            diff.changed_fields.len(),
+            diff.removed_types.len(),
+            diff.removed_fields.len(),
+        );
+        graph = marked;
+    }
+
+    Ok(LoadedSchema { graph, name })
+}
+
+/// Combined mtime fingerprint of the schema + overlay files.
+pub fn fingerprint(schema_path: &Path, overlay_path: Option<&Path>) -> u128 {
+    fn mtime(p: &Path) -> u128 {
+        std::fs::metadata(p)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    }
+    mtime(schema_path) ^ overlay_path.map(mtime).unwrap_or(0).rotate_left(1)
+}

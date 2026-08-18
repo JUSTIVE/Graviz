@@ -41,9 +41,19 @@ gpui-app/
 - [x] 모드 탭 (Reachable / Orphaned / Deprecated) — 모드 전환 = 슬라이스 후 전체 재레이아웃(~10ms)
 - [x] SDL 오버레이 엔진 — overlay.ts 충실 포팅 (62 테스트) + `--overlay <file>` CLI 통합,
       오버레이 카드 에메랄드 대시 보더 / 추가·변경 행 거터 마커 / 상태바 카운트
+- [x] z-order 레이어 분리(엣지 아래/카드 위) + 카드 드롭 섀도 + 크롬 그림자
+- [x] 호버 툴팁 — 필드/헤더 description, deprecation, 화면 가장자리 플립
+- [x] Show descriptions(⌘D) — 행 설명 줄 + 재레이아웃 (ROW_H 16→28)
+- [x] 엣지 번들링(⌘E, 기본 on) — 평행 필드 엣지 병합 (GitHub 스키마 3960→3121)
+- [x] Investigate 모드(⌘I) — 미문서화 타입 빨간 윤곽/행 틱 + 커버리지 % 상태바
+- [x] deprecated/until — 만료 [until] 빨간 타입, Relay 필드 청록 마커
+- [x] kind 필터 칩, referencedBy 상세 패널, 포커스 히스토리 ⌘[ + 브레드크럼
+- [x] 파일 감시 핫 리로드(1s mtime 폴링) + ⌘O 파일 열기 — 웹 linked-file 대응
+- [x] GOMPASS_SELFSHOT=<png> 셀프 스크린샷 (자기 창 캡처, 권한 불필요 — 시각 검증용)
 - [ ] 오버레이 하단 도크(인앱 SDL 에디터) — 현재는 파일 기반(`--overlay`)
-- [ ] kind 필터 칩, referencedBy 패널, 포커스 스택/브레드크럼
-- [ ] 랜딩 화면(파일 드롭/히스토리), 라이트 테마, 설정 영속화
+- [ ] 랜딩 화면(파일 드롭/히스토리 UI), 라이트 테마, 설정 영속화
+- [ ] 레이아웃 밀도/엣지 라우팅 품질 개선, 유사도 힌트, 허브 페이딩
+- [ ] 요소 단위 backdrop blur — GPUI 미지원이라 반투명+그림자로 근사 중
 - [ ] SDL 오버레이 (overlay.ts 포팅 + 하단 도크 + diff 하이라이트)
 - [ ] 랜딩(파일 열기/드롭/히스토리), 테마, 설정 영속화
 - [ ] 필드 툴팁/설명 표시, Investigate 모드, 엣지 번들 토글

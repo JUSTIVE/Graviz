@@ -64,6 +64,14 @@ pub struct GraphCanvas {
     canvas_origin: Rc<Cell<(f32, f32)>>,
     /// EMA of paint_scene duration, for the status bar.
     frame_ms: Rc<Cell<f32>>,
+    /// Cursor position in canvas-local coords, for tooltip placement.
+    hover_pos: Option<(f32, f32)>,
+    /// Focus history for back navigation (⌘[).
+    history: Vec<u32>,
+    /// Skip the history push for the next `center_on` (set by `go_back`).
+    suppress_push: bool,
+    /// Investigate mode: outline types/rows lacking descriptions.
+    investigate: bool,
 }
 
 impl GraphCanvas {
@@ -79,7 +87,36 @@ impl GraphCanvas {
             pinned: None,
             canvas_origin: Rc::new(Cell::new((0.0, 0.0))),
             frame_ms: Rc::new(Cell::new(0.0)),
+            hover_pos: None,
+            history: Vec::new(),
+            suppress_push: false,
+            investigate: false,
         }
+    }
+
+    pub fn set_investigate(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.investigate != on {
+            self.investigate = on;
+            cx.notify();
+        }
+    }
+
+    /// Navigate back to the previously focused card.
+    pub fn go_back(&mut self, cx: &mut Context<Self>) {
+        if let Some(prev) = self.history.pop() {
+            self.pending_center = Some(prev);
+            self.suppress_push = true;
+            cx.notify();
+        }
+    }
+
+    pub fn history_names(&self) -> Vec<gpui::SharedString> {
+        self.history
+            .iter()
+            .rev()
+            .take(6)
+            .map(|&i| self.model.cards[i as usize].name.clone())
+            .collect()
     }
 
     /// Swap in a different slice of the schema (mode change).
@@ -91,6 +128,9 @@ impl GraphCanvas {
         self.focus = None;
         self.pending_center = None;
         self.pinned = None;
+        self.hover_pos = None;
+        self.history.clear();
+        self.suppress_push = false;
         cx.notify();
     }
 
@@ -147,6 +187,17 @@ impl GraphCanvas {
     }
 
     fn center_on(&mut self, card: u32, vw: f32, vh: f32) {
+        if !self.suppress_push {
+            if let Some(f) = self.focus {
+                if f != card {
+                    self.history.push(f);
+                    if self.history.len() > 64 {
+                        self.history.remove(0);
+                    }
+                }
+            }
+        }
+        self.suppress_push = false;
         let c = &self.model.cards[card as usize];
         let p = self.model.positions[card as usize];
         let k = self.view.k.max(0.9);
@@ -205,8 +256,15 @@ impl GraphCanvas {
             }
         } else {
             let hover = self.hit_test(ev.position);
-            if hover != self.hover {
+            let (ox, oy) = self.canvas_origin.get();
+            let pos = (f32::from(ev.position.x) - ox, f32::from(ev.position.y) - oy);
+            let moved = match self.hover_pos {
+                Some((px_, py_)) => (px_ - pos.0).abs() + (py_ - pos.1).abs() > 2.0,
+                None => true,
+            };
+            if hover != self.hover || (hover.is_some() && moved) {
                 self.hover = hover;
+                self.hover_pos = Some(pos);
                 cx.notify();
             }
         }
@@ -246,6 +304,11 @@ impl GraphCanvas {
         let ms = self.frame_ms.get();
         if ms > 0.0 {
             base.push_str(&format!("  ·  {ms:.1}ms"));
+        }
+        if self.investigate {
+            let (documented, total) = m.desc_coverage;
+            let pct = if total > 0 { documented * 100 / total } else { 100 };
+            base.push_str(&format!("  ·  desc {documented}/{total} ({pct}%)"));
         }
         match self.hover {
             Some(Hover { card, row: Some(row) }) => {
@@ -361,6 +424,50 @@ impl Render for GraphCanvas {
         let pinned = self.pinned;
         let canvas_origin = self.canvas_origin.clone();
         let frame_ms = self.frame_ms.clone();
+
+        // Floating tooltip: field/header description + deprecation info.
+        struct Tooltip {
+            title: String,
+            description: Option<String>,
+            deprecation: Option<String>,
+            expired: bool,
+        }
+        let tooltip: Option<Tooltip> = if self.drag.is_some() {
+            None
+        } else {
+            self.hover.and_then(|h| {
+                let card = &self.model.cards[h.card as usize];
+                match h.row {
+                    Some(ri) => {
+                        let row = &card.rows[ri];
+                        let title = if row.right.is_empty() {
+                            format!("{}::{}", card.name, row.left)
+                        } else {
+                            format!("{}.{}: {}", card.name, row.left, row.right)
+                        };
+                        let deprecation = row
+                            .deprecation_reason
+                            .clone()
+                            .or_else(|| row.deprecated.then(|| "deprecated".to_string()));
+                        (row.description.is_some() || deprecation.is_some()).then_some(Tooltip {
+                            title,
+                            description: row.description.clone(),
+                            deprecation,
+                            expired: row.until_expired,
+                        })
+                    }
+                    None => card.description.clone().map(|d| Tooltip {
+                        title: format!("{} {}", card.kind_label, card.name),
+                        description: Some(d),
+                        deprecation: None,
+                        expired: false,
+                    }),
+                }
+            })
+        };
+        let hover_pos = self.hover_pos;
+        let canvas_left = self.canvas_origin.get().0;
+        let investigate = self.investigate;
         let pal = palette();
         let bg = pal.bg;
         let status = self.status_line();
@@ -386,7 +493,9 @@ impl Render for GraphCanvas {
                         canvas_origin
                             .set((f32::from(bounds.origin.x), f32::from(bounds.origin.y)));
                         let t0 = std::time::Instant::now();
-                        paint_scene(&model, view, hover, focus, pinned, bounds, window, cx);
+                        paint_scene(
+                            &model, view, hover, focus, pinned, investigate, bounds, window, cx,
+                        );
                         let ms = t0.elapsed().as_secs_f32() * 1000.0;
                         let prev = frame_ms.get();
                         frame_ms.set(if prev == 0.0 { ms } else { prev * 0.8 + ms * 0.2 });
@@ -402,12 +511,73 @@ impl Render for GraphCanvas {
                     .px_3()
                     .py_1()
                     .rounded_md()
-                    .bg(rgba(0x1a1e26e0))
+                    .bg(rgba(0x1a1e26f0))
+                    .shadow_md()
                     .text_color(pal.text_muted)
                     .text_xs()
                     .font_family("Menlo")
                     .child(SharedString::from(status)),
             )
+            .when_some(tooltip.zip(hover_pos), |el, (tip, (hx, hy))| {
+                let tw = 340.0;
+                let pane_w = vw - canvas_left;
+                let left = if hx + 16.0 + tw > pane_w {
+                    (hx - tw - 12.0).max(4.0)
+                } else {
+                    hx + 16.0
+                };
+                let top = if hy + 160.0 > vh {
+                    (hy - 140.0).max(4.0)
+                } else {
+                    hy + 18.0
+                };
+                el.child(
+                    div()
+                        .absolute()
+                        .left(px(left))
+                        .top(px(top))
+                        .w(px(tw))
+                        .p_2()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(0x2c3340))
+                        .bg(rgba(0x1a1e26f5))
+                        .shadow_lg()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .font_family("Menlo")
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(pal.text)
+                                .child(SharedString::from(tip.title)),
+                        )
+                        .when_some(tip.description, |el, d| {
+                            el.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(pal.text_muted)
+                                    .max_h(px(120.0))
+                                    .overflow_hidden()
+                                    .child(SharedString::from(d)),
+                            )
+                        })
+                        .when_some(tip.deprecation, |el, d| {
+                            let color: Hsla = if tip.expired {
+                                rgb(0xe5534b).into()
+                            } else {
+                                pal.type_amber
+                            };
+                            el.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(color)
+                                    .child(SharedString::from(format!("⚠ {d}"))),
+                            )
+                        }),
+                )
+            })
     }
 }
 
@@ -417,6 +587,7 @@ fn paint_scene(
     hover: Option<Hover>,
     focus: Option<u32>,
     pinned: Option<(u32, usize)>,
+    investigate: bool,
     bounds: Bounds<Pixels>,
     window: &mut Window,
     cx: &mut App,
@@ -457,6 +628,10 @@ fn paint_scene(
         1
     };
     let draw_arrows = k >= 0.3;
+    // Edges live in their own layer so cards (next layer) always draw above
+    // them — within a single layer GPUI batches by primitive type, which
+    // does not guarantee paths-under-quads.
+    window.paint_layer(bounds, |window| {
     // With a focused card, incident edges stay bright and the rest dim —
     // the web app's focus behavior, minus its re-tessellation dodge.
     for (group, dim_pass) in groups.iter().flat_map(|&g| [(g, false), (g, true)]) {
@@ -525,8 +700,9 @@ fn paint_scene(
             }
         }
     }
+    });
 
-    // ---- nodes ----
+    // ---- nodes (their own layer, above the edges) ----
     let name_font = mono(FontWeight::SEMIBOLD);
     let row_font = mono(FontWeight::NORMAL);
     let text_system = window.text_system().clone();
@@ -536,6 +712,7 @@ fn paint_scene(
     let kt = 2f32.powf((k.log2() * 8.0).round() / 8.0);
     let mut text_errors = 0usize;
 
+    window.paint_layer(bounds, |window| {
     for (i, card) in model.cards.iter().enumerate() {
         let pos = model.positions[i];
         if pos.x + card.w < wx0 || pos.x > wx1 || pos.y + card.h < wy0 || pos.y > wy1 {
@@ -550,6 +727,19 @@ fn paint_scene(
         let is_hovered = matches!(hover, Some(h) if h.card == i as u32);
         let is_focused = focus == Some(i as u32);
         let radius = px(6.0 * k);
+        if k >= 0.25 {
+            window.paint_drop_shadows(
+                card_bounds,
+                Corners::all(radius),
+                &[gpui::BoxShadow {
+                    color: gpui::black().opacity(0.35),
+                    offset: point(px(0.0), px(2.0 * k)),
+                    blur_radius: px(10.0 * k),
+                    spread_radius: px(0.0),
+                    inset: false,
+                }],
+            );
+        }
         let border_w = if is_focused || card.is_overlay { 2.0 } else { 1.25 };
         let border_color = if card.is_overlay {
             overlay_green()
@@ -585,13 +775,41 @@ fn paint_scene(
             BorderStyle::Solid,
         ));
 
+        // Investigate mode: red outline on undocumented types, red gutter
+        // ticks on undocumented field/enum rows.
+        if investigate {
+            if card.description.is_none() {
+                window.paint_quad(quad(
+                    card_bounds,
+                    Corners::all(radius),
+                    gpui::transparent_black(),
+                    Edges::all(px((1.5 * k).clamp(0.6, 2.5))),
+                    rgb(0xe5534b),
+                    BorderStyle::Solid,
+                ));
+            }
+            if k >= LOD_ROWS {
+                for (ri, row) in card.rows.iter().enumerate() {
+                    if matches!(row.kind, RowKind::Field | RowKind::EnumValue)
+                        && row.description.is_none()
+                    {
+                        let tick = Bounds {
+                            origin: to_screen(pos.x, pos.y + card.row_y(ri) + 4.0),
+                            size: size(px(2.0 * k), px((card.row_h - 8.0) * k)),
+                        };
+                        window.paint_quad(fill(tick, rgb(0xe5534b)));
+                    }
+                }
+            }
+        }
+
         // overlay row gutter markers
         if !card.is_overlay {
             for (ri, row) in card.rows.iter().enumerate() {
                 if row.is_overlay {
                     let gutter = Bounds {
                         origin: to_screen(pos.x + 2.0, pos.y + card.row_y(ri) + 2.0),
-                        size: size(px(3.0 * k), px((ROW_H - 4.0) * k)),
+                        size: size(px(3.0 * k), px((card.row_h - 4.0) * k)),
                     };
                     window.paint_quad(fill(gutter, overlay_green()));
                 }
@@ -603,7 +821,7 @@ fn paint_scene(
             if pc == i as u32 && row < card.rows.len() {
                 let row_bounds = Bounds {
                     origin: to_screen(pos.x, pos.y + card.row_y(row)),
-                    size: size(px(card.w * k), px(ROW_H * k)),
+                    size: size(px(card.w * k), px(card.row_h * k)),
                 };
                 window.paint_quad(fill(row_bounds, pal.type_amber.opacity(0.18)));
             }
@@ -615,7 +833,7 @@ fn paint_scene(
                 let ry = card.row_y(row);
                 let row_bounds = Bounds {
                     origin: to_screen(pos.x, pos.y + ry),
-                    size: size(px(card.w * k), px(ROW_H * k)),
+                    size: size(px(card.w * k), px(card.row_h * k)),
                 };
                 window.paint_quad(fill(row_bounds, gpui::white().opacity(0.06)));
             }
@@ -698,16 +916,51 @@ fn paint_scene(
                 )
                 .is_err() as usize;
             if !row.right.is_empty() {
-                let right_run = [run(row.right.len(), &row_font, pal.type_amber)];
+                let rt_color: Hsla = if row.until_expired {
+                    rgb(0xe5534b).into()
+                } else {
+                    pal.type_amber
+                };
+                let right_run = [run(row.right.len(), &row_font, rt_color)];
                 let rline =
                     text_system.shape_line(row.right.clone(), row_size, &right_run, None);
                 let rx = pos.x + card.w - CARD_PAD_X - f32::from(rline.width) / k;
                 text_errors += rline
                     .paint(to_screen(rx, ry), row_line_h, TextAlign::Left, None, window, cx)
                     .is_err() as usize;
+                if row.is_relay {
+                    // small teal dot marking a Relay-unwrapped connection field
+                    let d = 3.5 * k;
+                    window.paint_quad(quad(
+                        Bounds {
+                            origin: to_screen(rx - 8.0, ry + 3.5),
+                            size: size(px(d), px(d)),
+                        },
+                        Corners::all(px(d / 2.0)),
+                        kind_color(NodeKind::Input),
+                        Edges::default(),
+                        gpui::transparent_black(),
+                        BorderStyle::Solid,
+                    ));
+                }
+            }
+            if let Some(desc) = &row.description_line {
+                let drun = [run(desc.len(), &row_font, pal.text_muted.opacity(0.8))];
+                let dline = text_system.shape_line(desc.clone(), px(8.5 * kt), &drun, None);
+                text_errors += dline
+                    .paint(
+                        to_screen(pos.x + CARD_PAD_X, pos.y + card.row_y(ri) + 13.5),
+                        px(8.5 * 1.3 * kt),
+                        TextAlign::Left,
+                        None,
+                        window,
+                        cx,
+                    )
+                    .is_err() as usize;
             }
         }
     }
+    });
     if text_errors > 0 {
         eprintln!("canvas: {text_errors} text paint errors this frame");
     }

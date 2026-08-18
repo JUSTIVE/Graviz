@@ -5,12 +5,23 @@
 
 use crate::canvas::kind_color;
 use crate::model::Model;
+use gompass_core::graph::{EdgeKind, NodeKind};
 use gompass_core::search::{search_graph, SearchResult};
 use gpui::{
     div, prelude::*, px, rgb, uniform_list, App, Context, EventEmitter, FocusHandle, Focusable,
     KeyDownEvent, ScrollStrategy, SharedString, UniformListScrollHandle, Window,
 };
+use std::collections::HashSet;
 use std::rc::Rc;
+
+const KIND_CHIPS: [(NodeKind, &str); 6] = [
+    (NodeKind::Object, "type"),
+    (NodeKind::Interface, "iface"),
+    (NodeKind::Union, "union"),
+    (NodeKind::Enum, "enum"),
+    (NodeKind::Input, "input"),
+    (NodeKind::Scalar, "scalar"),
+];
 
 pub enum TreeEvent {
     Select { node_index: usize, row: Option<usize> },
@@ -25,6 +36,11 @@ pub struct TreePanel {
     active: usize,
     focus: FocusHandle,
     scroll: UniformListScrollHandle,
+    kind_filter: HashSet<NodeKind>,
+    /// Card index of the type shown in the detail section.
+    selected: Option<u32>,
+    /// `(referencing card, "Type.field")` rows for the detail section.
+    referenced_by: Vec<(u32, SharedString)>,
 }
 
 impl TreePanel {
@@ -41,6 +57,9 @@ impl TreePanel {
             active: 0,
             focus: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
+            kind_filter: HashSet::new(),
+            selected: None,
+            referenced_by: Vec::new(),
         }
     }
 
@@ -57,6 +76,8 @@ impl TreePanel {
         self.model = model;
         self.all_sorted = all_sorted;
         self.query.clear();
+        self.selected = None;
+        self.referenced_by.clear();
         self.refresh();
         cx.notify();
     }
@@ -73,28 +94,59 @@ impl TreePanel {
         self.results = if self.query.is_empty() {
             Vec::new()
         } else {
-            search_graph(&self.model.graph, &self.query)
+            let mut results = search_graph(&self.model.graph, &self.query);
+            if !self.kind_filter.is_empty() {
+                results.retain(|r| self.kind_filter.contains(&r.type_kind));
+            }
+            results
         };
         self.active = 0;
         self.scroll.scroll_to_item(0, ScrollStrategy::Top);
     }
 
+    fn toggle_kind(&mut self, kind: NodeKind, cx: &mut Context<Self>) {
+        if !self.kind_filter.insert(kind) {
+            self.kind_filter.remove(&kind);
+        }
+        self.refresh();
+        cx.notify();
+    }
+
+    /// Recompute the detail section for `card` (incoming field references).
+    fn select_card(&mut self, card: u32, row: Option<usize>, cx: &mut Context<Self>) {
+        self.selected = Some(card);
+        let id = &self.model.graph.nodes[card as usize].id;
+        let mut refs: Vec<(u32, SharedString)> = self
+            .model
+            .graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Field && &e.target == id && &e.source != id)
+            .filter_map(|e| {
+                let src = *self.model.index_of.get(&e.source)?;
+                let field = e.source_field.as_deref().unwrap_or("?");
+                Some((src, SharedString::from(format!("{}.{}", e.source, field))))
+            })
+            .collect();
+        refs.sort_by(|a, b| a.1.cmp(&b.1));
+        refs.dedup_by(|a, b| a.1 == b.1);
+        refs.truncate(200);
+        self.referenced_by = refs;
+        cx.emit(TreeEvent::Select { node_index: card as usize, row });
+        cx.notify();
+    }
+
     fn select(&mut self, ix: usize, cx: &mut Context<Self>) {
-        let event = if self.query.is_empty() {
-            self.all_sorted.get(ix).map(|&card| TreeEvent::Select {
-                node_index: card as usize,
-                row: None,
-            })
+        let target = if self.query.is_empty() {
+            self.all_sorted.get(ix).map(|&card| (card, None))
         } else {
-            self.results.get(ix).map(|r| TreeEvent::Select {
-                node_index: r.node_index,
-                row: r.row_index,
-            })
+            self.results
+                .get(ix)
+                .map(|r| (r.node_index as u32, r.row_index))
         };
-        if let Some(event) = event {
+        if let Some((card, row)) = target {
             self.active = ix;
-            cx.emit(event);
-            cx.notify();
+            self.select_card(card, row, cx);
         }
     }
 
@@ -254,6 +306,32 @@ impl Render for TreePanel {
                         format!("{count} results")
                     })),
             )
+            .when(!self.query.is_empty(), |el| {
+                el.child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_1()
+                        .px_2()
+                        .pb_1()
+                        .children(KIND_CHIPS.map(|(kind, label)| {
+                            let active = self.kind_filter.contains(&kind);
+                            div()
+                                .id(label)
+                                .px_2()
+                                .py(px(2.0))
+                                .rounded_full()
+                                .cursor_pointer()
+                                .border_1()
+                                .border_color(if active { kind_color(kind) } else { rgb(0x2c3340).into() })
+                                .when(active, |el| el.bg(rgb(0x232936)))
+                                .text_xs()
+                                .text_color(kind_color(kind))
+                                .on_click(cx.listener(move |this, _, _, cx| this.toggle_kind(kind, cx)))
+                                .child(SharedString::from(label))
+                        })),
+                )
+            })
             .child(
                 uniform_list(
                     "tree-items",
@@ -265,5 +343,96 @@ impl Render for TreePanel {
                 .flex_1()
                 .track_scroll(&self.scroll),
             )
+            .when_some(self.selected, |el, card| {
+                let c = &self.model.cards[card as usize];
+                let refs = self.referenced_by.clone();
+                let desc = c.description.clone();
+                el.child(
+                    div()
+                        .flex_none()
+                        .max_h(px(320.0))
+                        .border_t_1()
+                        .border_color(rgb(0x242a35))
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .px_3()
+                                .pt_2()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(div().size(px(7.0)).rounded_full().bg(kind_color(c.kind)).flex_none())
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_family("Menlo")
+                                        .text_color(rgb(0xe6e9ef))
+                                        .child(c.name.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(kind_color(c.kind))
+                                        .child(SharedString::from(c.kind_label)),
+                                ),
+                        )
+                        .when_some(desc, |el, d| {
+                            el.child(
+                                div()
+                                    .px_3()
+                                    .pt_1()
+                                    .text_xs()
+                                    .text_color(rgb(0x8b93a3))
+                                    .max_h(px(80.0))
+                                    .overflow_hidden()
+                                    .child(SharedString::from(d)),
+                            )
+                        })
+                        .child(
+                            div()
+                                .px_3()
+                                .pt_2()
+                                .pb_1()
+                                .text_xs()
+                                .text_color(rgb(0x687083))
+                                .child(SharedString::from(format!(
+                                    "Referenced by · {}",
+                                    refs.len()
+                                ))),
+                        )
+                        .child(
+                            uniform_list(
+                                "referenced-by",
+                                refs.len(),
+                                cx.processor(move |this: &mut Self, range: std::ops::Range<usize>, _w, cx| {
+                                    range
+                                        .map(|ix| {
+                                            let (src, label) = this.referenced_by[ix].clone();
+                                            div()
+                                                .id(ix)
+                                                .px_3()
+                                                .h(px(22.0))
+                                                .flex()
+                                                .items_center()
+                                                .cursor_pointer()
+                                                .hover(|el| el.bg(rgb(0x232936)))
+                                                .text_xs()
+                                                .font_family("Menlo")
+                                                .text_color(rgb(0x9aa3b5))
+                                                .whitespace_nowrap()
+                                                .overflow_hidden()
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.select_card(src, None, cx)
+                                                }))
+                                                .child(label)
+                                        })
+                                        .collect::<Vec<_>>()
+                                }),
+                            )
+                            .h(px((refs.len() as f32 * 22.0).min(176.0))),
+                        ),
+                )
+            })
     }
 }
