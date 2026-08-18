@@ -62,6 +62,22 @@ pub fn save_settings(s: &Settings) {
     write_json("settings.json", s);
 }
 
+pub fn search_history() -> Vec<String> {
+    read_json("searches.json").unwrap_or_default()
+}
+
+pub fn push_search(query: &str) {
+    let q = query.trim();
+    if q.is_empty() {
+        return;
+    }
+    let mut list = search_history();
+    list.retain(|s| s != q);
+    list.insert(0, q.to_string());
+    list.truncate(12);
+    write_json("searches.json", &list);
+}
+
 pub fn recents() -> Vec<RecentEntry> {
     read_json("recent.json").unwrap_or_default()
 }

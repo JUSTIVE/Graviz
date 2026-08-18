@@ -74,6 +74,8 @@ pub struct GraphCanvas {
     suppress_push: bool,
     /// Investigate mode: outline types/rows lacking descriptions.
     investigate: bool,
+    /// Edge under the cursor (when no card is hovered).
+    hovered_edge: Option<u32>,
     /// Horizontal window-space offset of the canvas pane (sidebar width),
     /// set by the workspace so fit/center math uses the pane, not the window.
     pane_offset_x: f32,
@@ -107,6 +109,7 @@ impl GraphCanvas {
             history: Vec::new(),
             suppress_push: false,
             investigate: false,
+            hovered_edge: None,
             pane_offset_x: 300.0,
         }
     }
@@ -153,6 +156,7 @@ impl GraphCanvas {
         self.pending_center = None;
         self.pinned = None;
         self.hover_pos = None;
+        self.hovered_edge = None;
         self.history.clear();
         self.suppress_push = false;
         cx.notify();
@@ -212,6 +216,42 @@ impl GraphCanvas {
             }
         }
         None
+    }
+
+    /// Nearest edge within ~6 screen px of the cursor.
+    fn hit_test_edge(&self, p: Point<Pixels>) -> Option<u32> {
+        let (wx, wy) = self.screen_to_world(p);
+        let threshold = 6.0 / self.view.k;
+        let t2 = threshold * threshold;
+        let mut best: Option<(f32, u32)> = None;
+        for (i, e) in self.model.edges.iter().enumerate() {
+            if wx < e.bbox[0] - threshold
+                || wx > e.bbox[2] + threshold
+                || wy < e.bbox[1] - threshold
+                || wy > e.bbox[3] + threshold
+            {
+                continue;
+            }
+            let pts = &e.points;
+            let mut j = 0;
+            while j + 3 < pts.len() {
+                let (x0, y0, x1, y1) = (pts[j], pts[j + 1], pts[j + 2], pts[j + 3]);
+                let (dx, dy) = (x1 - x0, y1 - y0);
+                let len2 = dx * dx + dy * dy;
+                let t = if len2 > 0.0 {
+                    (((wx - x0) * dx + (wy - y0) * dy) / len2).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let (cx_, cy_) = (x0 + dx * t, y0 + dy * t);
+                let d2 = (wx - cx_) * (wx - cx_) + (wy - cy_) * (wy - cy_);
+                if d2 < t2 && best.map(|(bd, _)| d2 < bd).unwrap_or(true) {
+                    best = Some((d2, i as u32));
+                }
+                j += 4; // every other segment is plenty for hovering
+            }
+        }
+        best.map(|(_, i)| i)
     }
 
     fn center_on(&mut self, card: u32, vw: f32, vh: f32) {
@@ -284,14 +324,23 @@ impl GraphCanvas {
             }
         } else {
             let hover = self.hit_test(ev.position);
+            let hovered_edge = if hover.is_none() {
+                self.hit_test_edge(ev.position)
+            } else {
+                None
+            };
             let (ox, oy) = self.canvas_origin.get();
             let pos = (f32::from(ev.position.x) - ox, f32::from(ev.position.y) - oy);
             let moved = match self.hover_pos {
                 Some((px_, py_)) => (px_ - pos.0).abs() + (py_ - pos.1).abs() > 2.0,
                 None => true,
             };
-            if hover != self.hover || (hover.is_some() && moved) {
+            if hover != self.hover
+                || hovered_edge != self.hovered_edge
+                || ((hover.is_some() || hovered_edge.is_some()) && moved)
+            {
                 self.hover = hover;
+                self.hovered_edge = hovered_edge;
                 self.hover_pos = Some(pos);
                 cx.notify();
             }
@@ -303,14 +352,32 @@ impl GraphCanvas {
         self.drag = None;
         if was_click {
             if let Some(hit) = self.hit_test(ev.position) {
-                let vw = f32::from(window.viewport_size().width);
+                let vw = f32::from(window.viewport_size().width) - self.pane_offset_x;
                 let vh = f32::from(window.viewport_size().height);
-                let target = match hit.row {
-                    Some(row) => self.model.cards[hit.card as usize].rows[row].target,
-                    None => Some(hit.card),
-                };
-                if let Some(t) = target {
-                    self.center_on(t, vw, vh);
+                match hit.row {
+                    Some(row) => {
+                        // Clicking the right-aligned type navigates; clicking
+                        // the rest of the row pins it (the web split).
+                        let card = &self.model.cards[hit.card as usize];
+                        let r = &card.rows[row];
+                        let (wx, _) = self.screen_to_world(ev.position);
+                        let local_x = wx - self.model.positions[hit.card as usize].x;
+                        let rt_w = crate::model::mono_w(&r.right, ROW_FONT_PX);
+                        let on_type = !r.right.is_empty()
+                            && local_x >= card.w - CARD_PAD_X - rt_w - 16.0;
+                        if on_type || r.right.is_empty() {
+                            if let Some(t) = r.target {
+                                self.center_on(t, vw, vh);
+                            } else {
+                                self.pinned = Some((hit.card, row));
+                                self.focus = Some(hit.card);
+                            }
+                        } else {
+                            self.pinned = Some((hit.card, row));
+                            self.focus = Some(hit.card);
+                        }
+                    }
+                    None => self.center_on(hit.card, vw, vh),
                 }
             }
         }
@@ -456,8 +523,33 @@ impl Render for GraphCanvas {
                 }
             })
         };
+        // Edge tooltip: source → target plus the bundled field labels.
+        let tooltip = tooltip.or_else(|| {
+            let ei = self.hovered_edge?;
+            let e = self.model.edges.get(ei as usize)?;
+            let from = &self.model.cards[e.from as usize].name;
+            let to = &self.model.cards[e.to as usize].name;
+            let shown: Vec<String> = e.labels.iter().take(10).map(|l| l.to_string()).collect();
+            let more = e.labels.len().saturating_sub(10);
+            let mut desc = shown.join(", ");
+            if more > 0 {
+                desc.push_str(&format!(" … +{more}"));
+            }
+            let bundle = if e.bundled > 1 {
+                format!("  ·  ×{}", e.bundled)
+            } else {
+                String::new()
+            };
+            Some(Tooltip {
+                title: format!("{from} → {to}{bundle}"),
+                description: (!desc.is_empty()).then_some(desc),
+                deprecation: None,
+                expired: false,
+            })
+        });
         let hover_pos = self.hover_pos;
         let investigate = self.investigate;
+        let hovered_edge = self.hovered_edge;
         let th = crate::theme::theme(window.appearance());
         let bg = th.bg;
         let status = self.status_line();
@@ -489,8 +581,8 @@ impl Render for GraphCanvas {
                             Some(gpui::ContentMask { bounds }),
                             |window| {
                                 paint_scene(
-                                    &model, view, hover, focus, pinned, investigate, bounds,
-                                    window, cx,
+                                    &model, view, hover, focus, pinned, investigate,
+                                    hovered_edge, bounds, window, cx,
                                 );
                             },
                         );
@@ -586,6 +678,7 @@ fn paint_scene(
     focus: Option<u32>,
     pinned: Option<(u32, usize)>,
     investigate: bool,
+    hovered_edge: Option<u32>,
     bounds: Bounds<Pixels>,
     window: &mut Window,
     cx: &mut App,
@@ -637,9 +730,12 @@ fn paint_scene(
         let mut any = false;
         let mut arrows = PathBuilder::fill();
         let mut any_arrow = false;
-        for e in &model.edges {
+        for (ei, e) in model.edges.iter().enumerate() {
             if e.group != group {
                 continue;
+            }
+            if Some(ei as u32) == hovered_edge {
+                continue; // painted separately, highlighted
             }
             // With a focus, everything non-incident dims; without one, only
             // hub-star edges dim (the web app's hub fading).
@@ -696,6 +792,22 @@ fn paint_scene(
         if any_arrow {
             if let Ok(path) = arrows.build() {
                 window.paint_path(path, color);
+            }
+        }
+    }
+    // The hovered edge draws on top, brighter and thicker.
+    if let Some(ei) = hovered_edge {
+        if let Some(e) = model.edges.get(ei as usize) {
+            let mut builder = PathBuilder::stroke(px((stroke_w * 2.0).max(2.0)));
+            let pts = &e.points;
+            builder.move_to(to_screen(pts[0], pts[1]));
+            let mut i = 2;
+            while i + 1 < pts.len() {
+                builder.line_to(to_screen(pts[i], pts[i + 1]));
+                i += 2;
+            }
+            if let Ok(path) = builder.build() {
+                window.paint_path(path, edge_color(&th, e.group).opacity(1.0));
             }
         }
     }

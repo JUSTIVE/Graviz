@@ -37,6 +37,7 @@ pub struct TreePanel {
     focus: FocusHandle,
     scroll: UniformListScrollHandle,
     kind_filter: HashSet<NodeKind>,
+    search_history: Vec<String>,
     /// Card index of the type shown in the detail section.
     selected: Option<u32>,
     /// `(referencing card, "Type.field")` rows for the detail section.
@@ -58,6 +59,7 @@ impl TreePanel {
             focus: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
             kind_filter: HashSet::new(),
+            search_history: crate::config::search_history(),
             selected: None,
             referenced_by: Vec::new(),
         }
@@ -145,9 +147,19 @@ impl TreePanel {
                 .map(|r| (r.node_index as u32, r.row_index))
         };
         if let Some((card, row)) = target {
+            if !self.query.is_empty() {
+                crate::config::push_search(&self.query);
+                self.search_history = crate::config::search_history();
+            }
             self.active = ix;
             self.select_card(card, row, cx);
         }
+    }
+
+    fn set_query(&mut self, q: String, cx: &mut Context<Self>) {
+        self.query = q;
+        self.refresh();
+        cx.notify();
     }
 
     fn on_key_down(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
@@ -192,28 +204,51 @@ impl TreePanel {
 
     fn render_row(&self, ix: usize, th: Theme, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let is_active = ix == self.active;
-        let (dot, main, detail): (gpui::Hsla, SharedString, Option<String>) = if self
-            .query
-            .is_empty()
-        {
-            let card = &self.model.cards[self.all_sorted[ix] as usize];
-            let detail = card.description.as_ref().map(|d| {
-                let one: String = d.split_whitespace().collect::<Vec<_>>().join(" ");
-                one.chars().take(60).collect::<String>()
-            });
-            (th.kind_color(card.kind), card.name.clone(), detail)
-        } else {
-            let r = &self.results[ix];
-            let main = match &r.field_name {
-                Some(f) => format!("{}.{}", r.type_name, f),
-                None => r.type_name.clone(),
+        let (dot, main, hl_chars, detail): (gpui::Hsla, SharedString, Vec<usize>, Option<String>) =
+            if self.query.is_empty() {
+                let card = &self.model.cards[self.all_sorted[ix] as usize];
+                let detail = card.description.as_ref().map(|d| {
+                    let one: String = d.split_whitespace().collect::<Vec<_>>().join(" ");
+                    one.chars().take(60).collect::<String>()
+                });
+                (th.kind_color(card.kind), card.name.clone(), Vec::new(), detail)
+            } else {
+                let r = &self.results[ix];
+                let main = match &r.field_name {
+                    Some(f) => format!("{}.{}", r.type_name, f),
+                    None => r.type_name.clone(),
+                };
+                // fuzzy-match highlight indices, mapped into the combined
+                // "Type.field" string
+                let mut hl: Vec<usize> = Vec::new();
+                if let Some(ti) = &r.type_match_indices {
+                    hl.extend(ti.iter().copied());
+                }
+                if r.field_name.is_some() {
+                    let off = r.type_name.chars().count() + 1;
+                    hl.extend(r.match_indices.iter().map(|i| i + off));
+                } else {
+                    hl.extend(r.match_indices.iter().copied());
+                }
+                let detail = r
+                    .snippet
+                    .as_ref()
+                    .map(|s| s.snippet.clone())
+                    .or_else(|| r.field_type.clone());
+                (th.kind_color(r.type_kind), main.into(), hl, detail)
             };
-            let detail = r
-                .snippet
-                .as_ref()
-                .map(|s| s.snippet.clone())
-                .or_else(|| r.field_type.clone());
-            (th.kind_color(r.type_kind), main.into(), detail)
+        let main_el: gpui::AnyElement = if hl_chars.is_empty() {
+            SharedString::from(main).into_any_element()
+        } else {
+            let ranges = char_byte_ranges(&main, &hl_chars);
+            let style = gpui::HighlightStyle {
+                color: Some(th.accent),
+                font_weight: Some(gpui::FontWeight::BOLD),
+                ..Default::default()
+            };
+            gpui::StyledText::new(main)
+                .with_highlights(ranges.into_iter().map(|r| (r, style)))
+                .into_any_element()
         };
 
         div()
@@ -235,7 +270,7 @@ impl TreePanel {
                     .text_xs()
                     .text_color(th.text)
                     .whitespace_nowrap()
-                    .child(SharedString::from(main)),
+                    .child(main_el),
             )
             .when_some(detail, |el, d| {
                 el.child(
@@ -253,6 +288,22 @@ impl TreePanel {
 }
 
 const ROW_H: f32 = 26.0;
+
+/// Merge sorted char indices into byte ranges over `text`.
+fn char_byte_ranges(text: &str, char_idxs: &[usize]) -> Vec<std::ops::Range<usize>> {
+    let set: std::collections::BTreeSet<usize> = char_idxs.iter().copied().collect();
+    let mut out: Vec<std::ops::Range<usize>> = Vec::new();
+    for (ci, (bi, c)) in text.char_indices().enumerate() {
+        if set.contains(&ci) {
+            let end = bi + c.len_utf8();
+            match out.last_mut() {
+                Some(last) if last.end == bi => last.end = end,
+                _ => out.push(bi..end),
+            }
+        }
+    }
+    out
+}
 
 impl EventEmitter<TreeEvent> for TreePanel {}
 
@@ -314,6 +365,37 @@ impl Render for TreePanel {
                         format!("{count} results")
                     })),
             )
+            .when(self.query.is_empty() && !self.search_history.is_empty(), |el| {
+                el.child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_1()
+                        .px_2()
+                        .pb_1()
+                        .children(self.search_history.iter().take(6).cloned().enumerate().map(
+                            |(i, q)| {
+                                let label = q.clone();
+                                div()
+                                    .id(("hist", i))
+                                    .px_2()
+                                    .py(px(2.0))
+                                    .rounded_full()
+                                    .border_1()
+                                    .border_color(th.card_border)
+                                    .text_xs()
+                                    .font_family("Menlo")
+                                    .text_color(th.text_muted)
+                                    .cursor_pointer()
+                                    .hover(|el| el.bg(th.hover_bg))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.set_query(q.clone(), cx)
+                                    }))
+                                    .child(SharedString::from(label))
+                            },
+                        )),
+                )
+            })
             .when(!self.query.is_empty(), |el| {
                 el.child(
                     div()

@@ -130,6 +130,9 @@ pub struct EdgeVisual {
     /// Incident to a hub node (degree ≥ HUB_FADE_DEGREE) — drawn faded so
     /// Relay `Node`-style stars don't dominate the picture.
     pub hub_faded: bool,
+    /// Field names (or relation kind) this edge represents — several when
+    /// bundled.
+    pub labels: Vec<gpui::SharedString>,
 }
 
 /// In- or out-degree at which a node's edges get faded.
@@ -500,6 +503,7 @@ pub fn build_model(graph: ParsedGraph, schema_name: String, options: &ModelOptio
         to: u32,
         edge_index: usize,
         bundled: u32,
+        labels: Vec<gpui::SharedString>,
     }
     let mut pre: Vec<PreEdge> = Vec::new();
     let mut bundle_index: HashMap<(u32, u32), usize> = HashMap::new();
@@ -510,14 +514,22 @@ pub fn build_model(graph: ParsedGraph, schema_name: String, options: &ModelOptio
         if from == to {
             continue;
         }
+        let label: gpui::SharedString = match e.kind {
+            EdgeKind::Field | EdgeKind::Arg => {
+                e.source_field.clone().unwrap_or_default().into()
+            }
+            EdgeKind::Implements => "implements".into(),
+            EdgeKind::Union => "union member".into(),
+        };
         if options.bundle_edges && e.kind == EdgeKind::Field {
             if let Some(&idx) = bundle_index.get(&(from, to)) {
                 pre[idx].bundled += 1;
+                pre[idx].labels.push(label);
                 continue;
             }
             bundle_index.insert((from, to), pre.len());
         }
-        pre.push(PreEdge { from, to, edge_index: ei, bundled: 1 });
+        pre.push(PreEdge { from, to, edge_index: ei, bundled: 1, labels: vec![label] });
     }
     let mut degree = vec![0u32; cards.len()];
     for p in &pre {
@@ -571,6 +583,7 @@ pub fn build_model(graph: ParsedGraph, schema_name: String, options: &ModelOptio
             bundled: bundle_counts[path.edge_index as usize],
             hub_faded: degree[le.from as usize] >= HUB_FADE_DEGREE
                 || degree[le.to as usize] >= HUB_FADE_DEGREE,
+            labels: pre[path.edge_index as usize].labels.clone(),
         });
     }
 
