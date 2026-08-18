@@ -1,7 +1,9 @@
 mod canvas;
 mod model;
+mod tree;
+mod workspace;
 
-use canvas::GraphCanvas;
+use workspace::Workspace;
 use gpui::{prelude::*, px, size, App, Bounds, WindowBounds, WindowOptions};
 use std::rc::Rc;
 
@@ -52,13 +54,14 @@ fn main() {
     );
 
     gpui_platform::application().run(move |cx: &mut App| {
+        workspace::init(cx);
         let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_, cx| cx.new(|_| GraphCanvas::new(model)),
+            |_, cx| cx.new(|cx| Workspace::new(model, cx)),
         )
         .unwrap();
         cx.activate(true);

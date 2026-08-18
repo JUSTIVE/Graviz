@@ -53,6 +53,11 @@ pub struct GraphCanvas {
     drag: Option<Drag>,
     fitted: bool,
     focus: Option<u32>,
+    /// Center request from outside (tree selection); applied on next render,
+    /// where the viewport size is known.
+    pending_center: Option<u32>,
+    /// Row pinned from a search hit: (card, row index).
+    pinned: Option<(u32, usize)>,
 }
 
 impl GraphCanvas {
@@ -64,7 +69,16 @@ impl GraphCanvas {
             drag: None,
             fitted: false,
             focus: None,
+            pending_center: None,
+            pinned: None,
         }
+    }
+
+    /// Called from the workspace when the tree selects a type.
+    pub fn navigate_to(&mut self, card: u32, row: Option<usize>, cx: &mut Context<Self>) {
+        self.pending_center = Some(card);
+        self.pinned = row.map(|r| (card, r));
+        cx.notify();
     }
 
     fn fit(&mut self, vw: f32, vh: f32) {
@@ -285,10 +299,15 @@ impl Render for GraphCanvas {
             self.fit(vw, vh);
             self.fitted = true;
         }
+        if let Some(card) = self.pending_center.take() {
+            self.center_on(card, vw, vh);
+        }
 
         let model = self.model.clone();
         let view = self.view;
         let hover = self.hover;
+        let focus = self.focus;
+        let pinned = self.pinned;
         let pal = palette();
         let bg = pal.bg;
         let status = self.status_line();
@@ -311,7 +330,7 @@ impl Render for GraphCanvas {
                 canvas(
                     |_, _, _| (),
                     move |bounds, _, window, cx| {
-                        paint_scene(&model, view, hover, bounds, window, cx);
+                        paint_scene(&model, view, hover, focus, pinned, bounds, window, cx);
                     },
                 )
                 .size_full(),
@@ -337,6 +356,8 @@ fn paint_scene(
     model: &Model,
     view: ViewTransform,
     hover: Option<Hover>,
+    focus: Option<u32>,
+    pinned: Option<(u32, usize)>,
     bounds: Bounds<Pixels>,
     window: &mut Window,
     cx: &mut App,
@@ -429,13 +450,15 @@ fn paint_scene(
         };
         let kc = kind_color(card.kind);
         let is_hovered = matches!(hover, Some(h) if h.card == i as u32);
+        let is_focused = focus == Some(i as u32);
         let radius = px(6.0 * k);
+        let border_w = if is_focused { 2.0 } else { 1.25 };
         window.paint_quad(quad(
             card_bounds,
             Corners::all(radius),
             pal.card_bg,
-            Edges::all(px((1.25 * k).clamp(0.5, 2.0))),
-            if is_hovered { kc } else { pal.card_border },
+            Edges::all(px((border_w * k).clamp(0.5, 3.0))),
+            if is_focused || is_hovered { kc } else { pal.card_border },
             BorderStyle::Solid,
         ));
         // header band
@@ -456,6 +479,17 @@ fn paint_scene(
             gpui::transparent_black(),
             BorderStyle::Solid,
         ));
+
+        // pinned row (search hit) highlight
+        if let Some((pc, row)) = pinned {
+            if pc == i as u32 && row < card.rows.len() {
+                let row_bounds = Bounds {
+                    origin: to_screen(pos.x, pos.y + card.row_y(row)),
+                    size: size(px(card.w * k), px(ROW_H * k)),
+                };
+                window.paint_quad(fill(row_bounds, pal.type_amber.opacity(0.18)));
+            }
+        }
 
         // hovered row highlight
         if let Some(Hover { card: hc, row: Some(row) }) = hover {
