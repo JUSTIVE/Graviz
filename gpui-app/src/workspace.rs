@@ -62,14 +62,23 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Self {
         let mode = Mode::Reachable;
-        let options = ModelOptions::default();
+        let mut options = ModelOptions::default();
+        // Debug presets so automated selfshots can exercise toggle states.
+        if std::env::var("GOMPASS_DESC").is_ok() {
+            options.show_descriptions = true;
+        }
+        let investigate = std::env::var("GOMPASS_INVESTIGATE").is_ok();
         let model = Rc::new(build_model(
             slice_graph(&loaded.graph, mode),
             loaded.name.clone(),
             &options,
         ));
         let tree = cx.new(|cx| TreePanel::new(model.clone(), cx));
-        let canvas = cx.new(|_| GraphCanvas::new(model));
+        let canvas = cx.new(|cx| {
+            let mut c = GraphCanvas::new(model);
+            c.set_investigate(investigate, cx);
+            c
+        });
         cx.subscribe(&tree, |this: &mut Self, _, event: &TreeEvent, cx| match event {
             TreeEvent::Select { node_index, row } => {
                 let (node_index, row) = (*node_index, *row);
@@ -112,7 +121,7 @@ impl Workspace {
             schema_name: loaded.name,
             mode,
             options,
-            investigate: false,
+            investigate,
             tree,
             canvas,
             sidebar_open: true,
@@ -292,6 +301,9 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
                 this.sidebar_open = !this.sidebar_open;
+                let offset = if this.sidebar_open { 300.0 } else { 0.0 };
+                this.canvas
+                    .update(cx, |canvas, cx| canvas.set_pane_offset(offset, cx));
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ToggleDescriptions, _, cx| {

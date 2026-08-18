@@ -72,6 +72,9 @@ pub struct GraphCanvas {
     suppress_push: bool,
     /// Investigate mode: outline types/rows lacking descriptions.
     investigate: bool,
+    /// Horizontal window-space offset of the canvas pane (sidebar width),
+    /// set by the workspace so fit/center math uses the pane, not the window.
+    pane_offset_x: f32,
 }
 
 impl GraphCanvas {
@@ -91,6 +94,14 @@ impl GraphCanvas {
             history: Vec::new(),
             suppress_push: false,
             investigate: false,
+            pane_offset_x: 300.0,
+        }
+    }
+
+    pub fn set_pane_offset(&mut self, offset: f32, cx: &mut Context<Self>) {
+        if (self.pane_offset_x - offset).abs() > 0.5 {
+            self.pane_offset_x = offset;
+            cx.notify();
         }
     }
 
@@ -407,7 +418,7 @@ fn run(len: usize, font: &Font, color: Hsla) -> TextRun {
 
 impl Render for GraphCanvas {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let vw = f32::from(window.viewport_size().width);
+        let vw = f32::from(window.viewport_size().width) - self.pane_offset_x;
         let vh = f32::from(window.viewport_size().height);
         if !self.fitted && vw > 0.0 {
             self.fit(vw, vh);
@@ -466,7 +477,6 @@ impl Render for GraphCanvas {
             })
         };
         let hover_pos = self.hover_pos;
-        let canvas_left = self.canvas_origin.get().0;
         let investigate = self.investigate;
         let pal = palette();
         let bg = pal.bg;
@@ -520,7 +530,7 @@ impl Render for GraphCanvas {
             )
             .when_some(tooltip.zip(hover_pos), |el, (tip, (hx, hy))| {
                 let tw = 340.0;
-                let pane_w = vw - canvas_left;
+                let pane_w = vw;
                 let left = if hx + 16.0 + tw > pane_w {
                     (hx - tw - 12.0).max(4.0)
                 } else {
