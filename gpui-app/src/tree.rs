@@ -197,7 +197,11 @@ impl TreePanel {
             .is_empty()
         {
             let card = &self.model.cards[self.all_sorted[ix] as usize];
-            (th.kind_color(card.kind), card.name.clone(), None)
+            let detail = card.description.as_ref().map(|d| {
+                let one: String = d.split_whitespace().collect::<Vec<_>>().join(" ");
+                one.chars().take(60).collect::<String>()
+            });
+            (th.kind_color(card.kind), card.name.clone(), detail)
         } else {
             let r = &self.results[ix];
             let main = match &r.field_name {
@@ -214,6 +218,7 @@ impl TreePanel {
 
         div()
             .id(ix)
+            .w_full()
             .px_2()
             .h(px(ROW_H))
             .flex()
@@ -226,15 +231,17 @@ impl TreePanel {
             .child(div().size(px(7.0)).rounded_full().bg(dot).flex_none())
             .child(
                 div()
+                    .flex_none()
                     .text_xs()
                     .text_color(th.text)
                     .whitespace_nowrap()
-                    .overflow_hidden()
                     .child(SharedString::from(main)),
             )
             .when_some(detail, |el, d| {
                 el.child(
                     div()
+                        .flex_1()
+                        .min_w_0()
                         .text_xs()
                         .text_color(th.text_muted)
                         .whitespace_nowrap()
@@ -413,6 +420,7 @@ impl Render for TreePanel {
                                             let (src, label) = this.referenced_by[ix].clone();
                                             div()
                                                 .id(ix)
+                                                .w_full()
                                                 .px_3()
                                                 .h(px(22.0))
                                                 .flex()

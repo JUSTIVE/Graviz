@@ -451,9 +451,15 @@ pub fn build_model(graph: ParsedGraph, schema_name: String, options: &ModelOptio
     // ---- layout ----
     let layout_nodes: Vec<LayoutNode> =
         cards.iter().map(|c| LayoutNode { w: c.w, h: c.h }).collect();
-    let mut layout_edges: Vec<LayoutEdge> = Vec::with_capacity(graph.edges.len());
-    let mut kept_edges: Vec<usize> = Vec::with_capacity(graph.edges.len());
-    let mut bundle_counts: Vec<u32> = Vec::with_capacity(graph.edges.len());
+    // Two passes: endpoints first (for hub degrees), then the layout edges
+    // with lane-routing turned off for hub-incident edges.
+    struct PreEdge {
+        from: u32,
+        to: u32,
+        edge_index: usize,
+        bundled: u32,
+    }
+    let mut pre: Vec<PreEdge> = Vec::new();
     let mut bundle_index: HashMap<(u32, u32), usize> = HashMap::new();
     for (ei, e) in graph.edges.iter().enumerate() {
         let (Some(&from), Some(&to)) = (index_of.get(&e.source), index_of.get(&e.target)) else {
@@ -464,18 +470,32 @@ pub fn build_model(graph: ParsedGraph, schema_name: String, options: &ModelOptio
         }
         if options.bundle_edges && e.kind == EdgeKind::Field {
             if let Some(&idx) = bundle_index.get(&(from, to)) {
-                bundle_counts[idx] += 1;
+                pre[idx].bundled += 1;
                 continue;
             }
-            bundle_index.insert((from, to), layout_edges.len());
+            bundle_index.insert((from, to), pre.len());
         }
+        pre.push(PreEdge { from, to, edge_index: ei, bundled: 1 });
+    }
+    let mut degree = vec![0u32; cards.len()];
+    for p in &pre {
+        degree[p.from as usize] += 1;
+        degree[p.to as usize] += 1;
+    }
+    let mut layout_edges: Vec<LayoutEdge> = Vec::with_capacity(pre.len());
+    let mut kept_edges: Vec<usize> = Vec::with_capacity(pre.len());
+    let mut bundle_counts: Vec<u32> = Vec::with_capacity(pre.len());
+    for p in &pre {
+        let e = &graph.edges[p.edge_index];
         layout_edges.push(LayoutEdge {
-            from,
-            to,
-            from_port_y: cards[from as usize].port_y(e.source_field_index),
+            from: p.from,
+            to: p.to,
+            from_port_y: cards[p.from as usize].port_y(e.source_field_index),
+            route: degree[p.from as usize] < HUB_FADE_DEGREE
+                && degree[p.to as usize] < HUB_FADE_DEGREE,
         });
-        kept_edges.push(ei);
-        bundle_counts.push(1);
+        kept_edges.push(p.edge_index);
+        bundle_counts.push(p.bundled);
     }
     let rt = &graph.root_types;
     let roots: Vec<u32> = [&rt.query, &rt.mutation, &rt.subscription]
@@ -485,36 +505,20 @@ pub fn build_model(graph: ParsedGraph, schema_name: String, options: &ModelOptio
     let result = layout::layout(&layout_nodes, &layout_edges, &roots, &LayoutConfig::default());
 
     // ---- flatten edge paths ----
-    let mut degree = vec![0u32; cards.len()];
-    for le in &layout_edges {
-        degree[le.from as usize] += 1;
-        degree[le.to as usize] += 1;
-    }
-    const STEPS: usize = 16;
     let mut edges: Vec<EdgeVisual> = Vec::with_capacity(result.edges.len());
     for path in &result.edges {
         let le = &layout_edges[path.edge_index as usize];
         let ge = &graph.edges[kept_edges[path.edge_index as usize]];
         let group = edge_group(ge);
-        let mut points = Vec::with_capacity((STEPS + 1) * 2);
+        let mut points = Vec::with_capacity(path.points.len() * 2);
         let mut bbox = [f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
-        for s in 0..=STEPS {
-            let t = s as f32 / STEPS as f32;
-            let mt = 1.0 - t;
-            let x = mt * mt * mt * path.start.x
-                + 3.0 * mt * mt * t * path.c1.x
-                + 3.0 * mt * t * t * path.c2.x
-                + t * t * t * path.end.x;
-            let y = mt * mt * mt * path.start.y
-                + 3.0 * mt * mt * t * path.c1.y
-                + 3.0 * mt * t * t * path.c2.y
-                + t * t * t * path.end.y;
-            points.push(x);
-            points.push(y);
-            bbox[0] = bbox[0].min(x);
-            bbox[1] = bbox[1].min(y);
-            bbox[2] = bbox[2].max(x);
-            bbox[3] = bbox[3].max(y);
+        for p in &path.points {
+            points.push(p.x);
+            points.push(p.y);
+            bbox[0] = bbox[0].min(p.x);
+            bbox[1] = bbox[1].min(p.y);
+            bbox[2] = bbox[2].max(p.x);
+            bbox[3] = bbox[3].max(p.y);
         }
         edges.push(EdgeVisual {
             from: le.from,

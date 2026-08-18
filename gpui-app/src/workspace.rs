@@ -288,7 +288,23 @@ fn toolbar_button(th: Theme, label: &'static str, active: bool) -> gpui::Statefu
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let th = crate::theme::theme(window.appearance());
-        let toolbar = div()
+        // Web-app placement: a real tab bar above the canvas for the modes…
+        let tab_bar = div()
+            .flex_none()
+            .h(px(40.0))
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .bg(th.panel)
+            .border_b_1()
+            .border_color(th.panel_border)
+            .child(self.mode_tab(th, Mode::Reachable, cx))
+            .child(self.mode_tab(th, Mode::Orphaned, cx))
+            .child(self.mode_tab(th, Mode::Deprecated, cx));
+
+        // …and a floating view-controls cluster at the canvas's top-left.
+        let controls = div()
             .absolute()
             .top_2()
             .left_2()
@@ -301,10 +317,6 @@ impl Render for Workspace {
             .border_1()
             .border_color(th.panel_border)
             .shadow_md()
-            .child(self.mode_tab(th, Mode::Reachable, cx))
-            .child(self.mode_tab(th, Mode::Orphaned, cx))
-            .child(self.mode_tab(th, Mode::Deprecated, cx))
-            .child(div().w(px(1.0)).h_4().bg(th.card_border))
             .child(self.toggle_button(
                 th,
                 "Desc",
@@ -378,6 +390,7 @@ impl Render for Workspace {
                             name.split('.').next().unwrap_or(&name).to_string();
                         div()
                             .id((title, i))
+                            .w_full()
                             .text_xs()
                             .font_family("Menlo")
                             .text_color(th.text_muted)
@@ -463,25 +476,51 @@ impl Render for Workspace {
                 })
         });
 
-        let breadcrumb = {
-            let names = self.canvas.read(cx).history_names();
-            (!names.is_empty()).then(|| {
-                let trail: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+        // Web-app placement: the click-history "Recent" panel at top-right.
+        let recent = {
+            let entries = self.canvas.read(cx).history_entries();
+            (!entries.is_empty()).then(|| {
                 div()
                     .absolute()
                     .top_2()
                     .right_2()
-                    .px_3()
-                    .py_1()
-                    .rounded_md()
+                    .w(px(200.0))
+                    .p_2()
+                    .rounded_lg()
                     .bg(th.chrome_bg)
                     .border_1()
                     .border_color(th.panel_border)
                     .shadow_md()
-                    .text_xs()
-                    .font_family("Menlo")
-                    .text_color(th.text_muted)
-                    .child(SharedString::from(format!("⌘[ ← {}", trail.join(" ‹ "))))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(th.text_faint)
+                            .child("Recent  ·  ⌘[ back"),
+                    )
+                    .children(entries.into_iter().enumerate().map(|(i, (card, name))| {
+                        div()
+                            .id(("recent", i))
+                            .w_full()
+                            .px_2()
+                            .py(px(2.0))
+                            .rounded_md()
+                            .cursor_pointer()
+                            .hover(|el| el.bg(th.hover_bg))
+                            .text_xs()
+                            .font_family("Menlo")
+                            .text_color(th.text_muted)
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.canvas.update(cx, |canvas, cx| {
+                                    canvas.navigate_to(card, None, cx)
+                                });
+                            }))
+                            .child(name)
+                    }))
             })
         };
 
@@ -536,11 +575,19 @@ impl Render for Workspace {
                     .flex_1()
                     .h_full()
                     .min_w_0()
-                    .relative()
-                    .child(self.canvas.clone())
-                    .child(toolbar)
-                    .when_some(breadcrumb, |el, b| el.child(b))
-                    .when_some(dock, |el, d| el.child(d)),
+                    .flex()
+                    .flex_col()
+                    .child(tab_bar)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .relative()
+                            .child(self.canvas.clone())
+                            .child(controls)
+                            .when_some(recent, |el, r| el.child(r))
+                            .when_some(dock, |el, d| el.child(d)),
+                    ),
             )
     }
 }

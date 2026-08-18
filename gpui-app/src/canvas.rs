@@ -134,12 +134,12 @@ impl GraphCanvas {
         }
     }
 
-    pub fn history_names(&self) -> Vec<gpui::SharedString> {
+    pub fn history_entries(&self) -> Vec<(u32, gpui::SharedString)> {
         self.history
             .iter()
             .rev()
-            .take(6)
-            .map(|&i| self.model.cards[i as usize].name.clone())
+            .take(8)
+            .map(|&i| (i, self.model.cards[i as usize].name.clone()))
             .collect()
     }
 
@@ -612,11 +612,11 @@ fn paint_scene(
     // Zoomed out, bezier detail is subpixel: sample the flattened polyline at
     // a stride (straight-ish lines) so tessellation stays cheap at overview
     // zoom, where every one of the ~5k edges is on screen.
-    let stride: usize = if k < 0.08 {
-        16
-    } else if k < 0.2 {
+    let stride: usize = if k < 0.05 {
+        8
+    } else if k < 0.15 {
         4
-    } else if k < 0.5 {
+    } else if k < 0.35 {
         2
     } else {
         1
@@ -836,6 +836,16 @@ fn paint_scene(
 
         // ---- text ----
         if k < LOD_HEADER {
+            // Text-shaped presence survives every zoom: a name bar in the
+            // header band even when real glyphs would be sub-pixel.
+            let name_w = crate::model::mono_w(&card.name, NAME_FONT_PX).min(card.w * 0.7);
+            window.paint_quad(fill(
+                Bounds {
+                    origin: to_screen(pos.x + CARD_PAD_X, pos.y + HEADER_H * 0.35),
+                    size: size(px(name_w * k), px((NAME_FONT_PX * k).max(0.6))),
+                },
+                th.text.opacity(0.5),
+            ));
             continue;
         }
         let name_size = px(NAME_FONT_PX * kt);
@@ -874,9 +884,9 @@ fn paint_scene(
 
         if k < LOD_ROWS {
             // Placeholder bars stand in for row text so zoomed-out cards keep
-            // their texture (the web app's "bar" sprite LOD).
-            if k >= LOD_ROW_BARS {
-                let bar_h = (ROW_FONT_PX * k).max(1.0);
+            // their texture at EVERY zoom (the web app's "bar" sprite LOD).
+            {
+                let bar_h = (ROW_FONT_PX * k).max(0.6);
                 for (ri, row) in card.rows.iter().enumerate() {
                     let by = pos.y + card.row_y(ri) + (card.row_h - ROW_FONT_PX) / 2.0;
                     let left_w = crate::model::mono_w(&row.left, ROW_FONT_PX)
