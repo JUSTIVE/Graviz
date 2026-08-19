@@ -185,7 +185,6 @@ impl Workspace {
         let investigate = std::env::var("GOMPASS_INVESTIGATE").is_ok();
         let t_layout = std::time::Instant::now();
         let mut sliced = slice_graph(&loaded.graph, mode, None);
-        let mut options = options;
         if options.hide_custom_scalars {
             options.hidden_scalars = crate::model::drop_custom_scalars(&mut sliced);
         }
