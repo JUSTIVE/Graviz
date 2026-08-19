@@ -803,22 +803,46 @@ impl TreePanel {
         } else {
             self.model.schema_name.clone().into()
         };
-        let buttons = root_names(&self.model).into_iter().enumerate().map(|(i, name)| {
-            let active = self.root_pick.as_ref() == Some(&name);
+        let buttons = self.model.root_ops.iter().enumerate().map(|(i, (op, name))| {
+            let active = self.root_pick.as_ref() == Some(name);
             let pick = name.clone();
             div()
                 .id(("root", i))
-                .rounded(px(4.0))
+                .flex()
+                .flex_col()
+                .gap(px(1.0))
+                .rounded_md()
+                .border_1()
                 .px_2()
-                .py_1()
-                .font_family(MONO)
-                .text_size(px(12.0))
+                .py(px(4.0))
                 .cursor_pointer()
-                .when(active, |el| el.bg(th.primary).text_color(th.primary_fg))
-                .when(!active, |el| el.bg(th.active_bg).text_color(th.text_muted))
+                .when(active, |el| {
+                    el.bg(th.primary).border_color(th.primary).text_color(th.primary_fg)
+                })
+                .when(!active, |el| {
+                    el.bg(th.active_bg)
+                        .border_color(th.card_border)
+                        .text_color(th.text)
+                        .hover(|el| el.bg(th.hover_bg).border_color(th.text_muted))
+                })
                 .on_click(cx.listener(move |this, _, _, cx| this.pick_root(pick.clone(), cx)))
-                .child(name)
+                .child(
+                    // The operation this type serves, so three buttons named
+                    // after three unrelated types still read as query /
+                    // mutation / subscription.
+                    div()
+                        .text_size(px(9.0))
+                        .opacity(if active { 0.8 } else { 0.6 })
+                        .child(SharedString::from(*op)),
+                )
+                .child(
+                    div()
+                        .font_family(MONO)
+                        .text_size(px(12.0))
+                        .child(name.clone()),
+                )
         });
+        let empty = self.model.root_ops.is_empty();
 
         div()
             .flex_none()
@@ -833,6 +857,14 @@ impl TreePanel {
                     .child(label),
             )
             .child(div().flex().flex_wrap().gap_1().children(buttons))
+            .when(empty, |el| {
+                el.child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(th.text_muted)
+                        .child("No root operations — pick a type below to explore from."),
+                )
+            })
             .into_any_element()
     }
 

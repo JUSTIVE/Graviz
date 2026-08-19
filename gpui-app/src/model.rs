@@ -409,6 +409,11 @@ pub struct Model {
     pub overlay_marks: usize,
     /// Card indices of the root operation types present in this slice.
     pub roots: Vec<u32>,
+    /// Root operations as (`query`/`mutation`/`subscription`, type name),
+    /// taken from the schema rather than the current slice — in Reachable
+    /// mode the other two roots are not in the slice at all, which is why
+    /// only one button used to appear.
+    pub root_ops: Vec<(&'static str, gpui::SharedString)>,
     #[allow(dead_code)]
     pub options: ModelOptions,
     /// (documented, total) over types + field/enum rows.
@@ -936,6 +941,11 @@ pub fn build_model(graph: ParsedGraph, schema_name: String, options: &ModelOptio
         bundle_counts.push(p.bundled);
     }
     let rt = &graph.root_types;
+    let root_ops: Vec<(&'static str, gpui::SharedString)> =
+        [("query", &rt.query), ("mutation", &rt.mutation), ("subscription", &rt.subscription)]
+            .into_iter()
+            .filter_map(|(op, name)| name.as_ref().map(|n| (op, n.clone().into())))
+            .collect();
     let roots: Vec<u32> = [&rt.query, &rt.mutation, &rt.subscription]
         .into_iter()
         .filter_map(|name| name.as_ref().and_then(|n| index_of.get(n).copied()))
@@ -1013,6 +1023,7 @@ pub fn build_model(graph: ParsedGraph, schema_name: String, options: &ModelOptio
         schema_name,
         overlay_marks,
         roots,
+        root_ops,
         options: options.clone(),
         desc_coverage: (desc_documented, desc_total),
         graph,
