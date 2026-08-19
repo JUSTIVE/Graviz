@@ -8,7 +8,7 @@ use crate::canvas::GraphCanvas;
 use crate::config;
 use crate::editor::{EditorEvent, TextArea};
 use crate::loader;
-use crate::model::{build_model, root_candidates, slice_graph, Mode, Model, ModelOptions};
+use crate::model::{build_model, slice_graph, Mode, Model, ModelOptions};
 use crate::panels::{OrphanPanel, PanelEvent, UntilPanel};
 use crate::icons::{icon, Icon};
 use crate::theme::Theme;
@@ -157,13 +157,16 @@ impl Workspace {
             e
         });
         cx.subscribe(&tree, |this: &mut Self, _, event: &TreeEvent, cx| match event {
+            TreeEvent::RootPicked(name) => {
+                this.root_override = Some(name.clone());
+                this.rebuild(cx);
+            }
             TreeEvent::Select { node_index, row } => {
                 let (node_index, row) = (*node_index, *row);
                 this.canvas.update(cx, |canvas, cx| {
                     canvas.navigate_to(node_index as u32, row, cx);
                 });
             }
-            _ => {}
         })
         .detach();
         for sub in [
@@ -368,22 +371,6 @@ impl Workspace {
         self.reload_from_disk(cx);
     }
 
-    fn cycle_root(&mut self, cx: &mut Context<Self>) {
-        let candidates = root_candidates(&self.full_graph);
-        if candidates.len() < 2 {
-            return;
-        }
-        let current = self
-            .root_override
-            .clone()
-            .or_else(|| candidates.first().cloned());
-        let idx = candidates
-            .iter()
-            .position(|c| Some(c) == current.as_ref())
-            .unwrap_or(0);
-        self.root_override = Some(candidates[(idx + 1) % candidates.len()].clone());
-        self.rebuild(cx);
-    }
 
     fn navigate_to_type(&mut self, name: &str, cx: &mut Context<Self>) {
         if let Some(&card) = self.model.index_of.get(name) {
@@ -400,20 +387,6 @@ impl Workspace {
         self.rebuild(cx);
     }
 
-    fn toggle_button<F>(
-        &self,
-        th: Theme,
-        label: &'static str,
-        active: bool,
-        on_click: F,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<F>
-    where
-        F: Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
-    {
-        toolbar_button(th, label, active)
-            .on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx)))
-    }
 
     /// One mode tab, styled like the web's `ModeTab`: icon always keeps its
     /// tone, the label collapses away when inactive, active tab grows.
@@ -523,19 +496,6 @@ pub fn kind_badge(th: Theme, kind: gompass_core::graph::NodeKind, label: &'stati
         .child(SharedString::from(label))
 }
 
-fn toolbar_button(th: Theme, label: &'static str, active: bool) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(label)
-        .px_3()
-        .py_1()
-        .rounded_md()
-        .cursor_pointer()
-        .text_xs()
-        .when(active, |el| el.bg(th.active_bg).text_color(th.text))
-        .when(!active, |el| el.text_color(th.text_muted))
-        .hover(|el| el.bg(th.hover_bg))
-        .child(SharedString::from(label))
-}
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {

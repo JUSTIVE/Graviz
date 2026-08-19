@@ -95,6 +95,11 @@ pub struct Row {
     /// Field type was unwrapped through a Relay Connection.
     pub is_relay: bool,
     pub type_color: TypeColor,
+    /// Right-hand type, pre-fitted to the card width (the painter must not
+    /// re-run `fit_text` every frame).
+    pub right_fit: gpui::SharedString,
+    /// Width of `right_fit`, for right-alignment and the hover chip.
+    pub right_w: f32,
     /// Field args, for the sidebar's arity badge and hover list.
     pub args: Vec<(gpui::SharedString, gpui::SharedString)>,
     pub required_args: usize,
@@ -105,6 +110,8 @@ pub struct Card {
     /// Index into `ParsedGraph::nodes` / `Model::cards`.
     pub index: u32,
     pub name: gpui::SharedString,
+    /// Header name pre-fitted to the card width.
+    pub name_fit: gpui::SharedString,
     pub kind: NodeKind,
     /// Lowercase word for sidebar badges ("type", "interface", …).
     pub kind_label: &'static str,
@@ -114,9 +121,9 @@ pub struct Card {
     /// One-line header description, shown in show-descriptions mode.
     pub header_desc: Option<gpui::SharedString>,
     pub rows: Vec<Row>,
-    /// Trailing violet band (Object / Interface).
+    /// Trailing violet band (Object / Interface), pre-fitted.
     pub implements: Vec<gpui::SharedString>,
-    /// Trailing amber band (Object).
+    /// Trailing amber band (Object), pre-fitted.
     pub member_of_unions: Vec<gpui::SharedString>,
     pub w: f32,
     pub h: f32,
@@ -358,6 +365,7 @@ pub struct Model {
     pub overlay_marks: usize,
     /// Card indices of the root operation types present in this slice.
     pub roots: Vec<u32>,
+    #[allow(dead_code)]
     pub options: ModelOptions,
     /// (documented, total) over types + field/enum rows.
     pub desc_coverage: (usize, usize),
@@ -397,24 +405,6 @@ fn root_ops_of(graph: &ParsedGraph) -> HashSet<String> {
     }
 }
 
-/// Root candidates for the Reachable slice, declared roots first.
-pub fn root_candidates(full: &ParsedGraph) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let rt = &full.root_types;
-    for name in [&rt.query, &rt.mutation, &rt.subscription].into_iter().flatten() {
-        if !out.contains(name) {
-            out.push(name.clone());
-        }
-    }
-    for conventional in ["Query", "Mutation", "Subscription"] {
-        if !out.iter().any(|n| n == conventional)
-            && full.nodes.iter().any(|n| n.id == conventional)
-        {
-            out.push(conventional.to_string());
-        }
-    }
-    out
-}
 
 /// Cut the full graph down to the slice a mode shows.
 pub fn slice_graph(full: &ParsedGraph, mode: Mode, root_override: Option<&str>) -> ParsedGraph {
@@ -539,6 +529,8 @@ pub fn build_model(graph: ParsedGraph, schema_name: String, options: &ModelOptio
             until_expired: false,
             is_relay: false,
             type_color: TypeColor::Normal,
+            right_fit: gpui::SharedString::default(),
+            right_w: 0.0,
             args: Vec::new(),
             required_args: 0,
         };
@@ -679,6 +671,29 @@ pub fn build_model(graph: ParsedGraph, schema_name: String, options: &ModelOptio
             member_of_unions.len(),
         );
 
+        // Everything the painter would otherwise re-fit every frame.
+        for r in &mut rows {
+            if r.right.is_empty() {
+                continue;
+            }
+            let name_w = mono_w(&r.left, ROW_FONT_PX);
+            let relay_pad = if r.is_relay { 20.0 } else { 0.0 };
+            let max_w = (w - 20.0 - name_w - relay_pad - 8.0).max(40.0);
+            let fitted = fit_text(&r.right, ROW_FONT_PX, max_w);
+            r.right_w = mono_w(&fitted, ROW_FONT_PX);
+            r.right_fit = fitted.into();
+        }
+        let name_fit: gpui::SharedString =
+            fit_text(&n.name, NAME_FONT_PX, w - HEADER_PAD_X * 2.0).into();
+        let implements: Vec<gpui::SharedString> = implements
+            .iter()
+            .map(|s| gpui::SharedString::from(fit_text(s, BAND_FONT_PX, w - 20.0)))
+            .collect();
+        let member_of_unions: Vec<gpui::SharedString> = member_of_unions
+            .iter()
+            .map(|s| gpui::SharedString::from(fit_text(s, BAND_FONT_PX, w - 20.0)))
+            .collect();
+
         // Descriptions are pre-fitted to the card width, like the painter.
         let header_desc = if options.show_descriptions {
             n.description
@@ -708,6 +723,7 @@ pub fn build_model(graph: ParsedGraph, schema_name: String, options: &ModelOptio
         cards.push(Card {
             index: i as u32,
             name: n.name.clone().into(),
+            name_fit,
             kind: n.kind,
             kind_label: kind_label(n.kind),
             kind_upper: kind_upper(n.kind),

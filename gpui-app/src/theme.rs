@@ -34,6 +34,7 @@ pub struct Theme {
     pub pin: Hsla,
     /// Expired `[until]` marker (red-500) — same in both themes.
     pub expired: Hsla,
+    #[allow(dead_code)]
     pub shadow: Hsla,
     kind_object: Hsla,
     kind_interface: Hsla,

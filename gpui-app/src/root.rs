@@ -8,8 +8,7 @@ use crate::landing;
 use crate::loader;
 use crate::workspace::{OpenSchema, Workspace};
 use gpui::{
-    div, prelude::*, px, App, Context, Entity, ExternalPaths, MouseButton, PathPromptOptions,
-    SharedString, Window,
+    div, prelude::*, Context, Entity, ExternalPaths, PathPromptOptions, Window,
 };
 use std::path::PathBuf;
 

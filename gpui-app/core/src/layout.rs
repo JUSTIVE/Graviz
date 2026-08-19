@@ -315,16 +315,11 @@ fn anchor_points(
 /// Centripetal-ish Catmull-Rom through the control points, flattened.
 fn smooth_polyline(ctrl: &[Point]) -> Vec<Point> {
     if ctrl.len() <= 2 {
-        // straight segment still gets samples for the LOD stride
-        let (a, b) = (ctrl[0], *ctrl.last().unwrap());
-        return (0..=16)
-            .map(|i| {
-                let t = i as f32 / 16.0;
-                Point { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t }
-            })
-            .collect();
+        // A straight edge is exactly two points — sampling it would only cost
+        // tessellation work with no visual difference.
+        return vec![ctrl[0], *ctrl.last().unwrap()];
     }
-    let steps_per_seg = 12usize;
+    let steps_per_seg = 8usize;
     let mut out = Vec::with_capacity((ctrl.len() - 1) * steps_per_seg + 1);
     out.push(ctrl[0]);
     for i in 0..ctrl.len() - 1 {
@@ -492,7 +487,7 @@ fn layout_component(
     let mut xin: Vec<Vec<u32>> = vec![Vec::new(); m];
     // chains: original directed pair -> virtual xnode ids from source to target
     let mut chains: HashMap<(u32, u32), Vec<u32>> = HashMap::new();
-    let mut push_edge = |xout: &mut Vec<Vec<u32>>, xin: &mut Vec<Vec<u32>>, a: u32, b: u32| {
+    let push_edge = |xout: &mut Vec<Vec<u32>>, xin: &mut Vec<Vec<u32>>, a: u32, b: u32| {
         xout[a as usize].push(b);
         xin[b as usize].push(a);
     };

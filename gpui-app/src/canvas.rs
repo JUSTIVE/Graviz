@@ -7,7 +7,7 @@
 
 use crate::theme::Theme;
 use crate::model::{
-    fit_text, mono_w, EdgeGroup, Model, RowHit, RowKind, TypeColor, BAND_FONT_PX, CARD_PAD_X,
+    mono_w, EdgeGroup, Model, RowHit, RowKind, TypeColor, BAND_FONT_PX, CARD_PAD_X,
     DESC_FONT_PX, HEADER_PAD_X, KIND_FONT_PX, NAME_FONT_PX, ROW_FONT_PX, TIGHT_ROW_H,
 };
 use gompass_core::graph::NodeKind;
@@ -23,12 +23,13 @@ use std::rc::Rc;
 const ZOOM_MIN: f32 = 0.01;
 const ZOOM_MAX: f32 = 4.0;
 const CLICK_DRAG_THRESHOLD: f32 = 4.0;
+// Real glyphs stop paying for themselves once they are only a couple of
+// pixels tall; below these zooms the painter falls back to text-shaped bars,
+// which keeps the card's texture without shaping thousands of invisible runs.
 /// Below this zoom, row text gives way to placeholder bars.
-const LOD_ROWS: f32 = 0.12;
-/// Below this zoom, rows are not drawn at all (sub-pixel pitch).
-const LOD_ROW_BARS: f32 = 0.075;
-/// Below this zoom, header text is not drawn.
-const LOD_HEADER: f32 = 0.03;
+const LOD_ROWS: f32 = 0.28;
+/// Below this zoom, header text gives way to a name bar.
+const LOD_HEADER: f32 = 0.2;
 /// Alpha applied to everything that is not the focused card (web DIM_ALPHA).
 const DIM_ALPHA: f32 = 0.1;
 
@@ -287,6 +288,35 @@ impl GraphCanvas {
         best.map(|(_, i)| i)
     }
 
+    /// Frame both endpoints of an edge (the web's `focusOnEdge`): fit them
+    /// with an 80px pad, capped at k = 1.2, and focus the source.
+    fn focus_edge(&mut self, edge: u32, vw: f32, vh: f32) {
+        let Some(e) = self.model.edges.get(edge as usize) else { return };
+        let (a, b) = (e.from as usize, e.to as usize);
+        let (pa, pb) = (self.model.positions[a], self.model.positions[b]);
+        let (ca, cb) = (&self.model.cards[a], &self.model.cards[b]);
+        let x0 = pa.x.min(pb.x);
+        let y0 = pa.y.min(pb.y);
+        let x1 = (pa.x + ca.w).max(pb.x + cb.w);
+        let y1 = (pa.y + ca.h).max(pb.y + cb.h);
+        let pad = 80.0;
+        let k = (((vw - pad) / (x1 - x0).max(1.0))
+            .min((vh - pad) / (y1 - y0).max(1.0)))
+        .clamp(ZOOM_MIN, 1.2);
+        if let Some(f) = self.focus {
+            if f != e.from {
+                self.history.push(f);
+            }
+        }
+        self.view = ViewTransform {
+            x: vw / 2.0 - (x0 + x1) / 2.0 * k,
+            y: vh / 2.0 - (y0 + y1) / 2.0 * k,
+            k,
+        };
+        self.focus = Some(e.from);
+        self.hovered_edge = Some(edge);
+    }
+
     fn center_on(&mut self, card: u32, vw: f32, vh: f32) {
         if !self.suppress_push {
             if let Some(f) = self.focus {
@@ -356,6 +386,9 @@ impl GraphCanvas {
                 cx.notify();
             }
         } else {
+            // Hover: only repaint when the hovered TARGET changes. Following
+            // the cursor pixel-by-pixel would repaint the whole canvas on
+            // every mouse event — the tooltip re-anchors on the next paint.
             let hover = self.hit_test(ev.position);
             let hovered_edge = if hover.is_none() {
                 self.hit_test_edge(ev.position)
@@ -363,18 +396,10 @@ impl GraphCanvas {
                 None
             };
             let (ox, oy) = self.canvas_origin.get();
-            let pos = (f32::from(ev.position.x) - ox, f32::from(ev.position.y) - oy);
-            let moved = match self.hover_pos {
-                Some((px_, py_)) => (px_ - pos.0).abs() + (py_ - pos.1).abs() > 2.0,
-                None => true,
-            };
-            if hover != self.hover
-                || hovered_edge != self.hovered_edge
-                || ((hover.is_some() || hovered_edge.is_some()) && moved)
-            {
+            self.hover_pos = Some((f32::from(ev.position.x) - ox, f32::from(ev.position.y) - oy));
+            if hover != self.hover || hovered_edge != self.hovered_edge {
                 self.hover = hover;
                 self.hovered_edge = hovered_edge;
-                self.hover_pos = Some(pos);
                 cx.notify();
             }
         }
@@ -390,9 +415,14 @@ impl GraphCanvas {
                 self.pinned = None;
                 self.hovered_edge = None;
             }
+            let vw = f32::from(window.viewport_size().width) - self.pane_offset_x;
+            let vh = f32::from(window.viewport_size().height);
+            if self.hit_test(ev.position).is_none() {
+                if let Some(ei) = self.hit_test_edge(ev.position) {
+                    self.focus_edge(ei, vw, vh);
+                }
+            }
             if let Some(hit) = self.hit_test(ev.position) {
-                let vw = f32::from(window.viewport_size().width) - self.pane_offset_x;
-                let vh = f32::from(window.viewport_size().height);
                 match hit.row {
                     Some(RowHit::Row(row)) => {
                         // Clicking the right-aligned type navigates; clicking
@@ -471,6 +501,7 @@ fn mono(weight: FontWeight) -> Font {
     f
 }
 
+#[allow(dead_code)]
 fn run(len: usize, font: &Font, color: Hsla) -> TextRun {
     TextRun {
         len,
@@ -608,10 +639,20 @@ impl Render for GraphCanvas {
         let bg = th.bg;
         let stats = self.stats_line();
 
+        // Cursor mirrors the web: pointer over anything clickable, an open
+        // hand over empty canvas, closed while panning.
+        let cursor = if self.drag.as_ref().is_some_and(|d| d.moved) {
+            gpui::CursorStyle::ClosedHand
+        } else if self.hover.is_some() || self.hovered_edge.is_some() {
+            gpui::CursorStyle::PointingHand
+        } else {
+            gpui::CursorStyle::OpenHand
+        };
         div()
             .size_full()
             .relative()
             .bg(bg)
+            .cursor(cursor)
             .on_scroll_wheel(cx.listener(|this, ev, window, cx| this.on_scroll(ev, window, cx)))
             .on_mouse_down(
                 MouseButton::Left,
@@ -994,6 +1035,12 @@ fn paint_scene(
     // re-shaping every visible glyph run each frame.
     let kt = 2f32.powf((k.log2() * 8.0).round() / 8.0);
     let mut text_errors = 0usize;
+    // GOMPASS_PERF=1 reports what a frame actually costs.
+    let probe = std::env::var("GOMPASS_PERF").is_ok();
+    let mut n_cards = 0usize;
+    let mut n_rows = 0usize;
+    SHAPES.with(|c| c.set(0));
+    let t_probe = std::time::Instant::now();
 
     window.paint_layer(bounds, |window| {
     for (i, card) in model.cards.iter().enumerate() {
@@ -1001,6 +1048,7 @@ fn paint_scene(
         if pos.x + card.w < wx0 || pos.x > wx1 || pos.y + card.h < wy0 || pos.y > wy1 {
             continue;
         }
+        n_cards += 1;
         let ci = i as u32;
         let dim = if highlight_overlay
             && !card.is_overlay
@@ -1107,10 +1155,9 @@ fn paint_scene(
                     cx,
                 );
             }
-            let name = fit_text(&card.name, NAME_FONT_PX, card.w - HEADER_PAD_X * 2.0);
             text_errors += paint_baseline(
                 &text_system,
-                name.into(),
+                card.name_fit.clone(),
                 &name_font,
                 px(NAME_FONT_PX * kt),
                 gpui::white().opacity(dim),
@@ -1147,9 +1194,10 @@ fn paint_scene(
         // ---- body rows ----
         let pitch = card.body_pitch();
         if k >= LOD_ROWS {
-            for (ri, row) in card.rows.iter().enumerate() {
+            let (r_lo, r_hi) = visible_rows(card, pos.y, wy0, wy1);
+            for (ri, row) in card.rows.iter().enumerate().take(r_hi).skip(r_lo) {
+                n_rows += 1;
                 let fy = pos.y + card.row_baseline(ri);
-                let name_w = mono_w(&row.left, ROW_FONT_PX);
                 match row.kind {
                     RowKind::Field => {
                         let dep_a = if row.deprecated && !row.until_expired { 0.4 } else { 1.0 };
@@ -1168,11 +1216,8 @@ fn paint_scene(
                             cx,
                         );
                         if !row.right.is_empty() {
-                            let relay_pad = if row.is_relay { 20.0 } else { 0.0 };
-                            let max_w =
-                                (card.w - 20.0 - name_w - relay_pad - 8.0).max(40.0);
-                            let ty = fit_text(&row.right, ROW_FONT_PX, max_w);
-                            let ty_w = mono_w(&ty, ROW_FONT_PX);
+                            let ty = row.right_fit.clone();
+                            let ty_w = row.right_w;
                             let (ty_c, ty_a) = match row.type_color {
                                 TypeColor::Expired => (th.expired, 1.0),
                                 TypeColor::BuiltinScalar => (th.type_builtin, 0.7),
@@ -1181,7 +1226,7 @@ fn paint_scene(
                             let tx = pos.x + card.w - CARD_PAD_X - ty_w;
                             text_errors += paint_baseline(
                                 &text_system,
-                                ty.into(),
+                                ty,
                                 &row_font,
                                 px(ROW_FONT_PX * kt),
                                 ty_c.opacity(ty_a * dep_a * dim),
@@ -1282,7 +1327,7 @@ fn paint_scene(
                 let by = card.band.iface_rows_top + bi as f32 * TIGHT_ROW_H + 10.0;
                 text_errors += paint_baseline(
                     &text_system,
-                    fit_text(name, BAND_FONT_PX, card.w - 20.0).into(),
+                    name.clone(),
                     &name_font,
                     px(BAND_FONT_PX * kt),
                     th.kind_color(NodeKind::Interface).opacity(dim),
@@ -1297,7 +1342,7 @@ fn paint_scene(
                 let by = card.band.union_rows_top + bi as f32 * TIGHT_ROW_H + 10.0;
                 text_errors += paint_baseline(
                     &text_system,
-                    fit_text(name, BAND_FONT_PX, card.w - 20.0).into(),
+                    name.clone(),
                     &name_font,
                     px(BAND_FONT_PX * kt),
                     th.kind_color(NodeKind::Union).opacity(dim),
@@ -1311,7 +1356,8 @@ fn paint_scene(
         } else {
             // Placeholder bars keep every card text-shaped at any zoom.
             let bar_h = (ROW_FONT_PX * k).max(0.6);
-            for (ri, row) in card.rows.iter().enumerate() {
+            let (r_lo, r_hi) = visible_rows(card, pos.y, wy0, wy1);
+            for (ri, row) in card.rows.iter().enumerate().take(r_hi).skip(r_lo) {
                 let by = card.row_y(ri) + (pitch - ROW_FONT_PX) / 2.0;
                 let left_w = mono_w(&row.left, ROW_FONT_PX).min(card.w * 0.55);
                 window.paint_quad(fill(
@@ -1448,6 +1494,43 @@ fn paint_scene(
     if text_errors > 0 {
         eprintln!("canvas: {text_errors} text paint errors this frame");
     }
+    if probe {
+        let n_edges = model
+            .edges
+            .iter()
+            .filter(|e| {
+                !(e.bbox[2] < wx0 || e.bbox[0] > wx1 || e.bbox[3] < wy0 || e.bbox[1] > wy1)
+            })
+            .count();
+        let pts: usize = model
+            .edges
+            .iter()
+            .filter(|e| {
+                !(e.bbox[2] < wx0 || e.bbox[0] > wx1 || e.bbox[3] < wy0 || e.bbox[1] > wy1)
+            })
+            .map(|e| e.points.len() / 2)
+            .sum();
+        eprintln!(
+            "perf: k={k:.2} {:.2}ms cards={n_cards} rows={n_rows} shapes={} edges={n_edges} edge_pts={pts}",
+            t_probe.elapsed().as_secs_f32() * 1000.0,
+            SHAPES.with(|c| c.get())
+        );
+    }
+}
+
+thread_local! {
+    /// Shaped-line count for the GOMPASS_PERF probe.
+    static SHAPES: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Row index range whose band intersects the visible world rect — a tall
+/// card must not shape rows nobody can see.
+fn visible_rows(card: &crate::model::Card, card_y: f32, wy0: f32, wy1: f32) -> (usize, usize) {
+    let pitch = card.body_pitch();
+    let top = card_y + card.body_top();
+    let lo = (((wy0 - top) / pitch).floor() as isize).max(0) as usize;
+    let hi = (((wy1 - top) / pitch).ceil() as isize).max(0) as usize + 1;
+    (lo.min(card.rows.len()), hi.min(card.rows.len()))
 }
 
 /// Paints one shaped line with its BASELINE at `baseline` (screen px), the
@@ -1479,6 +1562,7 @@ fn paint_baseline(
             color: Some(c),
         }),
     };
+    SHAPES.with(|c| c.set(c.get() + 1));
     let line = ts.shape_line(text, size_px, &[run], None);
     let line_height = line.ascent + line.descent;
     line.paint(

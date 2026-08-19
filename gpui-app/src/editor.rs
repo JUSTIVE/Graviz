@@ -14,6 +14,93 @@ use gpui::{
 use std::cell::Cell;
 use std::rc::Rc;
 
+/// GraphQL keywords the highlighter paints in the interface color.
+const KEYWORDS: [&str; 14] = [
+    "type", "interface", "enum", "union", "input", "scalar", "schema", "extend",
+    "implements", "directive", "query", "mutation", "subscription", "fragment",
+];
+
+/// Splits one SDL line into `(byte_len, color)` runs — comments, strings,
+/// keywords, directives, type names and punctuation, like cm6-graphql.
+fn highlight(line: &str, th: Theme) -> Vec<(usize, gpui::Hsla)> {
+    let mut runs: Vec<(usize, gpui::Hsla)> = Vec::new();
+    let push = |len: usize, c: gpui::Hsla, runs: &mut Vec<(usize, gpui::Hsla)>| {
+        if len == 0 {
+            return;
+        }
+        match runs.last_mut() {
+            Some((l, prev)) if *prev == c => *l += len,
+            _ => runs.push((len, c)),
+        }
+    };
+    let bytes = line.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let rest = &line[i..];
+        let ch = bytes[i] as char;
+        if ch == '#' {
+            push(line.len() - i, th.text_muted, &mut runs);
+            break;
+        }
+        if ch == '"' {
+            // block or single-line string (descriptions)
+            let quote_len = if rest.starts_with("\"\"\"") { 3 } else { 1 };
+            let mut j = i + quote_len;
+            while j < bytes.len() {
+                if quote_len == 3 && line[j..].starts_with("\"\"\"") {
+                    j += 3;
+                    break;
+                }
+                if quote_len == 1 && bytes[j] == b'"' {
+                    j += 1;
+                    break;
+                }
+                j += 1;
+            }
+            push(j.min(line.len()) - i, th.overlay_green, &mut runs);
+            i = j.min(line.len());
+            continue;
+        }
+        if ch == '@' {
+            let mut j = i + 1;
+            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                j += 1;
+            }
+            push(j - i, th.type_amber, &mut runs);
+            i = j;
+            continue;
+        }
+        if ch.is_ascii_alphabetic() || ch == '_' {
+            let mut j = i;
+            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                j += 1;
+            }
+            let word = &line[i..j];
+            let color = if KEYWORDS.contains(&word) {
+                th.kind_color(gompass_core::graph::NodeKind::Interface)
+            } else if word.starts_with(|c: char| c.is_ascii_uppercase()) {
+                th.kind_color(gompass_core::graph::NodeKind::Object)
+            } else {
+                th.text
+            };
+            push(j - i, color, &mut runs);
+            i = j;
+            continue;
+        }
+        if ch == '-' && rest.len() > 1 && !bytes[i + 1].is_ascii_digit() {
+            // the overlay's `-Type.field` removal marker
+            push(1, th.red, &mut runs);
+            i += 1;
+            continue;
+        }
+        let len = ch.len_utf8();
+        let color = if ch.is_ascii_digit() { th.type_amber } else { th.text_muted };
+        push(len, color, &mut runs);
+        i += len;
+    }
+    runs
+}
+
 const FONT_PX: f32 = 12.0;
 const LINE_H: f32 = 18.0;
 const PAD: f32 = 8.0;
@@ -63,6 +150,7 @@ impl TextArea {
         cx.notify();
     }
 
+    #[allow(dead_code)]
     pub fn focus_handle(&self) -> FocusHandle {
         self.focus.clone()
     }
@@ -455,18 +543,21 @@ fn paint_editor(
                     }
                 }
                 if !l.is_empty() {
-                    let run = TextRun {
-                        len: l.len(),
-                        font: font.clone(),
-                        color: th.text,
-                        background_color: None,
-                        underline: None,
-                        strikethrough: None,
-                    };
+                    let runs: Vec<TextRun> = highlight(l, th)
+                        .into_iter()
+                        .map(|(len, color)| TextRun {
+                            len,
+                            font: font.clone(),
+                            color,
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        })
+                        .collect();
                     let line = text_system.shape_line(
                         SharedString::from(l.to_string()),
                         px(FONT_PX),
-                        &[run],
+                        &runs,
                         None,
                     );
                     let _ = line.paint(
@@ -494,4 +585,44 @@ fn paint_editor(
             byte += line_len + 1;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn th() -> Theme {
+        crate::theme::theme(gpui::WindowAppearance::Dark)
+    }
+
+    /// Runs must tile the line exactly — a mismatch makes shape_line panic.
+    fn total(line: &str) -> usize {
+        highlight(line, th()).iter().map(|(l, _)| l).sum()
+    }
+
+    #[test]
+    fn runs_cover_every_byte() {
+        for line in [
+            "type User implements Node {",
+            "  name: String! @deprecated(reason: \"gone\")",
+            "# a comment",
+            "\"\"\"description\"\"\"",
+            "  -legacyName",
+            "",
+            "  tags: [String!]!",
+        ] {
+            assert_eq!(total(line), line.len(), "line: {line:?}");
+        }
+    }
+
+    #[test]
+    fn keywords_types_and_comments_get_distinct_colors() {
+        let t = th();
+        let runs = highlight("type User {", t);
+        assert_eq!(runs[0].1, t.kind_color(gompass_core::graph::NodeKind::Interface));
+        assert!(runs.iter().any(|(_, c)| *c
+            == t.kind_color(gompass_core::graph::NodeKind::Object)));
+        let c = highlight("# note", t);
+        assert_eq!(c, vec![(6, t.text_muted)]);
+    }
 }
