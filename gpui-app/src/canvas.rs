@@ -1758,6 +1758,7 @@ fn paint_scene(
     window: &mut Window,
     cx: &mut App,
 ) {
+    let t_frame = std::time::Instant::now();
     let th = crate::theme::current(cx, window.appearance());
     let k = view.k;
     let ox = f32::from(bounds.origin.x) + view.x;
@@ -1792,6 +1793,9 @@ fn paint_scene(
     };
 
     let lod_desc = LOD_DESC_AT.with(|v| *v);
+    // Setup: theme resolution, the visible world rect, and the first-degree
+    // neighbour set, which walks every edge.
+    let t_setup = t_frame.elapsed().as_secs_f32() * 1000.0;
     let t_probe = std::time::Instant::now();
     // Frame budget: price the edges at the ideal tolerance first, and if the
     // bill is too high, relax the tolerance just enough to fit. n scales with
@@ -1818,6 +1822,7 @@ fn paint_scene(
             CURVE_TOL
         }
     };
+    let t_price = t_probe.elapsed().as_secs_f32() * 1000.0;
     let mut n_pts = 0usize;
     
     // ---- edges, one stroked path per color group ----
@@ -1969,6 +1974,7 @@ fn paint_scene(
     }
     });
     let t_edges = t_probe.elapsed().as_secs_f32() * 1000.0;
+    let t_nodes_start = std::time::Instant::now();
 
     // ---- nodes (their own layer, above the edges) ----
     // Geometry, colors and draw order mirror the web renderer's
@@ -2512,12 +2518,21 @@ fn paint_scene(
                 !(e.bbox[2] < wx0 || e.bbox[0] > wx1 || e.bbox[3] < wy0 || e.bbox[1] > wy1)
             })
             .count();
+        // Anatomy of the frame. The stages partition it: setup + price +
+        // stroke + shape + glyph + quads == total, so nothing hides in a
+        // residual. `shape` is cache lookup plus shaping on a miss; `glyph`
+        // is ShapedLine::paint; `quads` is the node layer minus its text,
+        // i.e. card bodies, headers, borders and row decorations.
+        let nodes = t_nodes_start.elapsed().as_secs_f32() * 1000.0;
+        let shape = SHAPE_NS.with(|c| c.get()) * 1000.0;
+        let glyph = GLYPH_NS.with(|c| c.get()) * 1000.0;
+        let stroke = t_edges - t_price;
+        let total = t_setup + t_probe.elapsed().as_secs_f32() * 1000.0;
         eprintln!(
-            "perf: k={k:.2} {:.2}ms (edges {t_edges:.2} shape {:.2} glyph {:.2}) cards={n_cards} rows={n_rows} shapes={} edges={n_edges} emit={n_pts} tol={curve_tol:.2}",
-            t_probe.elapsed().as_secs_f32() * 1000.0,
-            SHAPE_NS.with(|c| c.get()) * 1000.0,
-            GLYPH_NS.with(|c| c.get()) * 1000.0,
-            SHAPES.with(|c| c.get())
+            "perf: k={k:.2} tot {total:.2} = setup {t_setup:.2} price {t_price:.2} stroke {stroke:.2} shape {shape:.2} glyph {glyph:.2} quads {:.2} | cards={n_cards} rows={n_rows} shapes={} edges={n_edges} emit={n_pts} tol={curve_tol:.2} skip={}",
+            nodes - shape - glyph,
+            SHAPES.with(|c| c.get()),
+            TEXT_SKIPPED.with(|c| c.get()),
         );
     }
 }
