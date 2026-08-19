@@ -629,18 +629,15 @@ fn anchor_points(
     port_y: f32,
     waypoints: &[Point],
 ) -> (Point, Point) {
-    let first_x = waypoints.first().map(|p| p.x).unwrap_or(tp.x + tn.w / 2.0);
-    let last_x = waypoints.last().map(|p| p.x).unwrap_or(sp.x + sn.w / 2.0);
-    let s_cx = sp.x + sn.w / 2.0;
-    let t_cx = tp.x + tn.w / 2.0;
-    let start = Point {
-        x: if first_x >= s_cx { sp.x + sn.w } else { sp.x },
-        y: sp.y + port_y,
-    };
-    let end = Point {
-        x: if last_x <= t_cx { tp.x } else { tp.x + tn.w },
-        y: tp.y + tn.h / 2.0,
-    };
+    // Always out of the right face and into the left face, whichever way the
+    // two cards happen to sit. The side an edge touches then *means*
+    // something — right is "this type refers to", left is "is referred to by"
+    // — instead of merely reporting which card the layout put first. An edge
+    // whose target ended up on the left loops back around, which is what a
+    // back edge should look like.
+    let _ = (waypoints, tn);
+    let start = Point { x: sp.x + sn.w, y: sp.y + port_y };
+    let end = Point { x: tp.x, y: tp.y + tn.h / 2.0 };
     (start, end)
 }
 
@@ -779,9 +776,13 @@ fn spline(knots: &[Point]) -> Vec<CubicSeg> {
         let p2 = knots[i + 1];
         let dx = (p2.x - p1.x).abs();
         // horizontal pull, proportional to the span but bounded
-        let h = (dx / 2.0).clamp(24.0, 160.0) * if p2.x >= p1.x { 1.0 } else { -1.0 };
+        let pull = (dx / 2.0).clamp(24.0, 160.0);
+        // The two ends always leave rightward and arrive rightward, matching
+        // the faces they are anchored to. Following the segment's own
+        // direction would make a back edge dive left the instant it left the
+        // card, crossing back over the card it just came from.
         let c1 = if i == 0 {
-            Point { x: p1.x + h, y: p1.y }
+            Point { x: p1.x + pull, y: p1.y }
         } else {
             let p0 = knots[i - 1];
             Point { x: p1.x + (p2.x - p0.x) / 6.0, y: p1.y + (p2.y - p0.y) / 6.0 }
@@ -790,7 +791,7 @@ fn spline(knots: &[Point]) -> Vec<CubicSeg> {
             let p3 = knots[i + 2];
             Point { x: p2.x - (p3.x - p1.x) / 6.0, y: p2.y - (p3.y - p1.y) / 6.0 }
         } else {
-            Point { x: p2.x - h, y: p2.y }
+            Point { x: p2.x - pull, y: p2.y }
         };
         out.push(CubicSeg { c1, c2, end: p2 });
     }
@@ -1726,6 +1727,47 @@ mod tests {
             }
         }
         n
+    }
+
+    #[test]
+    fn edges_leave_the_right_face_and_arrive_at_the_left_one() {
+        // Including the back edge: Repo points at User, which sits to its
+        // left, so that one has to loop out right and come back around.
+        let nodes = vec![node(120.0, 60.0); 3];
+        let edges = vec![edge(0, 1), edge(1, 2), edge(2, 1)];
+        let r = layout(&nodes, &edges, &[0], &[], &LayoutConfig::default());
+        for (k, e) in edges.iter().enumerate() {
+            let path = &r.edges[k];
+            let (sp, sn) = (r.positions[e.from as usize], nodes[e.from as usize]);
+            let (tp, _) = (r.positions[e.to as usize], nodes[e.to as usize]);
+            assert!(
+                (path.start.x - (sp.x + sn.w)).abs() < 0.5,
+                "edge {k} leaves at {} not the right face {}",
+                path.start.x,
+                sp.x + sn.w
+            );
+            let end = path.curves.last().expect("a path has segments").end;
+            assert!(
+                (end.x - tp.x).abs() < 0.5,
+                "edge {k} arrives at {} not the left face {}",
+                end.x,
+                tp.x
+            );
+        }
+    }
+
+    #[test]
+    fn both_ends_of_a_back_edge_point_rightward() {
+        // The departure and arrival tangents must both head right, or a back
+        // edge dives left the moment it leaves and crosses its own card.
+        let nodes = vec![node(120.0, 60.0); 2];
+        let edges = vec![edge(0, 1), edge(1, 0)];
+        let r = layout(&nodes, &edges, &[0], &[], &LayoutConfig::default());
+        let back = &r.edges[1];
+        let first = back.curves.first().unwrap();
+        assert!(first.c1.x > back.start.x, "departure tangent points left");
+        let last = back.curves.last().unwrap();
+        assert!(last.c2.x < last.end.x, "arrival tangent points left");
     }
 
     #[test]
