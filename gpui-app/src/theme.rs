@@ -23,6 +23,9 @@ pub struct Theme {
     pub overlay_green: Hsla,
     pub arg_orange: Hsla,
     pub accent: Hsla,
+    /// shadcn --primary: monochrome (near-black light / near-white dark).
+    pub primary: Hsla,
+    pub primary_fg: Hsla,
     /// Muted amber the web uses for builtin-scalar return types.
     pub type_builtin: Hsla,
     pub relay_orange: Hsla,
@@ -74,6 +77,8 @@ fn dark() -> Theme {
         overlay_green: rgb(0x10b981).into(),
         arg_orange: rgb(0xe08a4a).into(),
         accent: rgb(0x0ea5e9).into(),
+        primary: rgb(0xe5e5e5).into(),
+        primary_fg: rgb(0x171717).into(),
         type_builtin: rgb(0xb08c5a).into(),
         relay_orange: rgb(0xf26a03).into(),
         investigate: rgb(0xf97316).into(),
@@ -108,6 +113,8 @@ fn light() -> Theme {
         overlay_green: rgb(0x10b981).into(),
         arg_orange: rgb(0xb05a1f).into(),
         accent: rgb(0x0369a1).into(),
+        primary: rgb(0x171717).into(),
+        primary_fg: rgb(0xfafafa).into(),
         type_builtin: rgb(0xb08c5a).into(),
         relay_orange: rgb(0xf26a03).into(),
         investigate: rgb(0xf97316).into(),

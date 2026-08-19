@@ -9,6 +9,7 @@ use crate::config;
 use crate::editor::{EditorEvent, TextArea};
 use crate::loader;
 use crate::model::{build_model, root_candidates, slice_graph, Mode, Model, ModelOptions};
+use crate::icons::{icon, Icon};
 use crate::theme::Theme;
 use crate::tree::{TreeEvent, TreePanel};
 use gompass_core::graph::{OverlayDiff, ParsedGraph};
@@ -73,6 +74,25 @@ pub struct Workspace {
     overlay_diff: Option<OverlayDiff>,
     overlay_error: Option<String>,
     dock_open: bool,
+    /// Tab badge counts, recomputed only when the schema changes.
+    history_open: bool,
+    orphan_count: usize,
+    deprecated_count: usize,
+}
+
+/// Types no root operation can reach, and deprecated members — the two tab
+/// badges the web shows next to Orphaned / Deprecated.
+fn tab_counts(graph: &ParsedGraph) -> (usize, usize) {
+    let orphans = slice_graph(graph, Mode::Orphaned, None).nodes.len();
+    let deprecated = graph
+        .nodes
+        .iter()
+        .map(|n| {
+            n.fields.as_deref().unwrap_or(&[]).iter().filter(|f| f.is_deprecated).count()
+                + n.values.as_deref().unwrap_or(&[]).iter().filter(|v| v.is_deprecated).count()
+        })
+        .sum();
+    (orphans, deprecated)
 }
 
 impl Workspace {
@@ -157,6 +177,7 @@ impl Workspace {
         })
         .detach();
 
+        let counts = tab_counts(&loaded.graph);
         Self {
             schema_path,
             full_graph: loaded.graph,
@@ -175,6 +196,9 @@ impl Workspace {
             overlay_diff: loaded.diff,
             overlay_error: None,
             dock_open: std::env::var("GOMPASS_DOCK").is_ok(),
+            history_open: false,
+            orphan_count: counts.0,
+            deprecated_count: counts.1,
         }
     }
 
@@ -212,6 +236,9 @@ impl Workspace {
             Ok(loaded) => {
                 eprintln!("reloaded {}", self.schema_path.display());
                 self.full_graph = loaded.graph;
+                let counts = tab_counts(&self.full_graph);
+                self.orphan_count = counts.0;
+                self.deprecated_count = counts.1;
                 self.schema_name = loaded.name;
                 self.overlay_diff = loaded.diff;
                 self.overlay_error = None;
@@ -316,12 +343,6 @@ impl Workspace {
         self.rebuild(cx);
     }
 
-    fn mode_tab(&self, th: Theme, mode: Mode, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let active = self.mode == mode;
-        toolbar_button(th, mode.label(), active)
-            .on_click(cx.listener(move |this, _, _, cx| this.set_mode(mode, cx)))
-    }
-
     fn toggle_button<F>(
         &self,
         th: Theme,
@@ -336,6 +357,113 @@ impl Workspace {
         toolbar_button(th, label, active)
             .on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx)))
     }
+
+    /// One mode tab, styled like the web's `ModeTab`: icon always keeps its
+    /// tone, the label collapses away when inactive, active tab grows.
+    fn mode_tab(
+        &self,
+        th: Theme,
+        mode: Mode,
+        icon_name: Icon,
+        tone: gpui::Hsla,
+        count: Option<usize>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let active = self.mode == mode;
+        let disabled = matches!(count, Some(0));
+        div()
+            .id(mode.label())
+            .flex()
+            .items_center()
+            .justify_center()
+            .px_3()
+            .py_2()
+            .border_b_2()
+            .when(active, |el| el.border_color(tone))
+            .when(!active, |el| el.border_color(gpui::transparent_black()))
+            .when(active, |el| el.flex_grow(1.0))
+            .text_size(px(12.0))
+            .when(disabled, |el| el.opacity(0.4))
+            .when(!disabled, |el| {
+                el.cursor_pointer().hover(|el| el.text_color(th.text))
+            })
+            .when(!active, |el| el.text_color(th.text_muted))
+            .when(active, |el| el.text_color(tone))
+            .child(icon(icon_name, px(16.0), tone.opacity(if active { 1.0 } else { 0.7 })))
+            .when(active, |el| {
+                el.child(
+                    div()
+                        .ml(px(6.0))
+                        .flex()
+                        .items_center()
+                        .whitespace_nowrap()
+                        .child(SharedString::from(mode.label()))
+                        .when_some(count.filter(|c| *c > 0), |el, c| {
+                            el.child(
+                                div()
+                                    .ml(px(6.0))
+                                    .rounded_full()
+                                    .px(px(6.0))
+                                    .py(px(1.0))
+                                    .text_size(px(10.0))
+                                    .bg(tone.opacity(0.15))
+                                    .text_color(tone)
+                                    .child(SharedString::from(c.to_string())),
+                            )
+                        }),
+                )
+            })
+            .when(!disabled, |el| {
+                el.on_click(cx.listener(move |this, _, _, cx| this.set_mode(mode, cx)))
+            })
+    }
+
+    /// A pill filter chip from the canvas's floating "View controls" card.
+    fn chip<F>(
+        &self,
+        th: Theme,
+        id: &'static str,
+        label: &'static str,
+        active: bool,
+        on_click: F,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<F>
+    where
+        F: Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    {
+        let fg = if active { th.primary } else { th.text_muted };
+        div()
+            .id(id)
+            .flex()
+            .items_center()
+            .gap_1()
+            .rounded_full()
+            .border_1()
+            .px_2()
+            .py(px(2.0))
+            .text_size(px(10.0))
+            .cursor_pointer()
+            .when(active, |el| el.border_color(th.primary).bg(th.primary.opacity(0.1)))
+            .when(!active, |el| {
+                el.border_color(th.card_border).hover(|el| el.text_color(th.text))
+            })
+            .text_color(fg)
+            .child(icon(Icon::Filter, px(10.0), fg))
+            .child(SharedString::from(label))
+            .on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx)))
+    }
+}
+
+/// Solid kind badge used in list rows (web `KIND_STYLES[kind].badge`).
+pub fn kind_badge(th: Theme, kind: gompass_core::graph::NodeKind, label: &'static str) -> gpui::Div {
+    div()
+        .flex_none()
+        .rounded_md()
+        .px(px(6.0))
+        .text_size(px(9.0))
+        .bg(th.kind_color(kind))
+        .text_color(gpui::white())
+        .child(SharedString::from(label))
 }
 
 fn toolbar_button(th: Theme, label: &'static str, active: bool) -> gpui::Stateful<gpui::Div> {
@@ -356,84 +484,84 @@ impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let th = crate::theme::theme(window.appearance());
 
-        // Web-app placement: a real tab bar above the canvas for the modes,
-        // with the root selector on its right edge.
-        let root_label: SharedString = {
-            let candidates = root_candidates(&self.full_graph);
-            let current = self
-                .root_override
-                .clone()
-                .or_else(|| candidates.first().cloned())
-                .unwrap_or_else(|| "—".into());
-            format!("Root: {current}").into()
-        };
-        let tab_bar = div()
+        // ---- sidebar tab strip (web: it lives INSIDE the sidebar) ----
+        let deprecated_tone = th.red;
+        let tab_row = div()
             .flex_none()
-            .h(px(40.0))
             .flex()
-            .items_center()
-            .gap_1()
-            .px_2()
-            .bg(th.panel)
+            .items_stretch()
             .border_b_1()
             .border_color(th.panel_border)
-            .child(self.mode_tab(th, Mode::Reachable, cx))
-            .child(self.mode_tab(th, Mode::Orphaned, cx))
-            .child(self.mode_tab(th, Mode::Deprecated, cx))
-            .child(div().flex_1())
+            .child(self.mode_tab(
+                th,
+                Mode::Reachable,
+                Icon::Waypoints,
+                th.kind_color(gompass_core::graph::NodeKind::Object),
+                None,
+                cx,
+            ))
+            .child(self.mode_tab(
+                th,
+                Mode::Orphaned,
+                Icon::Unlink,
+                th.type_amber,
+                Some(self.orphan_count),
+                cx,
+            ))
+            .when(self.deprecated_count > 0, |el| {
+                el.child(self.mode_tab(
+                    th,
+                    Mode::Deprecated,
+                    Icon::Clock,
+                    deprecated_tone,
+                    Some(self.deprecated_count),
+                    cx,
+                ))
+            })
             .child(
                 div()
-                    .id("root-cycle")
-                    .px_3()
-                    .py_1()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .text_xs()
+                    .id("collapse-sidebar")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .flex_none()
+                    .border_l_1()
+                    .border_color(th.panel_border)
+                    .px(px(10.0))
                     .text_color(th.text_muted)
-                    .hover(|el| el.bg(th.hover_bg))
-                    .on_click(cx.listener(|this, _, _, cx| this.cycle_root(cx)))
-                    .child(root_label),
+                    .cursor_pointer()
+                    .hover(|el| el.bg(th.hover_bg).text_color(th.text))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.sidebar_open = false;
+                        this.canvas
+                            .update(cx, |canvas, cx| canvas.set_pane_offset(0.0, cx));
+                        this.save_settings();
+                        cx.notify();
+                    }))
+                    .child(icon(Icon::PanelLeftClose, px(16.0), th.text_muted)),
             );
 
-        // Floating view-controls cluster at the canvas's top-left.
+        // ---- canvas overlay: floating "View controls" card (left 16 / top 16)
         let controls = div()
             .absolute()
-            .top_2()
-            .left_2()
+            .top(px(16.0))
+            .left(px(16.0))
             .flex()
             .items_center()
-            .gap_1()
-            .p_1()
+            .gap(px(6.0))
             .rounded_lg()
-            .bg(th.chrome_bg)
             .border_1()
             .border_color(th.panel_border)
-            .shadow_md()
-            .child(self.toggle_button(
+            .bg(th.chrome_bg)
+            .px_2()
+            .py(px(6.0))
+            .shadow_lg()
+            .opacity(0.4)
+            .hover(|el| el.opacity(1.0))
+            .child(self.chip(
                 th,
-                "Desc",
-                self.options.show_descriptions,
-                |this, _, cx| {
-                    this.options.show_descriptions = !this.options.show_descriptions;
-                    this.rebuild(cx);
-                    this.save_settings();
-                },
-                cx,
-            ))
-            .child(self.toggle_button(
-                th,
-                "Bundle",
-                self.options.bundle_edges,
-                |this, _, cx| {
-                    this.options.bundle_edges = !this.options.bundle_edges;
-                    this.rebuild(cx);
-                    this.save_settings();
-                },
-                cx,
-            ))
-            .child(self.toggle_button(
-                th,
-                "Prims",
+                "hide-primitives",
+                "Hide primitives",
                 self.options.hide_primitive_fields,
                 |this, _, cx| {
                     this.options.hide_primitive_fields = !this.options.hide_primitive_fields;
@@ -442,9 +570,10 @@ impl Render for Workspace {
                 },
                 cx,
             ))
-            .child(self.toggle_button(
+            .child(self.chip(
                 th,
-                "Relay",
+                "hide-relay",
+                "Hide Relay",
                 self.hide_relay,
                 |this, _, cx| {
                     this.hide_relay = !this.hide_relay;
@@ -453,28 +582,114 @@ impl Render for Workspace {
                 },
                 cx,
             ))
-            .child(self.toggle_button(
+            .child(self.chip(
                 th,
-                "Investigate",
-                self.investigate,
+                "show-descriptions",
+                "Show descriptions",
+                self.options.show_descriptions,
                 |this, _, cx| {
-                    this.investigate = !this.investigate;
-                    let investigate = this.investigate;
-                    this.canvas
-                        .update(cx, |canvas, cx| canvas.set_investigate(investigate, cx));
+                    this.options.show_descriptions = !this.options.show_descriptions;
+                    this.rebuild(cx);
+                    this.save_settings();
                 },
                 cx,
             ))
-            .child(self.toggle_button(
+            .child(self.chip(
                 th,
-                "Overlay",
-                self.dock_open,
+                "bundle-edges",
+                "Bundle edges",
+                self.options.bundle_edges,
                 |this, _, cx| {
-                    this.dock_open = !this.dock_open;
-                    cx.notify();
+                    this.options.bundle_edges = !this.options.bundle_edges;
+                    this.rebuild(cx);
+                    this.save_settings();
                 },
                 cx,
             ));
+
+        // ---- canvas overlay: Investigate card (left 16 / top 56) ----
+        let (documented, total) = self.model.desc_coverage;
+        let coverage = if total > 0 { documented as f32 / total as f32 } else { 1.0 };
+        let cov_color = if coverage >= 0.9 {
+            th.kind_color(gompass_core::graph::NodeKind::Enum)
+        } else if coverage >= 0.5 {
+            th.type_amber
+        } else {
+            th.kind_color(gompass_core::graph::NodeKind::Scalar)
+        };
+        let investigate_card = div()
+            .absolute()
+            .top(px(56.0))
+            .left(px(16.0))
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .rounded_lg()
+            .border_1()
+            .border_color(th.panel_border)
+            .bg(th.chrome_bg)
+            .px_2()
+            .py(px(6.0))
+            .shadow_lg()
+            .opacity(0.4)
+            .hover(|el| el.opacity(1.0))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(icon(Icon::Microscope, px(12.0), th.text_muted))
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(th.text_muted)
+                            .child("INVESTIGATE"),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .id("investigate-mode")
+                            .rounded_full()
+                            .border_1()
+                            .px_2()
+                            .py(px(2.0))
+                            .text_size(px(10.0))
+                            .cursor_pointer()
+                            .when(self.investigate, |el| {
+                                el.border_color(th.investigate)
+                                    .bg(th.investigate.opacity(0.1))
+                                    .text_color(th.investigate)
+                            })
+                            .when(!self.investigate, |el| {
+                                el.border_color(th.card_border).text_color(th.text_muted)
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.investigate = !this.investigate;
+                                let on = this.investigate;
+                                this.canvas
+                                    .update(cx, |canvas, cx| canvas.set_investigate(on, cx));
+                            }))
+                            .child("Missing descriptions"),
+                    )
+                    .child(
+                        div()
+                            .rounded_full()
+                            .px(px(6.0))
+                            .py(px(2.0))
+                            .text_size(px(10.0))
+                            .bg(cov_color.opacity(0.1))
+                            .text_color(cov_color)
+                            .child(SharedString::from(format!(
+                                "{}%",
+                                (coverage * 100.0).round() as i32
+                            ))),
+                    ),
+            );
 
         // Overlay dock: in-app SDL editor + live diff panel.
         let dock = self.dock_open.then(|| {
@@ -617,51 +832,149 @@ impl Render for Workspace {
                 )
         });
 
-        // Web-app placement: the click-history "Recent" panel at top-right.
+        // ---- canvas overlay: click-history "Recent" panel (right 16 / top 16)
         let recent = {
             let entries = self.canvas.read(cx).history_entries();
+            let open = self.history_open;
             (!entries.is_empty()).then(|| {
+                let count = entries.len();
                 div()
                     .absolute()
-                    .top_2()
-                    .right_2()
-                    .w(px(200.0))
-                    .p_2()
+                    .top(px(16.0))
+                    .right(px(16.0))
+                    .w(px(256.0))
                     .rounded_lg()
-                    .bg(th.chrome_bg)
                     .border_1()
                     .border_color(th.panel_border)
-                    .shadow_md()
+                    .bg(th.chrome_bg)
+                    .shadow_lg()
                     .flex()
                     .flex_col()
-                    .gap_1()
+                    .opacity(0.4)
+                    .hover(|el| el.opacity(1.0))
                     .child(
                         div()
-                            .text_xs()
-                            .text_color(th.text_faint)
-                            .child("Recent  ·  ⌘[ back"),
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .border_b_1()
+                            .border_color(th.panel_border)
+                            .px_3()
+                            .py_2()
+                            .child(icon(Icon::History, px(12.0), th.text_muted))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_size(px(10.0))
+                                    .text_color(th.text_muted)
+                                    .child(SharedString::from(format!("RECENT ({count})"))),
+                            )
+                            .child(
+                                div()
+                                    .id("clear-history")
+                                    .rounded_md()
+                                    .p_1()
+                                    .cursor_pointer()
+                                    .hover(|el| el.bg(th.hover_bg))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.canvas
+                                            .update(cx, |canvas, cx| canvas.clear_history(cx));
+                                        cx.notify();
+                                    }))
+                                    .child(icon(Icon::Trash2, px(12.0), th.text_muted)),
+                            )
+                            .child(
+                                div()
+                                    .id("toggle-history")
+                                    .rounded_md()
+                                    .p_1()
+                                    .cursor_pointer()
+                                    .hover(|el| el.bg(th.hover_bg))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.history_open = !this.history_open;
+                                        cx.notify();
+                                    }))
+                                    .child(icon(
+                                        if open { Icon::ChevronUp } else { Icon::ChevronDown },
+                                        px(12.0),
+                                        th.text_muted,
+                                    )),
+                            ),
                     )
-                    .children(entries.into_iter().enumerate().map(|(i, (card, name))| {
-                        div()
-                            .id(("recent", i))
-                            .w_full()
-                            .px_2()
-                            .py(px(2.0))
-                            .rounded_md()
-                            .cursor_pointer()
-                            .hover(|el| el.bg(th.hover_bg))
-                            .text_xs()
-                            .font_family("Menlo")
-                            .text_color(th.text_muted)
-                            .whitespace_nowrap()
-                            .overflow_hidden()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.canvas.update(cx, |canvas, cx| {
-                                    canvas.navigate_to(card, None, cx)
-                                });
-                            }))
-                            .child(name)
-                    }))
+                    .when(open, |el| {
+                        el.child(
+                            div()
+                                .max_h(px(360.0))
+                                .overflow_hidden()
+                                .py_1()
+                                .flex()
+                                .flex_col()
+                                .children(entries.into_iter().enumerate().map(
+                                    |(i, (card, name))| {
+                                        let c = &self.model.cards[card as usize];
+                                        div()
+                                            .id(("recent", i))
+                                            .group("recent-row")
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .px_2()
+                                            .py(px(2.0))
+                                            .child(
+                                                div()
+                                                    .id(("recent-go", i))
+                                                    .flex()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .items_center()
+                                                    .gap_2()
+                                                    .rounded_md()
+                                                    .px_2()
+                                                    .py_1()
+                                                    .cursor_pointer()
+                                                    .bg(th.kind_color(c.kind).opacity(0.1))
+                                                    .hover(|el| el.bg(th.hover_bg))
+                                                    .on_click(cx.listener(
+                                                        move |this, _, _, cx| {
+                                                            this.canvas.update(cx, |canvas, cx| {
+                                                                canvas.navigate_to(card, None, cx)
+                                                            });
+                                                        },
+                                                    ))
+                                                    .child(kind_badge(th, c.kind, c.kind_label))
+                                                    .child(
+                                                        div()
+                                                            .flex_1()
+                                                            .min_w_0()
+                                                            .text_xs()
+                                                            .font_family("Menlo")
+                                                            .text_color(th.kind_color(c.kind))
+                                                            .whitespace_nowrap()
+                                                            .overflow_hidden()
+                                                            .child(name),
+                                                    ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id(("recent-x", i))
+                                                    .rounded_md()
+                                                    .p_1()
+                                                    .cursor_pointer()
+                                                    .hover(|el| el.bg(th.hover_bg))
+                                                    .on_click(cx.listener(
+                                                        move |this, _, _, cx| {
+                                                            this.canvas.update(cx, |canvas, cx| {
+                                                                canvas.remove_history(card, cx)
+                                                            });
+                                                            cx.notify();
+                                                        },
+                                                    ))
+                                                    .child(icon(Icon::X, px(12.0), th.text_muted)),
+                                            )
+                                    },
+                                )),
+                        )
+                    })
             })
         };
 
@@ -677,7 +990,7 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
                 this.sidebar_open = !this.sidebar_open;
-                let offset = if this.sidebar_open { 300.0 } else { 0.0 };
+                let offset = if this.sidebar_open { 340.0 } else { 0.0 };
                 this.canvas
                     .update(cx, |canvas, cx| canvas.set_pane_offset(offset, cx));
                 this.save_settings();
@@ -719,7 +1032,19 @@ impl Render for Workspace {
                 this.canvas.update(cx, |canvas, cx| canvas.go_back(cx));
             }))
             .when(self.sidebar_open, |el| {
-                el.child(div().w(px(300.0)).h_full().flex_none().child(self.tree.clone()))
+                el.child(
+                    div()
+                        .w(px(340.0))
+                        .h_full()
+                        .flex_none()
+                        .flex()
+                        .flex_col()
+                        .bg(th.panel)
+                        .border_r_1()
+                        .border_color(th.panel_border)
+                        .child(tab_row)
+                        .child(div().flex_1().min_h_0().child(self.tree.clone())),
+                )
             })
             .child(
                 div()
@@ -728,7 +1053,6 @@ impl Render for Workspace {
                     .min_w_0()
                     .flex()
                     .flex_col()
-                    .child(tab_bar)
                     .child(
                         div()
                             .flex_1()
@@ -736,9 +1060,40 @@ impl Render for Workspace {
                             .relative()
                             .child(self.canvas.clone())
                             .child(controls)
+                            .child(investigate_card)
                             .when_some(recent, |el, r| el.child(r))
-                            .when_some(dock, |el, d| el.child(d)),
-                    ),
+                            .when(!self.sidebar_open, |el| {
+                                el.child(
+                                    div()
+                                        .id("expand-sidebar")
+                                        .absolute()
+                                        .top(px(16.0))
+                                        .left(px(16.0))
+                                        .rounded_lg()
+                                        .border_1()
+                                        .border_color(th.panel_border)
+                                        .bg(th.chrome_bg)
+                                        .p(px(6.0))
+                                        .shadow_lg()
+                                        .cursor_pointer()
+                                        .hover(|el| el.bg(th.hover_bg))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.sidebar_open = true;
+                                            this.canvas.update(cx, |canvas, cx| {
+                                                canvas.set_pane_offset(340.0, cx)
+                                            });
+                                            this.save_settings();
+                                            cx.notify();
+                                        }))
+                                        .child(icon(
+                                            Icon::PanelLeftOpen,
+                                            px(16.0),
+                                            th.text_muted,
+                                        )),
+                                )
+                            }),
+                    )
+                    .when_some(dock, |el, d| el.child(d)),
             )
     }
 }

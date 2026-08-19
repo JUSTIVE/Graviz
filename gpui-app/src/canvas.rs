@@ -113,7 +113,7 @@ impl GraphCanvas {
             suppress_push: false,
             investigate: false,
             hovered_edge: None,
-            pane_offset_x: 300.0,
+            pane_offset_x: 340.0,
         }
     }
 
@@ -140,11 +140,21 @@ impl GraphCanvas {
         }
     }
 
+    pub fn clear_history(&mut self, cx: &mut Context<Self>) {
+        self.history.clear();
+        cx.notify();
+    }
+
+    pub fn remove_history(&mut self, card: u32, cx: &mut Context<Self>) {
+        self.history.retain(|&c| c != card);
+        cx.notify();
+    }
+
     pub fn history_entries(&self) -> Vec<(u32, gpui::SharedString)> {
         self.history
             .iter()
             .rev()
-            .take(8)
+            .take(50)
             .map(|&i| (i, self.model.cards[i as usize].name.clone()))
             .collect()
     }
