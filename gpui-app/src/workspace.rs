@@ -15,8 +15,8 @@ use crate::theme::Theme;
 use crate::tree::{TreeEvent, TreePanel};
 use gompass_core::graph::{OverlayDiff, ParsedGraph};
 use gpui::{
-    actions, div, prelude::*, px, App, Context, Entity, KeyBinding, PathPromptOptions,
-    SharedString, Window,
+    actions, div, prelude::*, px, App, Context, Entity, FocusHandle, Focusable, KeyBinding,
+    PathPromptOptions, SharedString, Window,
 };
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -112,6 +112,12 @@ pub struct Workspace {
     until_panel: Entity<UntilPanel>,
     canvas: Entity<GraphCanvas>,
     overlay_editor: Entity<TextArea>,
+    /// The workspace's own focus. Actions dispatch along the focus path, so
+    /// without a handle here nothing but the tree and the editor could receive
+    /// a shortcut — and neither of those holds focus when a schema first
+    /// opens, which left every hotkey dead until something was clicked.
+    focus: FocusHandle,
+    focused_once: bool,
     sidebar_open: bool,
     sidebar_width: f32,
     /// Which splitter is being dragged, if any.
@@ -286,6 +292,8 @@ impl Workspace {
             until_panel,
             canvas,
             overlay_editor,
+            focus: cx.focus_handle(),
+            focused_once: false,
             sidebar_open,
             sidebar_width,
             resizing: None,
@@ -561,6 +569,12 @@ pub fn kind_badge(th: Theme, kind: gompass_core::graph::NodeKind, label: &'stati
         .child(SharedString::from(label))
 }
 
+
+impl Focusable for Workspace {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1322,9 +1336,14 @@ impl Render for Workspace {
             })
         };
 
+        if !self.focused_once {
+            self.focused_once = true;
+            window.focus(&self.focus, cx);
+        }
         div()
             .flex()
             .size_full()
+            .track_focus(&self.focus)
             .key_context("Workspace")
             // A drag started on a splitter is tracked here, not on the strip
             // itself: once the cursor outruns the 5px grab area the strip

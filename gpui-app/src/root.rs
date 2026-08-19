@@ -8,7 +8,8 @@ use crate::landing;
 use crate::loader;
 use crate::workspace::{OpenSchema, Workspace};
 use gpui::{
-    div, prelude::*, Context, Entity, ExternalPaths, PathPromptOptions, Window,
+    div, prelude::*, App, Context, Entity, ExternalPaths, FocusHandle, Focusable,
+    PathPromptOptions, Window,
 };
 use std::path::PathBuf;
 
@@ -24,6 +25,10 @@ pub struct Root {
     warnings: Vec<String>,
     dragging: bool,
     schema_name: Option<String>,
+    /// The landing screen has no other focusable element, so without this its
+    /// shortcuts (⌘O) would have nowhere to dispatch.
+    focus: FocusHandle,
+    focused_once: bool,
 }
 
 impl Root {
@@ -53,6 +58,8 @@ impl Root {
             warnings: Vec::new(),
             dragging: false,
             schema_name: None,
+            focus: cx.focus_handle(),
+            focused_once: false,
         }
     }
 
@@ -116,6 +123,12 @@ impl Root {
             }
         })
         .detach();
+    }
+}
+
+impl Focusable for Root {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
     }
 }
 
@@ -206,11 +219,17 @@ impl Render for Root {
             .into_any_element()
         };
 
+        if !self.focused_once {
+            self.focused_once = true;
+            window.focus(&self.focus, cx);
+        }
         div()
             .size_full()
             .relative()
             .flex()
             .flex_col()
+            .track_focus(&self.focus)
+            .key_context("Root")
             .bg(th.bg)
             .on_action(cx.listener(|this, _: &OpenSchema, _, cx| {
                 if this.workspace.is_none() {

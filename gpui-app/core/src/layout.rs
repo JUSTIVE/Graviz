@@ -1729,6 +1729,17 @@ mod tests {
     }
 
     #[test]
+    fn a_forced_crossing_is_counted_exactly_once() {
+        // K(2,2): two sources both pointing at both targets. Whichever way
+        // the two targets are ordered, one pair of edges has to cross — the
+        // plain X. It is one tangle, however the paths are flattened.
+        let nodes = vec![node(100.0, 40.0); 4];
+        let edges = vec![edge(0, 2), edge(0, 3), edge(1, 2), edge(1, 3)];
+        let r = layout(&nodes, &edges, &[0, 1], &[], &LayoutConfig::default());
+        assert_eq!(tangles(&r, &edges), 1, "positions {:?}", r.positions);
+    }
+
+    #[test]
     fn edges_sharing_an_endpoint_are_not_a_tangle() {
         // A fan: one source, three targets. They all leave the same card, so
         // however they spread they must never count as crossing each other.
