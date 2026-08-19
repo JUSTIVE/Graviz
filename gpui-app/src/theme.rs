@@ -23,6 +23,14 @@ pub struct Theme {
     pub overlay_green: Hsla,
     pub arg_orange: Hsla,
     pub accent: Hsla,
+    /// Muted amber the web uses for builtin-scalar return types.
+    pub type_builtin: Hsla,
+    pub relay_orange: Hsla,
+    /// Investigate outlines and pinned rows (orange-500).
+    pub investigate: Hsla,
+    pub pin: Hsla,
+    /// Expired `[until]` marker (red-500) — same in both themes.
+    pub expired: Hsla,
     pub shadow: Hsla,
     kind_object: Hsla,
     kind_interface: Hsla,
@@ -45,25 +53,32 @@ impl Theme {
     }
 }
 
+// Base palette mirrors the web app's shadcn OKLCH variables converted to
+// sRGB (Tailwind `neutral`): --background/--card/--muted/--border/…
 fn dark() -> Theme {
     Theme {
-        bg: rgb(0x101216).into(),
-        panel: rgb(0x14171d).into(),
-        panel_border: rgb(0x242a35).into(),
-        card_bg: rgb(0x1a1e26).into(),
-        card_border: rgb(0x2c3340).into(),
-        text: rgb(0xe6e9ef).into(),
-        text_muted: rgb(0x8b93a3).into(),
-        text_faint: rgb(0x687083).into(),
-        hover_bg: rgb(0x232936).into(),
-        active_bg: rgb(0x2a3140).into(),
-        input_bg: rgb(0x1a1e26).into(),
-        chrome_bg: rgba(0x14171df0).into(),
+        bg: rgb(0x0a0a0a).into(),          // --background
+        panel: rgb(0x171717).into(),       // --sidebar / --card
+        panel_border: rgba(0xffffff1a).into(), // --border: white/10%
+        card_bg: rgb(0x171717).into(),     // --card
+        card_border: rgba(0xffffff1a).into(),
+        text: rgb(0xfafafa).into(),        // --foreground
+        text_muted: rgb(0xa1a1a1).into(),  // --muted-foreground
+        text_faint: rgb(0x737373).into(),
+        hover_bg: rgb(0x262626).into(),    // --accent
+        active_bg: rgb(0x262626).into(),   // --secondary
+        input_bg: rgba(0xffffff26).into(), // --input: white/15%
+        chrome_bg: rgba(0x171717f0).into(), // --popover, translucent
         type_amber: rgb(0xf59e0b).into(),
-        red: rgb(0xe5534b).into(),
-        overlay_green: rgb(0x34d399).into(),
+        red: rgb(0xff6467).into(),         // --destructive
+        overlay_green: rgb(0x10b981).into(),
         arg_orange: rgb(0xe08a4a).into(),
         accent: rgb(0x0ea5e9).into(),
+        type_builtin: rgb(0xb08c5a).into(),
+        relay_orange: rgb(0xf26a03).into(),
+        investigate: rgb(0xf97316).into(),
+        pin: rgb(0xf97316).into(),
+        expired: rgb(0xef4444).into(),
         shadow: gpui::black().opacity(0.35),
         kind_object: rgb(0x0ea5e9).into(),
         kind_interface: rgb(0x8b5cf6).into(),
@@ -76,30 +91,37 @@ fn dark() -> Theme {
 
 fn light() -> Theme {
     Theme {
-        bg: rgb(0xf2f4f7).into(),
-        panel: rgb(0xe9ecf1).into(),
-        panel_border: rgb(0xd4d9e1).into(),
-        card_bg: rgb(0xffffff).into(),
-        card_border: rgb(0xc9cfd9).into(),
-        text: rgb(0x1c2129).into(),
-        text_muted: rgb(0x5a6372).into(),
-        text_faint: rgb(0x7c8595).into(),
-        hover_bg: rgb(0xdde2ea).into(),
-        active_bg: rgb(0xd2d9e4).into(),
+        bg: rgb(0xfafaf9).into(),          // --background
+        panel: rgb(0xfafafa).into(),       // --sidebar
+        panel_border: rgb(0xe5e5e5).into(), // --border
+        card_bg: rgb(0xffffff).into(),     // --card
+        card_border: rgb(0xe5e5e5).into(),
+        text: rgb(0x0a0a0a).into(),        // --foreground
+        text_muted: rgb(0x737373).into(),  // --muted-foreground
+        text_faint: rgb(0xa1a1a1).into(),
+        hover_bg: rgb(0xf5f5f5).into(),    // --accent
+        active_bg: rgb(0xf5f5f5).into(),   // --secondary
         input_bg: rgb(0xffffff).into(),
-        chrome_bg: rgba(0xf7f8faf0).into(),
-        type_amber: rgb(0xb45309).into(),
-        red: rgb(0xc93c34).into(),
-        overlay_green: rgb(0x0d9668).into(),
+        chrome_bg: rgba(0xfffffff0).into(), // --popover, translucent
+        type_amber: rgb(0xf59e0b).into(),
+        red: rgb(0xe7000b).into(),         // --destructive
+        overlay_green: rgb(0x10b981).into(),
         arg_orange: rgb(0xb05a1f).into(),
         accent: rgb(0x0369a1).into(),
+        type_builtin: rgb(0xb08c5a).into(),
+        relay_orange: rgb(0xf26a03).into(),
+        investigate: rgb(0xf97316).into(),
+        pin: rgb(0xf97316).into(),
+        expired: rgb(0xef4444).into(),
         shadow: gpui::black().opacity(0.18),
-        kind_object: rgb(0x0369a1).into(),
-        kind_interface: rgb(0x5b21b6).into(),
-        kind_union: rgb(0xb45309).into(),
-        kind_enum: rgb(0x047857).into(),
-        kind_input: rgb(0xa21caf).into(),
-        kind_scalar: rgb(0xbe123c).into(),
+        // KIND_COLORS is theme-independent in the web app (KIND_COLORS_DARK
+        // exists but has no consumer), so light uses the same -500 series.
+        kind_object: rgb(0x0ea5e9).into(),
+        kind_interface: rgb(0x8b5cf6).into(),
+        kind_union: rgb(0xf59e0b).into(),
+        kind_enum: rgb(0x10b981).into(),
+        kind_input: rgb(0xd946ef).into(),
+        kind_scalar: rgb(0xf43f5e).into(),
     }
 }
 

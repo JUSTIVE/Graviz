@@ -1,6 +1,7 @@
 mod canvas;
 mod config;
 mod editor;
+mod icons;
 mod loader;
 mod model;
 mod root;
@@ -52,7 +53,7 @@ fn main() {
     #[cfg(target_os = "macos")]
     selfshot::arm_if_requested();
 
-    gpui_platform::application().run(move |cx: &mut App| {
+    gpui_platform::application().with_assets(icons::Assets).run(move |cx: &mut App| {
         workspace::init(cx);
         let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
         cx.open_window(

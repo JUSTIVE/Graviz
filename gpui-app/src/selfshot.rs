@@ -21,6 +21,7 @@ fn own_window_id() -> Result<u32> {
     )
     .ok_or_else(|| anyhow!("CGWindowListCopyWindowInfo returned null"))?;
 
+    let mut best: Option<(f64, u32)> = None;
     for item in info.iter() {
         let dict = unsafe {
             CFDictionary::<CFString, CFType>::wrap_under_get_rule(*item as *const _)
@@ -32,7 +33,9 @@ fn own_window_id() -> Result<u32> {
         if owner != Some(pid) {
             continue;
         }
-        // skip zero-area / menu windows: require a reasonably sized layer-0 window
+        // skip menu/panel layers, then take the LARGEST window: GPUI can own
+        // more than one (helper surfaces), and the first is not always the
+        // real one.
         let layer = dict
             .find(CFString::from_static_string("kCGWindowLayer"))
             .and_then(|v| v.downcast::<CFNumber>())
@@ -41,13 +44,30 @@ fn own_window_id() -> Result<u32> {
         if layer != 0 {
             continue;
         }
+        let area = dict
+            .find(CFString::from_static_string("kCGWindowBounds"))
+            .and_then(|v| v.downcast::<CFDictionary>())
+            .and_then(|b| {
+                let get = |k: &'static str| {
+                    b.find(CFString::from_static_string(k).as_CFTypeRef() as *const _)
+                        .map(|v| unsafe { CFNumber::wrap_under_get_rule(*v as *const _) })
+                        .and_then(|n| n.to_f64())
+                };
+                Some(get("Width")? * get("Height")?)
+            })
+            .unwrap_or(0.0);
         if let Some(id) = dict
             .find(CFString::from_static_string("kCGWindowNumber"))
             .and_then(|v| v.downcast::<CFNumber>())
             .and_then(|n| n.to_i64())
         {
-            return Ok(id as u32);
+            if best.map(|(a, _)| area > a).unwrap_or(true) {
+                best = Some((area, id as u32));
+            }
         }
+    }
+    if let Some((_, id)) = best {
+        return Ok(id);
     }
     Err(anyhow!("no on-screen window owned by pid {pid}"))
 }

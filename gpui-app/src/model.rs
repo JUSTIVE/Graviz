@@ -11,27 +11,68 @@ use gompass_core::graph::{
 use gompass_core::layout::{self, LayoutConfig, LayoutEdge, LayoutNode};
 use std::collections::{HashMap, HashSet};
 
+// Card geometry — mirrors the web renderer's node-style.ts constants exactly
+// (drawNodeSprite / estimateNodeWidth / estimateNodeHeight / trailingSectionGeom).
 pub const HEADER_H: f32 = 42.0;
-pub const ROW_H: f32 = 16.0;
+pub const HEADER_H_WITH_DESC: f32 = 56.0;
+pub const ROW_H: f32 = 14.0;
 /// Row pitch when field descriptions are shown inline.
-pub const ROW_H_WITH_DESC: f32 = 28.0;
+pub const ROW_H_WITH_DESC: f32 = 26.0;
+/// Trailing (implements / member-of-union) rows always use this pitch.
+pub const TIGHT_ROW_H: f32 = 14.0;
 pub const TOP_BODY_PAD: f32 = 8.0;
 pub const BOTTOM_PAD: f32 = 10.0;
+pub const IMPL_SECTION_GAP: f32 = 8.0;
+/// Left inset of body-row text (the 10px gutter holds the overlay marker).
 pub const CARD_PAD_X: f32 = 10.0;
+/// Header text inset.
+pub const HEADER_PAD_X: f32 = 8.0;
 pub const NAME_FONT_PX: f32 = 13.0;
-pub const ROW_FONT_PX: f32 = 10.5;
+pub const ROW_FONT_PX: f32 = 10.0;
+pub const DESC_FONT_PX: f32 = 9.0;
+pub const KIND_FONT_PX: f32 = 9.0;
+pub const BAND_FONT_PX: f32 = 10.0;
 /// Menlo advance width / font size.
 pub const MONO_ADVANCE: f32 = 0.602;
 pub const MIN_CARD_W: f32 = 220.0;
-pub const MAX_CARD_W: f32 = 640.0;
+pub const MAX_CARD_W: f32 = 900.0;
+const NAME_H_PAD: f32 = 16.0;
+const FIELD_NAME_TYPE_GAP: f32 = 16.0;
+const FIELD_ROW_SIDE_PAD: f32 = 20.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowKind {
     Field,
     EnumValue,
-    Implements,
+    /// Member of a `union` type — always tight pitch, sky-colored.
     UnionMember,
-    MemberOfUnion,
+}
+
+/// Which palette entry the right-aligned return type uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypeColor {
+    Normal,
+    BuiltinScalar,
+    Expired,
+}
+
+/// A hit inside a card's body, in the three vertical zones the web renderer
+/// paints: body rows, the implements band, the member-of-union band.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowHit {
+    Row(usize),
+    Implements(usize),
+    MemberOfUnion(usize),
+}
+
+/// Vertical geometry of the two trailing wash bands (`trailingSectionGeom`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BandGeom {
+    pub iface_band_top: f32,
+    pub iface_band_bottom: f32,
+    pub iface_rows_top: f32,
+    pub union_band_top: f32,
+    pub union_rows_top: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +94,10 @@ pub struct Row {
     pub until_expired: bool,
     /// Field type was unwrapped through a Relay Connection.
     pub is_relay: bool,
+    pub type_color: TypeColor,
+    /// Field args, for the sidebar's arity badge and hover list.
+    pub args: Vec<(gpui::SharedString, gpui::SharedString)>,
+    pub required_args: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -61,13 +106,25 @@ pub struct Card {
     pub index: u32,
     pub name: gpui::SharedString,
     pub kind: NodeKind,
+    /// Lowercase word for sidebar badges ("type", "interface", …).
     pub kind_label: &'static str,
+    /// Uppercase word the card header paints ("OBJECT", "INTERFACE", …).
+    pub kind_upper: &'static str,
     pub description: Option<String>,
+    /// One-line header description, shown in show-descriptions mode.
+    pub header_desc: Option<gpui::SharedString>,
     pub rows: Vec<Row>,
+    /// Trailing violet band (Object / Interface).
+    pub implements: Vec<gpui::SharedString>,
+    /// Trailing amber band (Object).
+    pub member_of_unions: Vec<gpui::SharedString>,
     pub w: f32,
     pub h: f32,
     /// Row pitch — `ROW_H`, or `ROW_H_WITH_DESC` in show-descriptions mode.
+    /// Union members and trailing rows always use `TIGHT_ROW_H`.
     pub row_h: f32,
+    pub header_h: f32,
+    pub band: BandGeom,
     /// Whole type came from the overlay SDL.
     pub is_overlay: bool,
     /// Graph row (field idx, then enum-value idx) → display row, `None` when
@@ -77,21 +134,49 @@ pub struct Card {
 }
 
 impl Card {
-    pub fn row_y(&self, i: usize) -> f32 {
-        HEADER_H + TOP_BODY_PAD + i as f32 * self.row_h
+    /// Top of the body row grid: `headerH + TOP_BODY_PAD - 2` in the web.
+    pub fn body_top(&self) -> f32 {
+        self.header_h + TOP_BODY_PAD - 2.0
     }
 
-    /// Inverse of `row_y` for hit-testing a point in card-local coords.
-    pub fn row_at(&self, local_x: f32, local_y: f32) -> Option<usize> {
-        if local_x < 0.0 || local_x > self.w {
+    /// Pitch of the body rows — union members are always tight.
+    pub fn body_pitch(&self) -> f32 {
+        if self.kind == NodeKind::Union {
+            TIGHT_ROW_H
+        } else {
+            self.row_h
+        }
+    }
+
+    pub fn row_y(&self, i: usize) -> f32 {
+        self.body_top() + i as f32 * self.body_pitch()
+    }
+
+    /// Text baseline for body row `i` (`bodyY + i*rowH + 10`).
+    pub fn row_baseline(&self, i: usize) -> f32 {
+        self.row_y(i) + 10.0
+    }
+
+    /// Inverse of the painter's geometry, across all three body zones.
+    pub fn hit_row(&self, local_x: f32, local_y: f32) -> Option<RowHit> {
+        if local_x < 0.0 || local_x > self.w || local_y < self.body_top() {
             return None;
         }
-        let body_y = local_y - HEADER_H - TOP_BODY_PAD;
-        if body_y < 0.0 {
-            return None;
+        // trailing bands first — they sit below the body rows
+        if !self.member_of_unions.is_empty() && local_y >= self.band.union_rows_top {
+            let k = ((local_y - self.band.union_rows_top) / TIGHT_ROW_H) as usize;
+            if k < self.member_of_unions.len() {
+                return Some(RowHit::MemberOfUnion(k));
+            }
         }
-        let i = (body_y / self.row_h) as usize;
-        (i < self.rows.len()).then_some(i)
+        if !self.implements.is_empty() && local_y >= self.band.iface_rows_top {
+            let k = ((local_y - self.band.iface_rows_top) / TIGHT_ROW_H) as usize;
+            if k < self.implements.len() {
+                return Some(RowHit::Implements(k));
+            }
+        }
+        let i = ((local_y - self.body_top()) / self.body_pitch()) as usize;
+        (i < self.rows.len()).then_some(RowHit::Row(i))
     }
 
     /// Display row for a graph-space row index (field, then enum value).
@@ -101,9 +186,84 @@ impl Card {
 
     pub fn port_y(&self, field_index: Option<usize>) -> f32 {
         match field_index.and_then(|i| self.display_row(i)) {
-            Some(i) if i < self.rows.len() => self.row_y(i) + self.row_h / 2.0,
+            Some(i) if i < self.rows.len() => self.row_y(i) + self.body_pitch() / 2.0,
             _ => self.h / 2.0,
         }
+    }
+}
+
+fn kind_upper(kind: NodeKind) -> &'static str {
+    match kind {
+        NodeKind::Object => "OBJECT",
+        NodeKind::Interface => "INTERFACE",
+        NodeKind::Union => "UNION",
+        NodeKind::Enum => "ENUM",
+        NodeKind::Scalar => "SCALAR",
+        NodeKind::Input => "INPUT",
+    }
+}
+
+/// Longest prefix of `s` that fits `max_w` at `font_px`, with an ellipsis
+/// when clipped (the web's `fitText`).
+pub fn fit_text(s: &str, font_px: f32, max_w: f32) -> String {
+    if mono_w(s, font_px) <= max_w {
+        return s.to_string();
+    }
+    let ell = mono_w("…", font_px);
+    let budget = (max_w - ell).max(0.0);
+    let per = font_px * MONO_ADVANCE;
+    let n = (budget / per).floor() as usize;
+    if n == 0 {
+        return "…".to_string();
+    }
+    let cut: String = s.chars().take(n).collect();
+    format!("{cut}…")
+}
+
+/// Whitespace-collapsed single line.
+fn one_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// `trailingSectionGeom` — vertical geometry of the two wash bands.
+fn band_geom(
+    kind: NodeKind,
+    h: f32,
+    header_h: f32,
+    row_h: f32,
+    fields: usize,
+    ifaces: usize,
+    unions: usize,
+) -> BandGeom {
+    if !matches!(kind, NodeKind::Object | NodeKind::Interface) || (ifaces == 0 && unions == 0) {
+        return BandGeom::default();
+    }
+    let impl_gap = if ifaces > 0 && fields > 0 { IMPL_SECTION_GAP } else { 0.0 };
+    let union_gap = if unions > 0 && ifaces == 0 && fields > 0 { IMPL_SECTION_GAP } else { 0.0 };
+    let wash_top = header_h + TOP_BODY_PAD + fields as f32 * row_h - 2.0 + impl_gap + union_gap;
+    let iface_block = ifaces as f32 * TIGHT_ROW_H;
+    let union_block = unions as f32 * TIGHT_ROW_H;
+    let extra = (h - wash_top - iface_block - union_block).max(0.0);
+
+    let iface_band_top = wash_top;
+    let iface_band_bottom = if ifaces > 0 {
+        if unions > 0 {
+            wash_top + iface_block + (extra / 2.0).floor()
+        } else {
+            h
+        }
+    } else {
+        wash_top
+    };
+    let union_band_top = if ifaces > 0 { iface_band_bottom } else { wash_top };
+    BandGeom {
+        iface_band_top,
+        iface_band_bottom,
+        iface_rows_top: iface_band_top
+            + ((iface_band_bottom - iface_band_top - iface_block) / 2.0).max(0.0).floor(),
+        union_band_top,
+        union_rows_top: union_band_top
+            + ((h - union_band_top - union_block) / 2.0).max(0.0).floor(),
     }
 }
 
@@ -378,13 +538,16 @@ pub fn build_model(graph: ParsedGraph, schema_name: String, options: &ModelOptio
             deprecation_reason: None,
             until_expired: false,
             is_relay: false,
+            type_color: TypeColor::Normal,
+            args: Vec::new(),
+            required_args: 0,
         };
+        // Body rows: fields, OR enum values, OR union members — never mixed
+        // (the web renderer paints exactly one of these grids).
         let mut rows: Vec<Row> = Vec::new();
         let mut row_map: Vec<Option<u32>> = Vec::new();
         for f in n.fields.as_deref().unwrap_or(&[]) {
-            if options.hide_primitive_fields
-                && BUILTIN_SCALARS.contains(&f.type_name.as_str())
-            {
+            if options.hide_primitive_fields && BUILTIN_SCALARS.contains(&f.type_name.as_str()) {
                 row_map.push(None);
                 continue;
             }
@@ -401,6 +564,20 @@ pub fn build_model(graph: ParsedGraph, schema_name: String, options: &ModelOptio
             r.deprecation_reason = f.deprecation_reason.clone();
             r.until_expired = is_until_expired(f.until.as_deref(), &options.today);
             r.is_relay = f.is_relay_connection;
+            r.type_color = if r.until_expired {
+                TypeColor::Expired
+            } else if BUILTIN_SCALARS.contains(&f.type_name.as_str()) {
+                TypeColor::BuiltinScalar
+            } else {
+                TypeColor::Normal
+            };
+            if let Some(args) = &f.args {
+                r.required_args = args.iter().filter(|a| a.type_.ends_with('!')).count();
+                r.args = args
+                    .iter()
+                    .map(|a| (a.name.clone().into(), a.type_.clone().into()))
+                    .collect();
+            }
             rows.push(r);
         }
         for v in n.values.as_deref().unwrap_or(&[]) {
@@ -420,57 +597,130 @@ pub fn build_model(graph: ParsedGraph, schema_name: String, options: &ModelOptio
                 index_of.get(m).copied(),
             ));
         }
-        for iface in n.interfaces.as_deref().unwrap_or(&[]) {
-            rows.push(base_row(
-                RowKind::Implements,
-                format!("implements {iface}").into(),
-                index_of.get(iface).copied(),
-            ));
-        }
-        for u in n.member_of_unions.as_deref().unwrap_or(&[]) {
-            rows.push(base_row(
-                RowKind::MemberOfUnion,
-                format!("in union {u}").into(),
-                index_of.get(u).copied(),
-            ));
-        }
+        // Trailing wash bands, not body rows.
+        let implements: Vec<gpui::SharedString> = n
+            .interfaces
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|s| s.clone().into())
+            .collect();
+        let member_of_unions: Vec<gpui::SharedString> = n
+            .member_of_unions
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|s| s.clone().into())
+            .collect();
 
-        let mut w = mono_w(&n.name, NAME_FONT_PX) + mono_w(kind_label(n.kind), 9.0) + CARD_PAD_X * 3.0;
-        for r in &rows {
-            let row_w = mono_w(&r.left, ROW_FONT_PX)
-                + if r.right.is_empty() { 0.0 } else { mono_w(&r.right, ROW_FONT_PX) + 24.0 }
-                + CARD_PAD_X * 2.0;
-            w = w.max(row_w);
+        // ---- width: estimateNodeWidth ----
+        let text_w = mono_w(&n.name, NAME_FONT_PX);
+        let mut field_max = 0.0f32;
+        {
+            let mut consider = |name: &str, ty: &str, relay: bool| {
+                let relay_pad = if relay { mono_w("~~ ", ROW_FONT_PX) } else { 0.0 };
+                let w = mono_w(name, ROW_FONT_PX)
+                    + FIELD_NAME_TYPE_GAP
+                    + relay_pad
+                    + mono_w(ty, ROW_FONT_PX)
+                    + FIELD_ROW_SIDE_PAD;
+                field_max = field_max.max(w);
+            };
+            for r in &rows {
+                consider(&r.left, &r.right, r.is_relay);
+            }
+            for s in implements.iter().chain(member_of_unions.iter()) {
+                consider(s, "", false);
+            }
         }
-        let w = w.clamp(MIN_CARD_W, MAX_CARD_W);
+        let required = NAME_H_PAD + text_w.ceil();
+        let w = MIN_CARD_W.max(MAX_CARD_W.min(required)).max(field_max).round();
+
+        // ---- height: estimateNodeHeight ----
         let row_h = if options.show_descriptions { ROW_H_WITH_DESC } else { ROW_H };
+        let header_h = if options.show_descriptions { HEADER_H_WITH_DESC } else { HEADER_H };
+        let field_count = if n.kind == NodeKind::Union { 0 } else { rows.len() };
+        let (grid_rows, tight_rows) = match n.kind {
+            NodeKind::Union => (0, rows.len()),
+            NodeKind::Scalar => (0, 0),
+            _ => (rows.len(), implements.len() + member_of_unions.len()),
+        };
+        let body = if grid_rows == 0 && tight_rows == 0 {
+            row_h
+        } else {
+            grid_rows as f32 * row_h + tight_rows as f32 * TIGHT_ROW_H
+        };
+        let impl_gap = if matches!(n.kind, NodeKind::Object | NodeKind::Interface)
+            && !implements.is_empty()
+            && field_count > 0
+        {
+            IMPL_SECTION_GAP
+        } else {
+            0.0
+        };
+        let union_gap = if n.kind == NodeKind::Object
+            && !member_of_unions.is_empty()
+            && implements.is_empty()
+            && field_count > 0
+        {
+            IMPL_SECTION_GAP
+        } else {
+            0.0
+        };
+        let h = header_h + TOP_BODY_PAD + body + impl_gap + union_gap + BOTTOM_PAD;
+
+        let band = band_geom(
+            n.kind,
+            h,
+            header_h,
+            row_h,
+            field_count,
+            implements.len(),
+            member_of_unions.len(),
+        );
+
+        // Descriptions are pre-fitted to the card width, like the painter.
+        let header_desc = if options.show_descriptions {
+            n.description
+                .as_deref()
+                .map(|d| one_line(d))
+                .filter(|d| !d.is_empty())
+                .map(|d| fit_text(&d, DESC_FONT_PX, w - HEADER_PAD_X * 2.0).into())
+        } else {
+            None
+        };
         if options.show_descriptions {
-            let max_chars = ((w - CARD_PAD_X * 2.0) / (9.0 * MONO_ADVANCE)).max(8.0) as usize;
             for r in &mut rows {
-                if let Some(desc) = &r.description {
-                    let one_line: String = desc.split_whitespace().collect::<Vec<_>>().join(" ");
-                    let truncated: String = if one_line.chars().count() > max_chars {
-                        let cut: String = one_line.chars().take(max_chars.saturating_sub(1)).collect();
-                        format!("{cut}…")
-                    } else {
-                        one_line
-                    };
-                    r.description_line = Some(truncated.into());
+                let src = r
+                    .description
+                    .clone()
+                    .or_else(|| r.deprecated.then(|| r.deprecation_reason.clone()).flatten());
+                if let Some(d) = src {
+                    let d = one_line(&d);
+                    if !d.is_empty() {
+                        r.description_line =
+                            Some(fit_text(&d, DESC_FONT_PX, w - CARD_PAD_X * 2.0).into());
+                    }
                 }
             }
         }
-        let h = HEADER_H + TOP_BODY_PAD + rows.len() as f32 * row_h + BOTTOM_PAD;
 
         cards.push(Card {
             index: i as u32,
             name: n.name.clone().into(),
             kind: n.kind,
             kind_label: kind_label(n.kind),
+            kind_upper: kind_upper(n.kind),
             description: n.description.clone(),
+            header_desc,
             rows,
+            implements,
+            member_of_unions,
             w,
             h,
             row_h,
+            header_h,
+            band,
             is_overlay: n.is_overlay,
             row_map,
         });
@@ -616,5 +866,134 @@ fn edge_group(e: &gompass_core::graph::GraphEdgeData) -> EdgeGroup {
         EdgeKind::Union => EdgeGroup::Union,
         EdgeKind::Implements => EdgeGroup::Implements,
         EdgeKind::Arg => EdgeGroup::Arg,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gompass_core::graph::{sdl_to_graph, SdlToGraphOptions};
+
+    fn model_of(sdl: &str, opts: ModelOptions) -> Model {
+        let g = sdl_to_graph(
+            sdl,
+            &SdlToGraphOptions { hide_relay_boilerplate: false, ..Default::default() },
+        );
+        assert!(g.error.is_none(), "{:?}", g.error);
+        build_model(g, "t".into(), &opts)
+    }
+
+    /// The spec's worked example: Object with 3 fields + 1 interface, no
+    /// descriptions → h=124, band 98..124, iface rows start at 104 so the
+    /// band text baseline lands at 114.
+    #[test]
+    fn card_height_and_band_match_the_web_worked_example() {
+        let m = model_of(
+            "interface Node { id: ID! }
+             type User implements Node { id: ID!, a: String, b: String }",
+            ModelOptions { today: "2020-01-01".into(), ..Default::default() },
+        );
+        let c = &m.cards[m.index_of["User"] as usize];
+        assert_eq!(c.rows.len(), 3);
+        assert_eq!(c.implements.len(), 1);
+        assert_eq!(c.h, 124.0, "card height");
+        assert_eq!(c.band.iface_band_top, 98.0, "wash top");
+        assert_eq!(c.band.iface_band_bottom, 124.0, "band runs to the card bottom");
+        assert_eq!(c.band.iface_rows_top, 104.0, "rows centered in the band");
+        assert_eq!(c.band.iface_rows_top + 10.0, 114.0, "band text baseline");
+    }
+
+    #[test]
+    fn body_row_grid_matches_the_web() {
+        let m = model_of(
+            "type Query { a: String, b: String }",
+            ModelOptions { today: "2020-01-01".into(), ..Default::default() },
+        );
+        let c = &m.cards[m.index_of["Query"] as usize];
+        assert_eq!(c.header_h, HEADER_H);
+        assert_eq!(c.body_top(), HEADER_H + 6.0, "bodyY = headerH + TOP_BODY_PAD - 2");
+        assert_eq!(c.row_baseline(0), HEADER_H + 16.0, "first baseline");
+        assert_eq!(c.row_baseline(1) - c.row_baseline(0), ROW_H, "pitch");
+        // hit-testing is the exact inverse of the painter
+        assert_eq!(c.hit_row(20.0, c.row_y(1) + 1.0), Some(RowHit::Row(1)));
+        assert_eq!(c.hit_row(20.0, 10.0), None, "header is not a row");
+    }
+
+    #[test]
+    fn descriptions_mode_uses_the_taller_grid() {
+        let m = model_of(
+            "\"doc\" type Query { a: String }",
+            ModelOptions {
+                show_descriptions: true,
+                today: "2020-01-01".into(),
+                ..Default::default()
+            },
+        );
+        let c = &m.cards[m.index_of["Query"] as usize];
+        assert_eq!(c.header_h, HEADER_H_WITH_DESC);
+        assert_eq!(c.row_h, ROW_H_WITH_DESC);
+        assert!(c.header_desc.is_some(), "header description is rendered");
+    }
+
+    #[test]
+    fn union_members_use_tight_pitch_and_scalars_get_a_stub_row() {
+        let m = model_of(
+            "type A { x: String } type B { x: String } union U = A | B scalar Custom",
+            ModelOptions {
+                show_descriptions: true,
+                today: "2020-01-01".into(),
+                ..Default::default()
+            },
+        );
+        let u = &m.cards[m.index_of["U"] as usize];
+        assert_eq!(u.body_pitch(), TIGHT_ROW_H, "union members stay tight");
+        assert_eq!(u.h, HEADER_H_WITH_DESC + 8.0 + 2.0 * TIGHT_ROW_H + 10.0);
+        let s = &m.cards[m.index_of["Custom"] as usize];
+        assert!(s.rows.is_empty());
+        assert_eq!(s.h, HEADER_H_WITH_DESC + 8.0 + ROW_H_WITH_DESC + 10.0);
+    }
+
+    #[test]
+    fn width_follows_the_estimate_formula() {
+        let m = model_of(
+            "type Query { averyveryverylongfieldnamehere: SomeQuiteLongTypeName }
+             type SomeQuiteLongTypeName { x: String }",
+            ModelOptions { today: "2020-01-01".into(), ..Default::default() },
+        );
+        let c = &m.cards[m.index_of["Query"] as usize];
+        let expect = mono_w("averyveryverylongfieldnamehere", ROW_FONT_PX)
+            + 16.0
+            + mono_w("SomeQuiteLongTypeName", ROW_FONT_PX)
+            + 20.0;
+        assert_eq!(c.w, expect.max(MIN_CARD_W).round());
+    }
+
+    #[test]
+    fn builtin_scalar_and_expired_types_are_colored_apart() {
+        let m = model_of(
+            "type Query { s: String, u: Other @deprecated(reason: \"gone [until 2000-01-01]\") }
+             type Other { x: String }",
+            ModelOptions { today: "2020-01-01".into(), ..Default::default() },
+        );
+        let c = &m.cards[m.index_of["Query"] as usize];
+        assert_eq!(c.rows[0].type_color, TypeColor::BuiltinScalar);
+        assert_eq!(c.rows[1].type_color, TypeColor::Expired);
+        assert!(c.rows[1].until_expired);
+    }
+
+    #[test]
+    fn hiding_primitives_remaps_rows_for_ports_and_pins() {
+        let m = model_of(
+            "type Query { s: String, o: Other } type Other { x: String }",
+            ModelOptions {
+                hide_primitive_fields: true,
+                today: "2020-01-01".into(),
+                ..Default::default()
+            },
+        );
+        let c = &m.cards[m.index_of["Query"] as usize];
+        assert_eq!(c.rows.len(), 1, "String field hidden");
+        assert_eq!(c.display_row(0), None, "hidden field maps to nothing");
+        assert_eq!(c.display_row(1), Some(0), "second field moved up");
     }
 }

@@ -7,7 +7,8 @@
 
 use crate::theme::Theme;
 use crate::model::{
-    EdgeGroup, Model, RowKind, CARD_PAD_X, HEADER_H, NAME_FONT_PX, ROW_FONT_PX, ROW_H,
+    fit_text, mono_w, EdgeGroup, Model, RowHit, RowKind, TypeColor, BAND_FONT_PX, CARD_PAD_X,
+    DESC_FONT_PX, HEADER_PAD_X, KIND_FONT_PX, NAME_FONT_PX, ROW_FONT_PX, TIGHT_ROW_H,
 };
 use gompass_core::graph::NodeKind;
 use gpui::{
@@ -28,6 +29,8 @@ const LOD_ROWS: f32 = 0.12;
 const LOD_ROW_BARS: f32 = 0.075;
 /// Below this zoom, header text is not drawn.
 const LOD_HEADER: f32 = 0.03;
+/// Alpha applied to everything that is not the focused card (web DIM_ALPHA).
+const DIM_ALPHA: f32 = 0.1;
 
 #[derive(Clone, Copy, PartialEq)]
 pub struct ViewTransform {
@@ -40,7 +43,7 @@ pub struct ViewTransform {
 pub struct Hover {
     pub card: u32,
     /// None = header hover.
-    pub row: Option<usize>,
+    pub row: Option<RowHit>,
 }
 
 struct Drag {
@@ -208,7 +211,7 @@ impl GraphCanvas {
             let pos = m.positions[i];
             if wx >= pos.x && wx <= pos.x + card.w && wy >= pos.y && wy <= pos.y + card.h {
                 let row = if self.view.k >= LOD_ROWS {
-                    card.row_at(wx - pos.x, wy - pos.y)
+                    card.hit_row(wx - pos.x, wy - pos.y)
                 } else {
                     None
                 };
@@ -355,26 +358,36 @@ impl GraphCanvas {
                 let vw = f32::from(window.viewport_size().width) - self.pane_offset_x;
                 let vh = f32::from(window.viewport_size().height);
                 match hit.row {
-                    Some(row) => {
+                    Some(RowHit::Row(row)) => {
                         // Clicking the right-aligned type navigates; clicking
                         // the rest of the row pins it (the web split).
                         let card = &self.model.cards[hit.card as usize];
                         let r = &card.rows[row];
                         let (wx, _) = self.screen_to_world(ev.position);
                         let local_x = wx - self.model.positions[hit.card as usize].x;
-                        let rt_w = crate::model::mono_w(&r.right, ROW_FONT_PX);
+                        let rt_w = mono_w(&r.right, ROW_FONT_PX);
                         let on_type = !r.right.is_empty()
                             && local_x >= card.w - CARD_PAD_X - rt_w - 16.0;
-                        if on_type || r.right.is_empty() {
-                            if let Some(t) = r.target {
-                                self.center_on(t, vw, vh);
-                            } else {
+                        let navigate = r.target.filter(|_| on_type || r.right.is_empty());
+                        match navigate {
+                            Some(t) => self.center_on(t, vw, vh),
+                            None => {
                                 self.pinned = Some((hit.card, row));
                                 self.focus = Some(hit.card);
                             }
-                        } else {
-                            self.pinned = Some((hit.card, row));
-                            self.focus = Some(hit.card);
+                        }
+                    }
+                    Some(RowHit::Implements(b)) => {
+                        let name = self.model.cards[hit.card as usize].implements[b].clone();
+                        if let Some(&t) = self.model.index_of.get(name.as_ref()) {
+                            self.center_on(t, vw, vh);
+                        }
+                    }
+                    Some(RowHit::MemberOfUnion(b)) => {
+                        let name =
+                            self.model.cards[hit.card as usize].member_of_unions[b].clone();
+                        if let Some(&t) = self.model.index_of.get(name.as_ref()) {
+                            self.center_on(t, vw, vh);
                         }
                     }
                     None => self.center_on(hit.card, vw, vh),
@@ -406,7 +419,7 @@ impl GraphCanvas {
             base.push_str(&format!("  ·  desc {documented}/{total} ({pct}%)"));
         }
         match self.hover {
-            Some(Hover { card, row: Some(row) }) => {
+            Some(Hover { card, row: Some(RowHit::Row(row)) }) => {
                 let c = &m.cards[card as usize];
                 let r = &c.rows[row];
                 let mut line = if r.right.is_empty() {
@@ -421,6 +434,14 @@ impl GraphCanvas {
                     line.push_str(&format!("   “{excerpt}{ellipsis}”"));
                 }
                 line
+            }
+            Some(Hover { card, row: Some(RowHit::Implements(b)) }) => {
+                let c = &m.cards[card as usize];
+                format!("{base}   —   {} implements {}", c.name, c.implements[b])
+            }
+            Some(Hover { card, row: Some(RowHit::MemberOfUnion(b)) }) => {
+                let c = &m.cards[card as usize];
+                format!("{base}   —   {} in union {}", c.name, c.member_of_unions[b])
             }
             Some(Hover { card, row: None }) => {
                 let c = &m.cards[card as usize];
@@ -496,7 +517,7 @@ impl Render for GraphCanvas {
             self.hover.and_then(|h| {
                 let card = &self.model.cards[h.card as usize];
                 match h.row {
-                    Some(ri) => {
+                    Some(RowHit::Row(ri)) => {
                         let row = &card.rows[ri];
                         let title = if row.right.is_empty() {
                             format!("{}::{}", card.name, row.left)
@@ -514,6 +535,18 @@ impl Render for GraphCanvas {
                             expired: row.until_expired,
                         })
                     }
+                    Some(RowHit::Implements(b)) => Some(Tooltip {
+                        title: format!("implements {}", card.implements[b]),
+                        description: None,
+                        deprecation: None,
+                        expired: false,
+                    }),
+                    Some(RowHit::MemberOfUnion(b)) => Some(Tooltip {
+                        title: format!("member of union {}", card.member_of_unions[b]),
+                        description: None,
+                        deprecation: None,
+                        expired: false,
+                    }),
                     None => card.description.clone().map(|d| Tooltip {
                         title: format!("{} {}", card.kind_label, card.name),
                         description: Some(d),
@@ -814,8 +847,13 @@ fn paint_scene(
     });
 
     // ---- nodes (their own layer, above the edges) ----
+    // Geometry, colors and draw order mirror the web renderer's
+    // `drawNodeSprite` (see UI-PARITY.md §1). Layout math stays in world
+    // units via `mono_w`; only glyph shaping happens at the screen scale.
     let name_font = mono(FontWeight::SEMIBOLD);
     let row_font = mono(FontWeight::NORMAL);
+    let mut italic_font = mono(FontWeight::NORMAL);
+    italic_font.style = gpui::FontStyle::Italic;
     let text_system = window.text_system().clone();
     // Text is shaped at a quantized zoom (√2/4 ladder, ~9% steps) so that a
     // continuous zoom gesture hits the text system's layout cache instead of
@@ -829,73 +867,344 @@ fn paint_scene(
         if pos.x + card.w < wx0 || pos.x > wx1 || pos.y + card.h < wy0 || pos.y > wy1 {
             continue;
         }
+        let ci = i as u32;
+        let dim = match focus {
+            Some(f) if f != ci => DIM_ALPHA,
+            _ => 1.0,
+        };
+        let kind_c = th.kind_color(card.kind);
+        let is_hovered = matches!(hover, Some(h) if h.card == ci);
+        let is_focused = focus == Some(ci);
+        let radius = px(6.0 * k);
         let origin = to_screen(pos.x, pos.y);
         let card_bounds = Bounds {
             origin,
             size: size(px(card.w * k), px(card.h * k)),
         };
-        let kc = th.kind_color(card.kind);
-        let is_hovered = matches!(hover, Some(h) if h.card == i as u32);
-        let is_focused = focus == Some(i as u32);
-        let radius = px(6.0 * k);
-        if k >= 0.25 {
-            window.paint_drop_shadows(
-                card_bounds,
-                Corners::all(radius),
-                &[gpui::BoxShadow {
-                    color: th.shadow,
-                    offset: point(px(0.0), px(2.0 * k)),
-                    blur_radius: px(10.0 * k),
-                    spread_radius: px(0.0),
-                    inset: false,
-                }],
-            );
-        }
-        let border_w = if is_focused || card.is_overlay { 2.0 } else { 1.25 };
-        let border_color = if card.is_overlay {
-            th.overlay_green
-        } else if is_focused || is_hovered {
-            kc
+        let rect = |x: f32, y: f32, w: f32, h: f32| Bounds {
+            origin: to_screen(pos.x + x, pos.y + y),
+            size: size(px((w * k).max(0.5)), px((h * k).max(0.5))),
+        };
+
+        // card body + kind border (overlay types get the emerald dashed ring)
+        let (border_color, border_w, border_style) = if card.is_overlay {
+            (th.overlay_green.opacity(dim), 2.0, BorderStyle::Dashed)
         } else {
-            th.card_border
+            (kind_c.opacity(0.75 * dim), 1.25, BorderStyle::Solid)
         };
         window.paint_quad(quad(
             card_bounds,
             Corners::all(radius),
-            th.card_bg,
+            th.card_bg.opacity(dim),
             Edges::all(px((border_w * k).clamp(0.5, 3.0))),
             border_color,
-            if card.is_overlay { BorderStyle::Dashed } else { BorderStyle::Solid },
+            border_style,
         ));
-        // header band
-        let header_bounds = Bounds {
-            origin,
-            size: size(px(card.w * k), px(HEADER_H * k)),
-        };
+
+        // header band — kind color at full opacity, square bottom corners
         window.paint_quad(quad(
-            header_bounds,
+            Bounds {
+                origin,
+                size: size(px(card.w * k), px(card.header_h * k)),
+            },
             Corners {
                 top_left: radius,
                 top_right: radius,
                 bottom_left: px(0.0),
                 bottom_right: px(0.0),
             },
-            kc.opacity(0.16),
+            kind_c.opacity(dim),
             Edges::default(),
             gpui::transparent_black(),
             BorderStyle::Solid,
         ));
+        window.paint_quad(fill(
+            rect(0.0, card.header_h, card.w, 0.75),
+            kind_c.opacity(0.4 * dim),
+        ));
 
-        // Investigate mode: red outline on undocumented types, red gutter
-        // ticks on undocumented field/enum rows.
+        // trailing wash bands: violet = implements, amber = member of union
+        if !card.implements.is_empty() {
+            let c = th.kind_color(NodeKind::Interface);
+            let (t, b) = (card.band.iface_band_top, card.band.iface_band_bottom);
+            window.paint_quad(fill(rect(0.0, t, card.w, b - t), c.opacity(0.1 * dim)));
+            window.paint_quad(fill(rect(0.0, t, card.w, 0.5), c.opacity(0.4 * dim)));
+        }
+        if !card.member_of_unions.is_empty() {
+            let c = th.kind_color(NodeKind::Union);
+            let t = card.band.union_band_top;
+            window.paint_quad(fill(rect(0.0, t, card.w, card.h - t), c.opacity(0.1 * dim)));
+            window.paint_quad(fill(rect(0.0, t, card.w, 0.5), c.opacity(0.4 * dim)));
+        }
+
+        // ---- header text ----
+        if k >= LOD_HEADER {
+            text_errors += paint_baseline(
+                &text_system,
+                card.kind_upper.into(),
+                &name_font,
+                px(KIND_FONT_PX * kt),
+                gpui::white().opacity(0.6 * dim),
+                None,
+                to_screen(pos.x + HEADER_PAD_X, 0.0).x.into(),
+                to_screen(0.0, pos.y + 14.0).y.into(),
+                window,
+                cx,
+            );
+            if card.is_overlay {
+                let tag_x = pos.x + card.w - HEADER_PAD_X - mono_w("OVERLAY", 8.0);
+                text_errors += paint_baseline(
+                    &text_system,
+                    "OVERLAY".into(),
+                    &name_font,
+                    px(8.0 * kt),
+                    gpui::white().opacity(0.9 * dim),
+                    None,
+                    to_screen(tag_x, 0.0).x.into(),
+                    to_screen(0.0, pos.y + 14.0).y.into(),
+                    window,
+                    cx,
+                );
+            }
+            let name = fit_text(&card.name, NAME_FONT_PX, card.w - HEADER_PAD_X * 2.0);
+            text_errors += paint_baseline(
+                &text_system,
+                name.into(),
+                &name_font,
+                px(NAME_FONT_PX * kt),
+                gpui::white().opacity(dim),
+                None,
+                to_screen(pos.x + HEADER_PAD_X, 0.0).x.into(),
+                to_screen(0.0, pos.y + 30.0).y.into(),
+                window,
+                cx,
+            );
+            if let Some(d) = &card.header_desc {
+                text_errors += paint_baseline(
+                    &text_system,
+                    d.clone(),
+                    &row_font,
+                    px(DESC_FONT_PX * kt),
+                    gpui::white().opacity(0.75 * dim),
+                    None,
+                    to_screen(pos.x + HEADER_PAD_X, 0.0).x.into(),
+                    to_screen(0.0, pos.y + 42.0).y.into(),
+                    window,
+                    cx,
+                );
+            }
+        } else {
+            // Text-shaped presence survives every zoom: a name bar in the
+            // header band even when real glyphs would be sub-pixel.
+            let name_w = mono_w(&card.name, NAME_FONT_PX).min(card.w * 0.7);
+            window.paint_quad(fill(
+                rect(HEADER_PAD_X, card.header_h * 0.45, name_w, NAME_FONT_PX * 0.4),
+                gpui::white().opacity(0.55 * dim),
+            ));
+        }
+
+        // ---- body rows ----
+        let pitch = card.body_pitch();
+        if k >= LOD_ROWS {
+            for (ri, row) in card.rows.iter().enumerate() {
+                let fy = pos.y + card.row_baseline(ri);
+                let name_w = mono_w(&row.left, ROW_FONT_PX);
+                match row.kind {
+                    RowKind::Field => {
+                        let dep_a = if row.deprecated && !row.until_expired { 0.4 } else { 1.0 };
+                        let name_c = if row.until_expired { th.expired } else { th.text };
+                        let strike = row.deprecated.then_some(name_c.opacity(dep_a * dim));
+                        text_errors += paint_baseline(
+                            &text_system,
+                            row.left.clone(),
+                            &row_font,
+                            px(ROW_FONT_PX * kt),
+                            name_c.opacity(dep_a * dim),
+                            strike,
+                            to_screen(pos.x + CARD_PAD_X, 0.0).x.into(),
+                            to_screen(0.0, fy).y.into(),
+                            window,
+                            cx,
+                        );
+                        if !row.right.is_empty() {
+                            let relay_pad = if row.is_relay { 20.0 } else { 0.0 };
+                            let max_w =
+                                (card.w - 20.0 - name_w - relay_pad - 8.0).max(40.0);
+                            let ty = fit_text(&row.right, ROW_FONT_PX, max_w);
+                            let ty_w = mono_w(&ty, ROW_FONT_PX);
+                            let (ty_c, ty_a) = match row.type_color {
+                                TypeColor::Expired => (th.expired, 1.0),
+                                TypeColor::BuiltinScalar => (th.type_builtin, 0.7),
+                                TypeColor::Normal => (th.type_amber, 1.0),
+                            };
+                            let tx = pos.x + card.w - CARD_PAD_X - ty_w;
+                            text_errors += paint_baseline(
+                                &text_system,
+                                ty.into(),
+                                &row_font,
+                                px(ROW_FONT_PX * kt),
+                                ty_c.opacity(ty_a * dep_a * dim),
+                                strike,
+                                to_screen(tx, 0.0).x.into(),
+                                to_screen(0.0, fy).y.into(),
+                                window,
+                                cx,
+                            );
+                            if row.is_relay {
+                                // 8px chain glyph, drawn as two linked bars
+                                let cx_ = tx - 8.0;
+                                let cy = fy - 2.0;
+                                let c = th.relay_orange.opacity(0.85 * dim);
+                                for dx in [-4.0f32, -0.5] {
+                                    window.paint_quad(quad(
+                                        rect(cx_ - pos.x + dx, cy - pos.y - 1.5, 4.5, 3.0),
+                                        Corners::all(px(1.5 * k)),
+                                        gpui::transparent_black(),
+                                        Edges::all(px((1.0 * k).max(0.5))),
+                                        c,
+                                        BorderStyle::Solid,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    RowKind::EnumValue => {
+                        // muted, struck only when the sunset date passed, never faded
+                        let c = if row.until_expired { th.expired } else { th.text_muted };
+                        let strike = row.until_expired.then_some(th.expired.opacity(dim));
+                        text_errors += paint_baseline(
+                            &text_system,
+                            row.left.clone(),
+                            &row_font,
+                            px(ROW_FONT_PX * kt),
+                            c.opacity(dim),
+                            strike,
+                            to_screen(pos.x + CARD_PAD_X, 0.0).x.into(),
+                            to_screen(0.0, fy).y.into(),
+                            window,
+                            cx,
+                        );
+                    }
+                    RowKind::UnionMember => {
+                        text_errors += paint_baseline(
+                            &text_system,
+                            row.left.clone(),
+                            &row_font,
+                            px(ROW_FONT_PX * kt),
+                            th.kind_color(NodeKind::Object).opacity(dim),
+                            None,
+                            to_screen(pos.x + CARD_PAD_X, 0.0).x.into(),
+                            to_screen(0.0, fy).y.into(),
+                            window,
+                            cx,
+                        );
+                    }
+                }
+                if row.is_overlay {
+                    window.paint_quad(fill(
+                        rect(3.0, card.row_baseline(ri) - 7.0, 2.0, 9.0),
+                        th.overlay_green.opacity(dim),
+                    ));
+                }
+                if let Some(d) = &row.description_line {
+                    text_errors += paint_baseline(
+                        &text_system,
+                        d.clone(),
+                        &row_font,
+                        px(DESC_FONT_PX * kt),
+                        th.text_muted.opacity(0.7 * dim),
+                        None,
+                        to_screen(pos.x + CARD_PAD_X, 0.0).x.into(),
+                        to_screen(0.0, fy + 11.0).y.into(),
+                        window,
+                        cx,
+                    );
+                }
+            }
+            if card.kind == NodeKind::Scalar && card.rows.is_empty() {
+                text_errors += paint_baseline(
+                    &text_system,
+                    "custom scalar".into(),
+                    &italic_font,
+                    px(ROW_FONT_PX * kt),
+                    th.text_muted.opacity(dim),
+                    None,
+                    to_screen(pos.x + CARD_PAD_X, 0.0).x.into(),
+                    to_screen(0.0, pos.y + card.body_top() + 10.0).y.into(),
+                    window,
+                    cx,
+                );
+            }
+            // band text — one name per line, no prefix; the band color carries
+            // the meaning (matching the web renderer).
+            for (bi, name) in card.implements.iter().enumerate() {
+                let by = card.band.iface_rows_top + bi as f32 * TIGHT_ROW_H + 10.0;
+                text_errors += paint_baseline(
+                    &text_system,
+                    fit_text(name, BAND_FONT_PX, card.w - 20.0).into(),
+                    &name_font,
+                    px(BAND_FONT_PX * kt),
+                    th.kind_color(NodeKind::Interface).opacity(dim),
+                    None,
+                    to_screen(pos.x + CARD_PAD_X, 0.0).x.into(),
+                    to_screen(0.0, pos.y + by).y.into(),
+                    window,
+                    cx,
+                );
+            }
+            for (bi, name) in card.member_of_unions.iter().enumerate() {
+                let by = card.band.union_rows_top + bi as f32 * TIGHT_ROW_H + 10.0;
+                text_errors += paint_baseline(
+                    &text_system,
+                    fit_text(name, BAND_FONT_PX, card.w - 20.0).into(),
+                    &name_font,
+                    px(BAND_FONT_PX * kt),
+                    th.kind_color(NodeKind::Union).opacity(dim),
+                    None,
+                    to_screen(pos.x + CARD_PAD_X, 0.0).x.into(),
+                    to_screen(0.0, pos.y + by).y.into(),
+                    window,
+                    cx,
+                );
+            }
+        } else {
+            // Placeholder bars keep every card text-shaped at any zoom.
+            let bar_h = (ROW_FONT_PX * k).max(0.6);
+            for (ri, row) in card.rows.iter().enumerate() {
+                let by = card.row_y(ri) + (pitch - ROW_FONT_PX) / 2.0;
+                let left_w = mono_w(&row.left, ROW_FONT_PX).min(card.w * 0.55);
+                window.paint_quad(fill(
+                    Bounds {
+                        origin: to_screen(pos.x + CARD_PAD_X, pos.y + by),
+                        size: size(px(left_w * k), px(bar_h)),
+                    },
+                    th.text_muted.opacity(0.3 * dim),
+                ));
+                if !row.right.is_empty() {
+                    let right_w = mono_w(&row.right, ROW_FONT_PX).min(card.w * 0.4);
+                    window.paint_quad(fill(
+                        Bounds {
+                            origin: to_screen(pos.x + card.w - CARD_PAD_X - right_w, pos.y + by),
+                            size: size(px(right_w * k), px(bar_h)),
+                        },
+                        th.type_amber.opacity(0.25 * dim),
+                    ));
+                }
+            }
+        }
+
+        // ---- interaction overlays (painted above the card, like the web) ----
         if investigate {
             if card.description.is_none() {
                 window.paint_quad(quad(
-                    card_bounds,
-                    Corners::all(radius),
+                    Bounds {
+                        origin: to_screen(pos.x - 4.0, pos.y - 4.0),
+                        size: size(px((card.w + 8.0) * k), px((card.h + 8.0) * k)),
+                    },
+                    Corners::all(px(8.0 * k)),
                     gpui::transparent_black(),
-                    Edges::all(px((1.5 * k).clamp(0.6, 2.5))),
-                    th.red,
+                    Edges::all(px((3.0 * k).clamp(1.0, 4.0))),
+                    th.investigate.opacity(0.95),
                     BorderStyle::Solid,
                 ));
             }
@@ -904,211 +1213,93 @@ fn paint_scene(
                     if matches!(row.kind, RowKind::Field | RowKind::EnumValue)
                         && row.description.is_none()
                     {
-                        let tick = Bounds {
-                            origin: to_screen(pos.x, pos.y + card.row_y(ri) + 4.0),
-                            size: size(px(2.0 * k), px((card.row_h - 8.0) * k)),
-                        };
-                        window.paint_quad(fill(tick, th.red));
-                    }
-                }
-            }
-        }
-
-        // overlay row gutter markers
-        if !card.is_overlay {
-            for (ri, row) in card.rows.iter().enumerate() {
-                if row.is_overlay {
-                    let gutter = Bounds {
-                        origin: to_screen(pos.x + 2.0, pos.y + card.row_y(ri) + 2.0),
-                        size: size(px(3.0 * k), px((card.row_h - 4.0) * k)),
-                    };
-                    window.paint_quad(fill(gutter, th.overlay_green));
-                }
-            }
-        }
-
-        // pinned row (search hit) highlight
-        if let Some((pc, row)) = pinned {
-            if pc == i as u32 && row < card.rows.len() {
-                let row_bounds = Bounds {
-                    origin: to_screen(pos.x, pos.y + card.row_y(row)),
-                    size: size(px(card.w * k), px(card.row_h * k)),
-                };
-                window.paint_quad(fill(row_bounds, th.type_amber.opacity(0.18)));
-            }
-        }
-
-        // hovered row highlight
-        if let Some(Hover { card: hc, row: Some(row) }) = hover {
-            if hc == i as u32 {
-                let ry = card.row_y(row);
-                let row_bounds = Bounds {
-                    origin: to_screen(pos.x, pos.y + ry),
-                    size: size(px(card.w * k), px(card.row_h * k)),
-                };
-                window.paint_quad(fill(row_bounds, gpui::white().opacity(0.06)));
-            }
-        }
-
-        // ---- text ----
-        if k < LOD_HEADER {
-            // Text-shaped presence survives every zoom: a name bar in the
-            // header band even when real glyphs would be sub-pixel.
-            let name_w = crate::model::mono_w(&card.name, NAME_FONT_PX).min(card.w * 0.7);
-            window.paint_quad(fill(
-                Bounds {
-                    origin: to_screen(pos.x + CARD_PAD_X, pos.y + HEADER_H * 0.35),
-                    size: size(px(name_w * k), px((NAME_FONT_PX * k).max(0.6))),
-                },
-                th.text.opacity(0.5),
-            ));
-            continue;
-        }
-        let name_size = px(NAME_FONT_PX * kt);
-        let name_run = [run(card.name.len(), &name_font, th.text)];
-        let line = text_system.shape_line(card.name.clone(), name_size, &name_run, None);
-        text_errors += line
-            .paint(
-                to_screen(pos.x + CARD_PAD_X, pos.y + 8.0),
-                px(NAME_FONT_PX * 1.4 * kt),
-                TextAlign::Left,
-                None,
-                window,
-                cx,
-            )
-            .is_err() as usize;
-        // kind label, small, right of header
-        let kl_size = px(9.0 * kt);
-        let kl_run = [run(card.kind_label.len(), &row_font, kc)];
-        let kl_line = text_system.shape_line(
-            SharedString::from(card.kind_label),
-            kl_size,
-            &kl_run,
-            None,
-        );
-        let kl_x = pos.x + card.w - CARD_PAD_X - f32::from(kl_line.width) / k;
-        text_errors += kl_line
-            .paint(
-                to_screen(kl_x, pos.y + 10.0),
-                px(9.0 * 1.4 * kt),
-                TextAlign::Left,
-                None,
-                window,
-                cx,
-            )
-            .is_err() as usize;
-
-        if k < LOD_ROWS {
-            // Placeholder bars stand in for row text so zoomed-out cards keep
-            // their texture at EVERY zoom (the web app's "bar" sprite LOD).
-            {
-                let bar_h = (ROW_FONT_PX * k).max(0.6);
-                for (ri, row) in card.rows.iter().enumerate() {
-                    let by = pos.y + card.row_y(ri) + (card.row_h - ROW_FONT_PX) / 2.0;
-                    let left_w = crate::model::mono_w(&row.left, ROW_FONT_PX)
-                        .min(card.w * 0.55);
-                    window.paint_quad(fill(
-                        Bounds {
-                            origin: to_screen(pos.x + CARD_PAD_X, by),
-                            size: size(px(left_w * k), px(bar_h)),
-                        },
-                        th.text_muted.opacity(0.3),
-                    ));
-                    if !row.right.is_empty() {
-                        let right_w = crate::model::mono_w(&row.right, ROW_FONT_PX)
-                            .min(card.w * 0.4);
                         window.paint_quad(fill(
-                            Bounds {
-                                origin: to_screen(
-                                    pos.x + card.w - CARD_PAD_X - right_w,
-                                    by,
-                                ),
-                                size: size(px(right_w * k), px(bar_h)),
-                            },
-                            th.type_amber.opacity(0.25),
+                            rect(4.0, card.row_y(ri), card.w - 8.0, pitch),
+                            th.investigate.opacity(0.22),
                         ));
                     }
                 }
             }
-            continue;
         }
-        let row_size = px(ROW_FONT_PX * kt);
-        let row_line_h = px(ROW_H * kt);
-        for (ri, row) in card.rows.iter().enumerate() {
-            let ry = pos.y + card.row_y(ri) + (ROW_H - ROW_FONT_PX * 1.2) / 2.0;
-            let left_color = match row.kind {
-                RowKind::Field | RowKind::EnumValue => {
-                    if row.deprecated {
-                        th.text_muted.opacity(0.6)
-                    } else {
-                        th.text.opacity(0.92)
+        if let Some((pc, row)) = pinned {
+            if pc == ci && row < card.rows.len() {
+                window.paint_quad(quad(
+                    rect(2.0, card.row_y(row) - 2.0, card.w - 4.0, pitch + 4.0),
+                    Corners::all(px(4.0 * k)),
+                    th.pin.opacity(0.18),
+                    Edges::all(px((2.0 * k).clamp(1.0, 3.0))),
+                    th.pin.opacity(0.95),
+                    BorderStyle::Solid,
+                ));
+            }
+        }
+        if let Some(Hover { card: hc, row: Some(hit) }) = hover {
+            if hc == ci {
+                let (hy, hh) = match hit {
+                    RowHit::Row(r) => (card.row_y(r), pitch),
+                    RowHit::Implements(b) => (
+                        card.band.iface_rows_top + b as f32 * TIGHT_ROW_H,
+                        TIGHT_ROW_H,
+                    ),
+                    RowHit::MemberOfUnion(b) => (
+                        card.band.union_rows_top + b as f32 * TIGHT_ROW_H,
+                        TIGHT_ROW_H,
+                    ),
+                };
+                window.paint_quad(quad(
+                    rect(4.0, hy, card.w - 8.0, hh),
+                    Corners::all(px(3.0 * k)),
+                    th.text.opacity(0.07),
+                    Edges::default(),
+                    gpui::transparent_black(),
+                    BorderStyle::Solid,
+                ));
+                // return-type chip, when the cursor is over the type label
+                if let (RowHit::Row(r), true) = (hit, k >= LOD_ROWS) {
+                    let row = &card.rows[r];
+                    if !row.right.is_empty() {
+                        let ty_w = mono_w(&row.right, ROW_FONT_PX);
+                        let relay_w = if row.is_relay { 12.0 } else { 0.0 };
+                        let rt_left = card.w - CARD_PAD_X - ty_w - relay_w - 4.0;
+                        window.paint_quad(quad(
+                            rect(rt_left, card.row_y(r), ty_w + relay_w + 8.0, pitch),
+                            Corners::all(px(3.0 * k)),
+                            th.type_amber.opacity(0.22),
+                            Edges::all(px((1.0 * k).max(0.5))),
+                            th.type_amber.opacity(0.9),
+                            BorderStyle::Solid,
+                        ));
                     }
                 }
-                RowKind::Implements => th.kind_color(NodeKind::Interface).opacity(0.9),
-                RowKind::UnionMember | RowKind::MemberOfUnion => {
-                    th.kind_color(NodeKind::Union).opacity(0.9)
-                }
-            };
-            let mut left_run = run(row.left.len(), &row_font, left_color);
-            if row.deprecated {
-                left_run.strikethrough = Some(gpui::StrikethroughStyle {
-                    thickness: px(1.0),
-                    color: Some(th.text_muted),
-                });
             }
-            let line = text_system.shape_line(row.left.clone(), row_size, &[left_run], None);
-            text_errors += line
-                .paint(
-                    to_screen(pos.x + CARD_PAD_X, ry),
-                    row_line_h,
-                    TextAlign::Left,
-                    None,
-                    window,
-                    cx,
-                )
-                .is_err() as usize;
-            if !row.right.is_empty() {
-                let rt_color: Hsla = if row.until_expired {
-                    th.red
-                } else {
-                    th.type_amber
-                };
-                let right_run = [run(row.right.len(), &row_font, rt_color)];
-                let rline =
-                    text_system.shape_line(row.right.clone(), row_size, &right_run, None);
-                let rx = pos.x + card.w - CARD_PAD_X - f32::from(rline.width) / k;
-                text_errors += rline
-                    .paint(to_screen(rx, ry), row_line_h, TextAlign::Left, None, window, cx)
-                    .is_err() as usize;
-                if row.is_relay {
-                    // small teal dot marking a Relay-unwrapped connection field
-                    let d = 3.5 * k;
-                    window.paint_quad(quad(
-                        Bounds {
-                            origin: to_screen(rx - 8.0, ry + 3.5),
-                            size: size(px(d), px(d)),
-                        },
-                        Corners::all(px(d / 2.0)),
-                        th.kind_color(NodeKind::Input),
-                        Edges::default(),
-                        gpui::transparent_black(),
-                        BorderStyle::Solid,
-                    ));
-                }
-            }
-            if let Some(desc) = &row.description_line {
-                let drun = [run(desc.len(), &row_font, th.text_muted.opacity(0.8))];
-                let dline = text_system.shape_line(desc.clone(), px(8.5 * kt), &drun, None);
-                text_errors += dline
-                    .paint(
-                        to_screen(pos.x + CARD_PAD_X, pos.y + card.row_y(ri) + 13.5),
-                        px(8.5 * 1.3 * kt),
-                        TextAlign::Left,
-                        None,
-                        window,
-                        cx,
-                    )
-                    .is_err() as usize;
+        }
+        if is_focused || (is_hovered && !is_focused) {
+            let (w_ring, a_ring) = if is_focused { (2.5, 0.75) } else { (1.5, 0.4) };
+            window.paint_quad(quad(
+                Bounds {
+                    origin: to_screen(pos.x - 3.0, pos.y - 3.0),
+                    size: size(px((card.w + 6.0) * k), px((card.h + 6.0) * k)),
+                },
+                Corners::all(px(9.0 * k)),
+                gpui::transparent_black(),
+                Edges::all(px((w_ring * k).clamp(1.0, 3.5))),
+                kind_c.opacity(a_ring),
+                BorderStyle::Solid,
+            ));
+        }
+        if card.is_overlay {
+            for (pad, r, a) in [(22.0f32, 26.0f32, 0.12f32), (13.0, 18.0, 0.22), (6.0, 11.0, 0.38)] {
+                window.paint_quad(quad(
+                    Bounds {
+                        origin: to_screen(pos.x - pad, pos.y - pad),
+                        size: size(px((card.w + pad * 2.0) * k), px((card.h + pad * 2.0) * k)),
+                    },
+                    Corners::all(px(r * k)),
+                    th.overlay_green.opacity(a * dim),
+                    Edges::default(),
+                    gpui::transparent_black(),
+                    BorderStyle::Solid,
+                ));
             }
         }
     }
@@ -1116,4 +1307,46 @@ fn paint_scene(
     if text_errors > 0 {
         eprintln!("canvas: {text_errors} text paint errors this frame");
     }
+}
+
+/// Paints one shaped line with its BASELINE at `baseline` (screen px), the
+/// way the web's canvas `fillText` positions text.
+#[allow(clippy::too_many_arguments)]
+fn paint_baseline(
+    ts: &std::sync::Arc<gpui::WindowTextSystem>,
+    text: SharedString,
+    font: &Font,
+    size_px: Pixels,
+    color: Hsla,
+    strike: Option<Hsla>,
+    x: f32,
+    baseline: f32,
+    window: &mut Window,
+    cx: &mut App,
+) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+    let run = TextRun {
+        len: text.len(),
+        font: font.clone(),
+        color,
+        background_color: None,
+        underline: None,
+        strikethrough: strike.map(|c| gpui::StrikethroughStyle {
+            thickness: px(0.75),
+            color: Some(c),
+        }),
+    };
+    let line = ts.shape_line(text, size_px, &[run], None);
+    let line_height = line.ascent + line.descent;
+    line.paint(
+        point(px(x), px(baseline) - line.ascent),
+        line_height,
+        TextAlign::Left,
+        None,
+        window,
+        cx,
+    )
+    .is_err() as usize
 }
