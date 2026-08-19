@@ -1339,6 +1339,13 @@ impl Render for Workspace {
         if !self.focused_once {
             self.focused_once = true;
             window.focus(&self.focus, cx);
+            // Debug: GOMPASS_FOCUS=<TypeName> opens with that card focused, so
+            // a selfshot can reproduce the focused state.
+            if let Ok(name) = std::env::var("GOMPASS_FOCUS") {
+                cx.defer_in(window, move |this: &mut Self, _, cx| {
+                    this.navigate_to_type(&name, cx)
+                });
+            }
         }
         div()
             .flex()

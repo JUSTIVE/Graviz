@@ -578,9 +578,14 @@ impl GraphCanvas {
     }
 }
 
-/// Per-stroke alpha for edges faded behind a pinned one. Chosen for how it
-/// accumulates: a lone edge is a whisper, twenty stacked are a faint haze.
-const PIN_DIM_ALPHA: f32 = 0.015;
+/// Per-stroke alpha for edges faded behind a focused card or a pinned edge.
+///
+/// It has to be far harder than it looks. The web fades a whole PixiJS
+/// container, so its alpha composites once; these are separate strokes, and
+/// twenty overlapping hairlines at 0.1 add back up to an opaque wash — which
+/// is why "dimmed" edges still read as bright. Chosen for how it accumulates:
+/// a lone edge is a whisper, twenty stacked are a faint haze.
+const FOCUS_DIM_ALPHA: f32 = 0.015;
 
 /// Should this edge be drawn in the dim pass?
 ///
@@ -1308,12 +1313,14 @@ fn paint_scene(
     const SEGS_PER_BATCH: usize = 900;
     for (group, dim_pass) in groups.iter().flat_map(|&g| [(g, false), (g, true)]) {
         let color = if dim_pass {
-            // Pinning one edge out of thousands needs a far harder fade than
-            // dimming the edges that merely miss a focused node. It also has
-            // to be harder than it looks: the web fades a whole container, so
-            // its alpha composites once, while these are separate strokes and
-            // twenty overlapping hairlines at 0.1 add up to an opaque wash.
-            let a = if focused_edge.is_some() { PIN_DIM_ALPHA } else { 0.35 };
+            // With a focus of any kind the dimmed edges have to recede hard;
+            // without one this pass is only the hub fading, which should stay
+            // legible.
+            let a = if focused_edge.is_some() || focus.is_some() {
+                FOCUS_DIM_ALPHA
+            } else {
+                0.35
+            };
             edge_color(&th, group).opacity(a)
         } else {
             edge_color(&th, group)

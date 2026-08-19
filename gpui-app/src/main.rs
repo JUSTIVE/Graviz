@@ -15,8 +15,13 @@ mod theme;
 mod tree;
 mod workspace;
 
-use gpui::{prelude::*, px, size, App, Bounds, WindowBounds, WindowOptions};
+use gpui::{
+    actions, prelude::*, px, size, App, Bounds, KeyBinding, Menu, MenuItem, WindowBounds,
+    WindowOptions,
+};
 use root::Root;
+
+actions!(gompass, [Quit]);
 use std::path::PathBuf;
 
 fn main() {
@@ -59,6 +64,15 @@ fn main() {
 
     gpui_platform::application().with_assets(icons::Assets).run(move |cx: &mut App| {
         workspace::init(cx);
+        // The window has no system titlebar, but the app still needs the
+        // standard menu: without it macOS gives ⌘Q to nothing.
+        cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+        cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
+        cx.set_menus(vec![Menu {
+            name: "Graviz".into(),
+            items: vec![MenuItem::action("Quit Graviz", Quit)],
+            disabled: false,
+        }]);
         let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
         cx.open_window(
             WindowOptions {
