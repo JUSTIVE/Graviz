@@ -424,6 +424,7 @@ pub fn layout(
             }
         }
         let mut crossed = 0usize;
+        let (mut back_crossed, mut back_n) = (0usize, 0usize);
         for (e, p) in edges.iter().zip(edge_paths.iter()) {
             let mut hit = std::collections::HashSet::new();
             for w in p.points.windows(2) {
@@ -450,6 +451,11 @@ pub fn layout(
                 }
             }
             crossed += hit.len();
+            let (a, b) = (positions[e.from as usize], positions[e.to as usize]);
+            if b.x <= a.x {
+                back_crossed += hit.len();
+                back_n += 1;
+            }
         }
         // How well the clusters actually held together: average distance
         // between members, and the share of clusters whose members ended up
@@ -554,6 +560,13 @@ pub fn layout(
             }
         }
         let edge_x = tangled.len();
+        eprintln!(
+            "cards: {} back edges cross {:.2} cards each, {} forward cross {:.2}",
+            back_n,
+            back_crossed as f32 / back_n.max(1) as f32,
+            edges.len() - back_n,
+            (crossed - back_crossed) as f32 / (edges.len() - back_n).max(1) as f32
+        );
         // How concentrated are the crossings? If a small set of long edges
         // accounts for most of them, those are worth routing differently.
         let mut per_edge = vec![0u32; edges.len()];
