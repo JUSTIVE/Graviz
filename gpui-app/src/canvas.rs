@@ -30,6 +30,22 @@ const CLICK_DRAG_THRESHOLD: f32 = 4.0;
 const LOD_ROWS: f32 = 0.28;
 /// Below this zoom, header text gives way to a name bar.
 const LOD_HEADER: f32 = 0.2;
+/// Below this zoom, description lines are dropped.
+///
+/// Descriptions are the 9px text, so this is where they fall under ~3.8px on
+/// screen — a grey smear that reads as texture, not words, while costing a
+/// third of every shaped line on the canvas. Names and types keep their own,
+/// lower threshold, because at these zooms they are still the thing being
+/// scanned for.
+const LOD_DESC: f32 = 0.42;
+
+thread_local! {
+    /// `GOMPASS_LOD_DESC` overrides the threshold for A/B measurement.
+    static LOD_DESC_AT: f32 = std::env::var("GOMPASS_LOD_DESC")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(LOD_DESC);
+}
 /// Alpha applied to everything that is not the focused card (web DIM_ALPHA).
 const DIM_ALPHA: f32 = 0.1;
 
@@ -116,7 +132,41 @@ pub struct GraphCanvas {
     pane_offset_x: f32,
     /// Right-click menu on a card, if one is open.
     context_menu: Option<ContextMenu>,
+    /// Scripted camera sweep for frame-time measurement (`GOMPASS_BENCH=1`).
+    bench: Option<Bench>,
 }
+
+/// A scripted camera sweep that records every frame's paint time.
+///
+/// The perf panel shows an EMA, which is the wrong statistic for "does this
+/// ever drop a frame": one 20ms hitch inside a run of 4ms frames barely moves
+/// the average but is exactly the stutter a reader notices. So the bench keeps
+/// every sample and reports the tail.
+struct Bench {
+    samples: Rc<std::cell::RefCell<Vec<BenchSample>>>,
+    frame: usize,
+}
+
+/// One recorded frame. The camera travels with the sample so a slow frame can
+/// be attributed to a zoom level and a world region, and the skip count shows
+/// what the text budget cost that frame.
+#[derive(Clone, Copy)]
+struct BenchSample {
+    ms: f32,
+    k: f32,
+    frame: usize,
+    skipped: u32,
+}
+
+/// Frames discarded before recording — the first paints shape every glyph in
+/// the viewport for the first time and would otherwise dominate the maximum.
+const BENCH_WARMUP: usize = 30;
+const BENCH_FRAMES: usize = 480;
+/// Camera stops per zoom level: a 4x4 grid over the world, so the sweep sees
+/// dense and empty regions alike instead of only the diagonal.
+const BENCH_STOPS: usize = 16;
+/// Zoom levels visited, in order. 0.0 means "whatever fits the whole graph".
+const BENCH_ZOOMS: [f32; 5] = [0.0, 0.25, 0.5, 1.0, 2.0];
 
 /// One stop in the navigation history: a type card, or an edge between two.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -180,7 +230,126 @@ impl GraphCanvas {
             focus_changed_at: None,
             pane_offset_x: 340.0,
             context_menu: None,
+            // Debug: GOMPASS_BENCH=1 runs the camera sweep and exits.
+            bench: std::env::var("GOMPASS_BENCH").is_ok().then(|| Bench {
+                samples: Rc::new(std::cell::RefCell::new(Vec::new())),
+                frame: 0,
+            }),
         }
+    }
+
+    /// Camera for bench frame `i`.
+    ///
+    /// First half: cycle the zoom levels, walking a 4x4 grid of world centers
+    /// at each — that is panning. Second half: hold the center and sweep the
+    /// zoom continuously, which is the harder case, because a font size that
+    /// changes every frame misses every text cache.
+    fn bench_view(&self, i: usize, vw: f32, vh: f32) -> ViewTransform {
+        let (gw, gh) = (self.model.world_w.max(1.0), self.model.world_h.max(1.0));
+        if i >= BENCH_FRAMES / 2 {
+            // 0.2 → 1.4 over the whole phase: at 120fps that is a two-second
+            // gesture, which is about as fast as a pinch-zoom actually goes.
+            // Sweeping faster than a real gesture would test nothing anyone
+            // does, and any size ladder would look useless against it.
+            let t = (i - BENCH_FRAMES / 2) as f32 / (BENCH_FRAMES / 2) as f32;
+            let k = 0.2 + 1.2 * t;
+            let (cx, cy) = (gw * 0.4, gh * 0.4);
+            return ViewTransform { x: vw / 2.0 - cx * k, y: vh / 2.0 - cy * k, k };
+        }
+        let z = BENCH_ZOOMS[(i / BENCH_STOPS) % BENCH_ZOOMS.len()];
+        let k = if z == 0.0 {
+            ((vw - 80.0) / gw).min((vh - 80.0) / gh).clamp(ZOOM_MIN, 1.2)
+        } else {
+            z
+        };
+        let side = 4;
+        let stop = i % BENCH_STOPS;
+        let (col, row) = (stop % side, stop / side);
+        let cx = gw * (col as f32 + 0.5) / side as f32;
+        let cy = gh * (row as f32 + 0.5) / side as f32;
+        ViewTransform { x: vw / 2.0 - cx * k, y: vh / 2.0 - cy * k, k }
+    }
+
+    /// Advance the sweep, and once it has run its course print the
+    /// distribution and quit.
+    fn bench_step(&mut self, vw: f32, vh: f32, window: &mut Window) {
+        let Some(bench) = &mut self.bench else { return };
+        let i = bench.frame;
+        bench.frame += 1;
+        let done = bench.samples.borrow().len() >= BENCH_FRAMES;
+        if !done {
+            self.view = self.bench_view(i, vw, vh);
+            window.request_animation_frame();
+            return;
+        }
+        eprintln!(
+            "bench: world {:.0}x{:.0}",
+            self.model.world_w, self.model.world_h
+        );
+        let raw = self.bench.as_ref().unwrap().samples.borrow().clone();
+        let mut s = raw.clone();
+        s.sort_by(|a, b| a.ms.partial_cmp(&b.ms).unwrap());
+        let pct = |p: f32| s[((s.len() - 1) as f32 * p) as usize].ms;
+        let budget = 1000.0 / 120.0;
+        let over = s.iter().filter(|v| v.ms > budget).count();
+        eprintln!(
+            "bench: {} frames  p50 {:.2}  p90 {:.2}  p99 {:.2}  max {:.2}  \
+             over-{budget:.2}ms {over} ({:.1}%)",
+            s.len(),
+            pct(0.50),
+            pct(0.90),
+            pct(0.99),
+            s[s.len() - 1].ms,
+            100.0 * over as f32 / s.len() as f32,
+        );
+        for (label, phase) in [("pan ", 0usize), ("zoom", BENCH_FRAMES / 2)] {
+            let mut at: Vec<&BenchSample> = raw
+                .iter()
+                .filter(|v| (v.frame >= BENCH_FRAMES / 2) == (phase > 0))
+                .collect();
+            if at.is_empty() {
+                continue;
+            }
+            let skipped = at.iter().filter(|v| v.skipped > 0).count();
+            let worst_skip = at.iter().map(|v| v.skipped).max().unwrap_or(0);
+            at.sort_by(|a, b| a.ms.partial_cmp(&b.ms).unwrap());
+            eprintln!(
+                "  {label}: n={} p50 {:.2} p99 {:.2} max {:.2}  frames-with-deferred-text {skipped} (worst {worst_skip} lines)",
+                at.len(),
+                at[at.len() / 2].ms,
+                at[(at.len() - 1) * 99 / 100].ms,
+                at[at.len() - 1].ms,
+            );
+        }
+        // Per-zoom breakdown: a tail concentrated at one zoom is a different
+        // bug from one scattered across all of them.
+        for z in BENCH_ZOOMS {
+            let mut at: Vec<f32> = s
+                .iter()
+                .filter(|v| z == 0.0 || (v.k - z).abs() < 1e-4)
+                .filter(|v| z != 0.0 || v.k < BENCH_ZOOMS[1])
+                .map(|v| v.ms)
+                .collect();
+            if at.is_empty() {
+                continue;
+            }
+            at.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            eprintln!(
+                "  zoom {z:.2}: n={} p50 {:.2} p99 {:.2} max {:.2}",
+                at.len(),
+                at[at.len() / 2],
+                at[(at.len() - 1) * 99 / 100],
+                at[at.len() - 1],
+            );
+        }
+        let worst: Vec<String> = s
+            .iter()
+            .rev()
+            .take(8)
+            .map(|s| format!("{:.1}ms@k{:.2}#{}/{}", s.ms, s.k, s.frame, s.skipped))
+            .collect();
+        eprintln!("  worst: {}", worst.join(" "));
+        std::process::exit(0);
     }
 
     pub fn set_pane_offset(&mut self, offset: f32, cx: &mut Context<Self>) {
@@ -827,23 +996,30 @@ fn card_is_dimmed(
 const RIPPLE_CYCLE: f32 = 1.6;
 const RIPPLE_TOTAL: f32 = 4.8;
 
-/// World-space spacing of the background dot lattice, and the smallest
-/// on-screen spacing it is allowed to shrink to before the lattice doubles.
-const GRID_STEP: f32 = 24.0;
-const GRID_MIN_SCREEN_STEP: f32 = 18.0;
-/// Hard ceiling on dots per frame, as a guard against a degenerate viewport.
-const GRID_MAX_DOTS: usize = 40_000;
-
 /// Largest deviation, in screen pixels, we aim for between a flattened edge
 /// and the true curve. Below half a pixel the difference is not resolvable.
 const CURVE_TOL: f32 = 0.35;
 
 /// Line segments an edge layer may emit in one frame before the tolerance is
 /// relaxed to fit. Stroke tessellation measures at ~0.113µs per segment, so
-/// this is about 4.3ms — the share of a 120fps frame (8.3ms) that edges can
-/// have and still leave the ~2.1ms that cards and text cost at their worst
-/// plus the ~0.6ms the background lattice takes.
-const SEG_BUDGET: usize = 38_000;
+/// this is about 3.2ms — the share of a 120fps frame (8.3ms) that edges can
+/// have and still leave the ~3.5ms text is allowed plus what the cards cost.
+///
+/// It was 38_000 while the background lattice was still being drawn and text
+/// re-shaped itself every frame; with both gone the tail on the GitHub schema
+/// (2651 edges) sat at 8.8ms, and this is what puts it under. The tolerance
+/// only relaxes on frames that would blow the budget anyway, and at that point
+/// the screen is a wash of overlapping hairlines where the flattening error is
+/// not resolvable — 38_000 and 22_000 render indistinguishably there.
+const SEG_BUDGET: usize = 28_000;
+
+thread_local! {
+    /// `GOMPASS_SEGS` overrides the budget for A/B measurement.
+    static SEG_BUDGET_AT: usize = std::env::var("GOMPASS_SEGS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(SEG_BUDGET);
+}
 
 /// Segments needed to keep one cubic within `tol` screen pixels of its chords.
 ///
@@ -940,6 +1116,9 @@ impl Render for GraphCanvas {
             self.focus_edge(ei, vw, vh);
         }
         let offscreen = vw > 0.0 && self.offscreen(vw, vh);
+        if self.bench.is_some() && vw > 0.0 {
+            self.bench_step(vw, vh, window);
+        }
 
         // Ripple phase, or None once the pulse has run its course. Decorative
         // motion, so it yields to the system's reduce-motion setting.
@@ -989,6 +1168,7 @@ impl Render for GraphCanvas {
         let fps_now = self.fps_now.clone();
         let last_frame = self.last_frame.clone();
         let last_sample = self.last_sample.clone();
+        let bench = self.bench.as_ref().map(|b| (b.samples.clone(), b.frame, view.k));
 
         // Floating tooltip: field/header description + deprecation info.
         /// Mirrors the web's three tooltip shapes (field / header / edge).
@@ -1143,6 +1323,16 @@ impl Render for GraphCanvas {
                             },
                         );
                         let ms = t0.elapsed().as_secs_f32() * 1000.0;
+                        if let Some((samples, frame, k)) = &bench {
+                            if *frame >= BENCH_WARMUP {
+                                samples.borrow_mut().push(BenchSample {
+                                    ms,
+                                    k: *k,
+                                    frame: *frame,
+                                    skipped: TEXT_SKIPPED.with(|c| c.get()),
+                                });
+                            }
+                        }
                         let prev = frame_ms.get();
                         frame_ms.set(if prev == 0.0 { ms } else { prev * 0.8 + ms * 0.2 });
                         // frame-interval FPS, sampled into the chart every 200ms
@@ -1601,39 +1791,8 @@ fn paint_scene(
         None => std::collections::HashSet::new(),
     };
 
+    let lod_desc = LOD_DESC_AT.with(|v| *v);
     let t_probe = std::time::Instant::now();
-    // ---- dot grid, under everything ----
-    // A 24px world lattice of dots, like the web canvas. It is what makes
-    // panning and zooming legible over an empty stretch of graph — without it
-    // a drag across blank space looks like nothing is happening. Only the
-    // dots inside the viewport are emitted, and the lattice doubles its step
-    // as you zoom out so the on-screen spacing stays in a readable band
-    // instead of collapsing into a grey wash.
-    {
-        let mut step = GRID_STEP;
-        while step * k < GRID_MIN_SCREEN_STEP {
-            step *= 2.0;
-        }
-        let dot = k.clamp(1.0, 2.0);
-        let color = th.text_muted.opacity(0.18);
-        let gx0 = (wx0 / step).floor() * step;
-        let gy0 = (wy0 / step).floor() * step;
-        let cols = ((wx1 - gx0) / step).ceil().max(0.0) as usize;
-        let rows = ((wy1 - gy0) / step).ceil().max(0.0) as usize;
-        if cols.saturating_mul(rows) <= GRID_MAX_DOTS {
-            for r in 0..=rows {
-                let wy = gy0 + r as f32 * step;
-                for c in 0..=cols {
-                    let wx = gx0 + c as f32 * step;
-                    window.paint_quad(fill(
-                        Bounds { origin: to_screen(wx, wy), size: size(px(dot), px(dot)) },
-                        color,
-                    ));
-                }
-            }
-        }
-    }
-
     // Frame budget: price the edges at the ideal tolerance first, and if the
     // bill is too high, relax the tolerance just enough to fit. n scales with
     // 1/sqrt(tol), so the correction is the square of the overrun. This is
@@ -1652,8 +1811,9 @@ fn paint_scene(
                 p0 = c.end;
             }
         }
-        if want > SEG_BUDGET {
-            CURVE_TOL * (want as f32 / SEG_BUDGET as f32).powi(2)
+        let budget = SEG_BUDGET_AT.with(|v| *v);
+        if want > budget {
+            CURVE_TOL * (want as f32 / budget as f32).powi(2)
         } else {
             CURVE_TOL
         }
@@ -1829,6 +1989,15 @@ fn paint_scene(
     let mut n_cards = 0usize;
     let mut n_rows = 0usize;
     SHAPES.with(|c| c.set(0));
+    TEXT_DEADLINE.with(|d| {
+        d.set(Some(std::time::Instant::now() + std::time::Duration::from_secs_f32(
+            TEXT_BUDGET_MS / 1000.0,
+        )))
+    });
+    TEXT_DEFERRED.with(|f| f.set(false));
+    TEXT_SKIPPED.with(|c| c.set(0));
+    SHAPE_NS.with(|c| c.set(0.0));
+    GLYPH_NS.with(|c| c.set(0.0));
 
     window.paint_layer(bounds, |window| {
     for (i, card) in model.cards.iter().enumerate() {
@@ -1963,7 +2132,7 @@ fn paint_scene(
                 window,
                 cx,
             );
-            if let Some(d) = &card.header_desc {
+            if let Some(d) = card.header_desc.as_ref().filter(|_| k >= lod_desc) {
                 text_errors += paint_baseline(
                     &text_system,
                     d.clone(),
@@ -2108,7 +2277,7 @@ fn paint_scene(
                         th.overlay_green.opacity(dim),
                     ));
                 }
-                if let Some(d) = &row.description_line {
+                if let Some(d) = row.description_line.as_ref().filter(|_| k >= lod_desc) {
                     text_errors += paint_baseline(
                         &text_system,
                         d.clone(),
@@ -2330,6 +2499,11 @@ fn paint_scene(
     if text_errors > 0 {
         eprintln!("canvas: {text_errors} text paint errors this frame");
     }
+    // Some text was over the frame's budget and went undrawn — come back for
+    // it rather than leaving a card blank.
+    if TEXT_DEFERRED.with(|f| f.get()) {
+        window.request_animation_frame();
+    }
     if probe {
         let n_edges = model
             .edges
@@ -2339,8 +2513,10 @@ fn paint_scene(
             })
             .count();
         eprintln!(
-            "perf: k={k:.2} {:.2}ms (edges {t_edges:.2}) cards={n_cards} rows={n_rows} shapes={} edges={n_edges} emit={n_pts} tol={curve_tol:.2}",
+            "perf: k={k:.2} {:.2}ms (edges {t_edges:.2} shape {:.2} glyph {:.2}) cards={n_cards} rows={n_rows} shapes={} edges={n_edges} emit={n_pts} tol={curve_tol:.2}",
             t_probe.elapsed().as_secs_f32() * 1000.0,
+            SHAPE_NS.with(|c| c.get()) * 1000.0,
+            GLYPH_NS.with(|c| c.get()) * 1000.0,
             SHAPES.with(|c| c.get())
         );
     }
@@ -2349,6 +2525,12 @@ fn paint_scene(
 thread_local! {
     /// Shaped-line count for the GRAVIZ_PERF probe.
     static SHAPES: Cell<usize> = const { Cell::new(0) };
+    /// Whether the per-line timers are armed, read once instead of hitting the
+    /// environment on every line.
+    static PROBE: Cell<bool> = Cell::new(std::env::var("GOMPASS_PERF").is_ok());
+    /// Seconds spent in `shape_line` vs in `ShapedLine::paint`, for the probe.
+    static SHAPE_NS: Cell<f32> = const { Cell::new(0.0) };
+    static GLYPH_NS: Cell<f32> = const { Cell::new(0.0) };
 }
 
 /// Row index range whose band intersects the visible world rect — a tall
@@ -2360,6 +2542,68 @@ fn visible_rows(card: &crate::model::Card, card_y: f32, wy0: f32, wy1: f32) -> (
     let hi = (((wy1 - top) / pitch).ceil() as isize).max(0) as usize + 1;
     (lo.min(card.rows.len()), hi.min(card.rows.len()))
 }
+
+/// Identity of a shaped line: everything `ShapedLine` bakes in, which is the
+/// glyph layout *and* the decoration colors.
+#[derive(PartialEq, Eq, Hash, Debug)]
+struct LineKey {
+    text: SharedString,
+    /// `size_px` bits — font size is continuous in the zoom, so it cannot be
+    /// an integer here without changing what gets drawn.
+    size: u32,
+    font: Font,
+    color: [u32; 4],
+    strike: Option<[u32; 4]>,
+}
+
+fn hsla_bits(c: Hsla) -> [u32; 4] {
+    [c.h.to_bits(), c.s.to_bits(), c.l.to_bits(), c.a.to_bits()]
+}
+
+/// The canvas's own shaped-line cache.
+///
+/// GPUI already caches line layouts, but that cache rotates every frame: the
+/// first touch of a line in a new frame has to promote it out of the previous
+/// frame's map, behind an upgradable-read→write lock and a mutex. Measured on
+/// the crepe schema that promotion is 11.8µs against 0.17µs for a same-frame
+/// repeat — with ~600 lines on screen it was 6.5ms of a 9ms frame, i.e. most
+/// of the frame went to re-finding text that had not changed. Holding the
+/// `ShapedLine` here means a steady camera pays the repeat price instead.
+///
+/// Two generations, rotated on overflow rather than per frame: after a
+/// rotation everything on screen is still in `prev`, so the miss path is a map
+/// move, not a reshape.
+#[derive(Default)]
+struct TextCache {
+    cur: std::collections::HashMap<Rc<LineKey>, gpui::ShapedLine>,
+    prev: std::collections::HashMap<Rc<LineKey>, gpui::ShapedLine>,
+}
+
+/// Entry ceiling before the generations rotate. A viewport holds well under a
+/// thousand lines, so this is many screens' worth of panning.
+const TEXT_CACHE_CAP: usize = 4096;
+
+thread_local! {
+    /// The canvas paints on the main thread only, so a thread-local keeps this
+    /// out of `paint_scene`'s already long argument list.
+    static TEXT_CACHE: std::cell::RefCell<TextCache> =
+        std::cell::RefCell::new(TextCache::default());
+    /// When text work has to stop this frame, and whether it did.
+    static TEXT_DEADLINE: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+    static TEXT_DEFERRED: Cell<bool> = const { Cell::new(false) };
+    /// Lines skipped this frame for being over budget, for the bench report.
+    static TEXT_SKIPPED: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Share of the 8.3ms frame that newly-seen text may take before the rest is
+/// pushed to the next frame.
+///
+/// Cached lines are ~0.2µs and always drawn; only a cache *miss* — shaping and
+/// rasterizing text that just came into view — is subject to this. Panning
+/// into fresh cards exposes on the order of a hundred new lines, well inside
+/// the budget, so in practice it binds only on a hard jump across the graph,
+/// where it costs a frame or two of late text instead of a 15ms hitch.
+const TEXT_BUDGET_MS: f32 = 3.5;
 
 /// Paints one shaped line with its BASELINE at `baseline` (screen px), the
 /// way the web's canvas `fillText` positions text.
@@ -2379,29 +2623,71 @@ fn paint_baseline(
     if text.is_empty() {
         return 0;
     }
-    let run = TextRun {
-        len: text.len(),
-        font: font.clone(),
-        color,
-        background_color: None,
-        underline: None,
-        strikethrough: strike.map(|c| gpui::StrikethroughStyle {
-            thickness: px(0.75),
-            color: Some(c),
-        }),
-    };
+    // Timestamps only under the probe: two `Instant::now()` per line is ~30µs
+    // a frame at 600 lines, which is not worth paying to measure nothing.
+    let t = PROBE.with(|p| p.get()).then(std::time::Instant::now);
     SHAPES.with(|c| c.set(c.get() + 1));
-    let line = ts.shape_line(text, size_px, &[run], None);
+    let key = Rc::new(LineKey {
+        text,
+        size: f32::from(size_px).to_bits(),
+        font: font.clone(),
+        color: hsla_bits(color),
+        strike: strike.map(hsla_bits),
+    });
+    let line = TEXT_CACHE.with(|c| {
+        let c = &mut *c.borrow_mut();
+        if let Some(line) = c.cur.get(&key) {
+            return Some(line.clone());
+        }
+        if let Some((k, line)) = c.prev.remove_entry(&key) {
+            c.cur.insert(k, line.clone());
+            return Some(line);
+        }
+        // A miss is the expensive path — shaping plus glyph rasterization.
+        // Past the budget, leave it for the next frame rather than blow this
+        // one; `TEXT_DEFERRED` makes the caller schedule that frame.
+        if TEXT_DEADLINE.with(|d| d.get()).is_some_and(|d| std::time::Instant::now() > d) {
+            TEXT_DEFERRED.with(|f| f.set(true));
+            TEXT_SKIPPED.with(|c| c.set(c.get() + 1));
+            return None;
+        }
+        let run = TextRun {
+            len: key.text.len(),
+            font: font.clone(),
+            color,
+            background_color: None,
+            underline: None,
+            strikethrough: strike.map(|c| gpui::StrikethroughStyle {
+                thickness: px(0.75),
+                color: Some(c),
+            }),
+        };
+        let line = ts.shape_line(key.text.clone(), size_px, &[run], None);
+        if c.cur.len() >= TEXT_CACHE_CAP {
+            c.prev = std::mem::take(&mut c.cur);
+        }
+        c.cur.insert(key, line.clone());
+        Some(line)
+    });
+    let Some(line) = line else { return 0 };
+    let t_shaped = t.map(|t| {
+        let d = t.elapsed().as_secs_f32();
+        SHAPE_NS.with(|c| c.set(c.get() + d));
+        d
+    });
     let line_height = line.ascent + line.descent;
-    line.paint(
+    let r = line.paint(
         point(px(x), px(baseline) - line.ascent),
         line_height,
         TextAlign::Left,
         None,
         window,
         cx,
-    )
-    .is_err() as usize
+    );
+    if let (Some(t), Some(shaped)) = (t, t_shaped) {
+        GLYPH_NS.with(|c| c.set(c.get() + t.elapsed().as_secs_f32() - shaped));
+    }
+    r.is_err() as usize
 }
 
 #[cfg(test)]
@@ -2481,6 +2767,53 @@ mod tests {
             ScrollAction::Pan(3.0, -9.0)
         );
         assert_eq!(scroll_action(ScrollMode::Pan, trackpad(3.0, -9.0), cmd), ScrollAction::Zoom(-9.0));
+    }
+
+    fn key(text: &str, size: f32, color: Hsla, strike: Option<Hsla>) -> LineKey {
+        LineKey {
+            text: SharedString::from(text.to_string()),
+            size: size.to_bits(),
+            font: mono(FontWeight::NORMAL),
+            color: hsla_bits(color),
+            strike: strike.map(hsla_bits),
+        }
+    }
+
+    fn hash_of(k: &LineKey) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        k.hash(&mut h);
+        h.finish()
+    }
+
+    /// A `ShapedLine` bakes in the decoration colors as well as the glyph
+    /// layout, so anything that changes what gets drawn has to change the key.
+    /// If it did not, a dimmed card would be served the bright line that was
+    /// cached before it lost focus.
+    #[test]
+    fn shaped_line_cache_key_covers_everything_the_line_bakes_in() {
+        let white = gpui::white();
+        let base = key("viewerCanSubscribe", 10.0, white, None);
+        assert_eq!(hash_of(&base), hash_of(&key("viewerCanSubscribe", 10.0, white, None)));
+        assert_eq!(base, key("viewerCanSubscribe", 10.0, white, None));
+
+        for other in [
+            key("viewerCanSubscribX", 10.0, white, None),
+            key("viewerCanSubscribe", 10.5, white, None),
+            key("viewerCanSubscribe", 10.0, white.opacity(0.1), None),
+            key("viewerCanSubscribe", 10.0, white, Some(white)),
+        ] {
+            assert_ne!(base, other);
+        }
+    }
+
+    /// Zoom scales the font size continuously, so two zooms that round to the
+    /// same tenth of a pixel are still different sizes and must not share a
+    /// cached line.
+    #[test]
+    fn shaped_line_cache_key_separates_neighbouring_font_sizes() {
+        let c = gpui::white();
+        assert_ne!(key("id", 5.0, c, None), key("id", 5.000001, c, None));
     }
 
     #[test]
