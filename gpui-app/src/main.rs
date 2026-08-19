@@ -4,7 +4,9 @@ mod editor;
 mod icons;
 mod loader;
 mod model;
+mod panels;
 mod root;
+mod shell;
 #[cfg(target_os = "macos")]
 mod selfshot;
 mod theme;

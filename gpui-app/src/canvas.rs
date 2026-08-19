@@ -67,8 +67,14 @@ pub struct GraphCanvas {
     /// Window-space origin of the canvas element, recorded at paint time so
     /// event coordinates (window-relative) can be mapped into the canvas.
     canvas_origin: Rc<Cell<(f32, f32)>>,
-    /// EMA of paint_scene duration, for the status bar.
+    /// EMA of paint_scene duration, shown in the perf panel.
     frame_ms: Rc<Cell<f32>>,
+    /// Rolling FPS samples (last 60) + the sampling clock, mirroring the
+    /// web's 260x48 bar chart.
+    fps_hist: Rc<std::cell::RefCell<Vec<f32>>>,
+    fps_now: Rc<Cell<f32>>,
+    last_frame: Rc<Cell<Option<std::time::Instant>>>,
+    last_sample: Rc<Cell<Option<std::time::Instant>>>,
     /// Cursor position in canvas-local coords, for tooltip placement.
     hover_pos: Option<(f32, f32)>,
     /// Focus history for back navigation (⌘[).
@@ -77,6 +83,7 @@ pub struct GraphCanvas {
     suppress_push: bool,
     /// Investigate mode: outline types/rows lacking descriptions.
     investigate: bool,
+    highlight_overlay: bool,
     /// Edge under the cursor (when no card is hovered).
     hovered_edge: Option<u32>,
     /// Horizontal window-space offset of the canvas pane (sidebar width),
@@ -108,10 +115,15 @@ impl GraphCanvas {
             pinned: None,
             canvas_origin: Rc::new(Cell::new((0.0, 0.0))),
             frame_ms: Rc::new(Cell::new(0.0)),
+            fps_hist: Rc::new(std::cell::RefCell::new(Vec::new())),
+            fps_now: Rc::new(Cell::new(0.0)),
+            last_frame: Rc::new(Cell::new(None)),
+            last_sample: Rc::new(Cell::new(None)),
             hover_pos: None,
             history: Vec::new(),
             suppress_push: false,
             investigate: false,
+            highlight_overlay: false,
             hovered_edge: None,
             pane_offset_x: 340.0,
         }
@@ -120,6 +132,14 @@ impl GraphCanvas {
     pub fn set_pane_offset(&mut self, offset: f32, cx: &mut Context<Self>) {
         if (self.pane_offset_x - offset).abs() > 0.5 {
             self.pane_offset_x = offset;
+            cx.notify();
+        }
+    }
+
+    /// Dim everything the overlay did not touch (web's Highlight toggle).
+    pub fn set_highlight_overlay(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.highlight_overlay != on {
+            self.highlight_overlay = on;
             cx.notify();
         }
     }
@@ -407,58 +427,20 @@ impl GraphCanvas {
         cx.notify();
     }
 
-    fn status_line(&self) -> String {
+    /// Right-hand half of the web's perf panel: `N nodes · N edges · N%`.
+    /// Right-hand half of the web's perf panel: `N nodes · N edges`.
+    fn stats_line(&self) -> String {
         let m = &self.model;
-        let mut base = format!(
-            "{}  ·  {} types  ·  {} edges  ·  {:.0}%",
-            m.schema_name,
-            m.cards.len(),
-            m.edges.len(),
-            self.view.k * 100.0
-        );
+        let mut s = format!("{} nodes · {} edges", m.cards.len(), m.edges.len());
         if m.overlay_marks > 0 {
-            base.push_str(&format!("  ·  overlay +{}", m.overlay_marks));
-        }
-        let ms = self.frame_ms.get();
-        if ms > 0.0 {
-            base.push_str(&format!("  ·  {ms:.1}ms"));
+            s.push_str(&format!(" · overlay +{}", m.overlay_marks));
         }
         if self.investigate {
             let (documented, total) = m.desc_coverage;
             let pct = if total > 0 { documented * 100 / total } else { 100 };
-            base.push_str(&format!("  ·  desc {documented}/{total} ({pct}%)"));
+            s.push_str(&format!(" · desc {pct}%"));
         }
-        match self.hover {
-            Some(Hover { card, row: Some(RowHit::Row(row)) }) => {
-                let c = &m.cards[card as usize];
-                let r = &c.rows[row];
-                let mut line = if r.right.is_empty() {
-                    format!("{base}   —   {}::{}", c.name, r.left)
-                } else {
-                    format!("{base}   —   {}.{}: {}", c.name, r.left, r.right)
-                };
-                if let Some(desc) = &r.description {
-                    let one_line: String = desc.split_whitespace().collect::<Vec<_>>().join(" ");
-                    let excerpt: String = one_line.chars().take(120).collect();
-                    let ellipsis = if one_line.chars().count() > 120 { "…" } else { "" };
-                    line.push_str(&format!("   “{excerpt}{ellipsis}”"));
-                }
-                line
-            }
-            Some(Hover { card, row: Some(RowHit::Implements(b)) }) => {
-                let c = &m.cards[card as usize];
-                format!("{base}   —   {} implements {}", c.name, c.implements[b])
-            }
-            Some(Hover { card, row: Some(RowHit::MemberOfUnion(b)) }) => {
-                let c = &m.cards[card as usize];
-                format!("{base}   —   {} in union {}", c.name, c.member_of_unions[b])
-            }
-            Some(Hover { card, row: None }) => {
-                let c = &m.cards[card as usize];
-                format!("{base}   —   {} {}", c.kind_label, c.name)
-            }
-            None => base,
-        }
+        s
     }
 }
 
@@ -513,6 +495,10 @@ impl Render for GraphCanvas {
         let pinned = self.pinned;
         let canvas_origin = self.canvas_origin.clone();
         let frame_ms = self.frame_ms.clone();
+        let fps_hist = self.fps_hist.clone();
+        let fps_now = self.fps_now.clone();
+        let last_frame = self.last_frame.clone();
+        let last_sample = self.last_sample.clone();
 
         // Floating tooltip: field/header description + deprecation info.
         struct Tooltip {
@@ -592,10 +578,11 @@ impl Render for GraphCanvas {
         });
         let hover_pos = self.hover_pos;
         let investigate = self.investigate;
+        let highlight_overlay = self.highlight_overlay;
         let hovered_edge = self.hovered_edge;
-        let th = crate::theme::theme(window.appearance());
+        let th = crate::theme::current(cx, window.appearance());
         let bg = th.bg;
-        let status = self.status_line();
+        let stats = self.stats_line();
 
         div()
             .size_full()
@@ -625,32 +612,123 @@ impl Render for GraphCanvas {
                             |window| {
                                 paint_scene(
                                     &model, view, hover, focus, pinned, investigate,
-                                    hovered_edge, bounds, window, cx,
+                                    highlight_overlay, hovered_edge, bounds, window, cx,
                                 );
                             },
                         );
                         let ms = t0.elapsed().as_secs_f32() * 1000.0;
                         let prev = frame_ms.get();
                         frame_ms.set(if prev == 0.0 { ms } else { prev * 0.8 + ms * 0.2 });
+                        // frame-interval FPS, sampled into the chart every 200ms
+                        let now = std::time::Instant::now();
+                        if let Some(prev_t) = last_frame.get() {
+                            let dt = now.duration_since(prev_t).as_secs_f32();
+                            if dt > 0.0 {
+                                let inst = (1.0 / dt).min(240.0);
+                                let cur = fps_now.get();
+                                fps_now.set(if cur == 0.0 { inst } else { cur * 0.8 + inst * 0.2 });
+                            }
+                        }
+                        last_frame.set(Some(now));
+                        let due = last_sample
+                            .get()
+                            .map(|t| now.duration_since(t).as_millis() >= 200)
+                            .unwrap_or(true);
+                        if due {
+                            last_sample.set(Some(now));
+                            let mut h = fps_hist.borrow_mut();
+                            h.push(fps_now.get());
+                            if h.len() > 60 {
+                                h.remove(0);
+                            }
+                        }
                     },
                 )
                 .size_full(),
             )
-            .child(
+            .child({
+                // Web's performance panel: bottom-right, minWidth 280, a
+                // 260x48 FPS bar chart over "N fps" / "N nodes · N edges".
+                let hist = self.fps_hist.clone();
+                let chart_th = th;
                 div()
                     .absolute()
-                    .bottom_2()
-                    .left_2()
+                    .bottom(px(16.0))
+                    .right(px(16.0))
+                    .min_w(px(280.0))
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(th.panel_border.opacity(0.2))
+                    .bg(th.bg.opacity(0.1))
                     .px_3()
-                    .py_1()
-                    .rounded_md()
-                    .bg(th.chrome_bg)
-                    .shadow_md()
-                    .text_color(th.text_muted)
-                    .text_xs()
+                    .py_2()
+                    .flex()
+                    .flex_col()
                     .font_family("Menlo")
-                    .child(SharedString::from(status)),
-            )
+                    .text_xs()
+                    .text_color(th.text_muted.opacity(0.6))
+                    .child(
+                        gpui::canvas(
+                            |_, _, _| (),
+                            move |bounds, _, window, _| {
+                                let samples = hist.borrow();
+                                if samples.is_empty() {
+                                    return;
+                                }
+                                let (w, h) = (
+                                    f32::from(bounds.size.width),
+                                    f32::from(bounds.size.height),
+                                );
+                                let peak = samples.iter().cloned().fold(65.0f32, f32::max);
+                                let max_fps = peak + 5.0;
+                                let bar_w = w / samples.len() as f32;
+                                for (i, v) in samples.iter().enumerate() {
+                                    let bh = ((v / max_fps) * h).max(1.0);
+                                    let color = if *v < peak * 0.5 {
+                                        chart_th.expired.opacity(0.7)
+                                    } else {
+                                        chart_th.text_muted.opacity(0.35)
+                                    };
+                                    window.paint_quad(fill(
+                                        Bounds {
+                                            origin: point(
+                                                bounds.origin.x + px(i as f32 * bar_w),
+                                                bounds.origin.y + px(h - bh),
+                                            ),
+                                            size: size(px((bar_w - 1.0).max(1.0)), px(bh)),
+                                        },
+                                        color,
+                                    ));
+                                }
+                            },
+                        )
+                        .w(px(260.0))
+                        .h(px(48.0))
+                        .mb(px(6.0)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_baseline()
+                            .justify_between()
+                            .gap_4()
+                            .child(SharedString::from(format!(
+                                "{} fps",
+                                self.fps_now.get().round() as i32
+                            )))
+                            .child(SharedString::from(stats)),
+                    )
+                    .child(
+                        div()
+                            .mt_1()
+                            .opacity(0.7)
+                            .child(SharedString::from(format!(
+                                "paint {:.1}ms · {:.0}%",
+                                self.frame_ms.get(),
+                                self.view.k * 100.0
+                            ))),
+                    )
+            })
             .when_some(tooltip.zip(hover_pos), |el, (tip, (hx, hy))| {
                 let tw = 340.0;
                 let pane_w = vw;
@@ -721,12 +799,13 @@ fn paint_scene(
     focus: Option<u32>,
     pinned: Option<(u32, usize)>,
     investigate: bool,
+    highlight_overlay: bool,
     hovered_edge: Option<u32>,
     bounds: Bounds<Pixels>,
     window: &mut Window,
     cx: &mut App,
 ) {
-    let th = crate::theme::theme(window.appearance());
+    let th = crate::theme::current(cx, window.appearance());
     let k = view.k;
     let ox = f32::from(bounds.origin.x) + view.x;
     let oy = f32::from(bounds.origin.y) + view.y;
@@ -878,9 +957,16 @@ fn paint_scene(
             continue;
         }
         let ci = i as u32;
-        let dim = match focus {
-            Some(f) if f != ci => DIM_ALPHA,
-            _ => 1.0,
+        let dim = if highlight_overlay
+            && !card.is_overlay
+            && !card.rows.iter().any(|r| r.is_overlay)
+        {
+            DIM_ALPHA
+        } else {
+            match focus {
+                Some(f) if f != ci => DIM_ALPHA,
+                _ => 1.0,
+            }
         };
         let kind_c = th.kind_color(card.kind);
         let is_hovered = matches!(hover, Some(h) if h.card == ci);

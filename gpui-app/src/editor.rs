@@ -339,7 +339,7 @@ impl Focusable for TextArea {
 
 impl Render for TextArea {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let th = crate::theme::theme(window.appearance());
+        let th = crate::theme::current(cx, window.appearance());
         let focused = self.focus.is_focused(window);
         let text = self.text.clone();
         let cursor = self.cursor;

@@ -76,6 +76,8 @@ pub struct Workspace {
     dock_open: bool,
     /// Tab badge counts, recomputed only when the schema changes.
     history_open: bool,
+    dock_height: f32,
+    highlight_overlay: bool,
     orphan_count: usize,
     deprecated_count: usize,
 }
@@ -197,18 +199,21 @@ impl Workspace {
             overlay_error: None,
             dock_open: std::env::var("GOMPASS_DOCK").is_ok(),
             history_open: false,
+            dock_height: 280.0,
+            highlight_overlay: false,
             orphan_count: counts.0,
             deprecated_count: counts.1,
         }
     }
 
-    fn save_settings(&self) {
+    fn save_settings(&self, cx: &gpui::App) {
         config::save_settings(&config::Settings {
             show_descriptions: self.options.show_descriptions,
             bundle_edges: self.options.bundle_edges,
             hide_primitive_fields: self.options.hide_primitive_fields,
             hide_relay: self.hide_relay,
             sidebar_open: self.sidebar_open,
+            theme_mode: crate::theme::mode(cx),
         });
     }
 
@@ -482,7 +487,7 @@ fn toolbar_button(th: Theme, label: &'static str, active: bool) -> gpui::Statefu
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let th = crate::theme::theme(window.appearance());
+        let th = crate::theme::current(cx, window.appearance());
 
         // ---- sidebar tab strip (web: it lives INSIDE the sidebar) ----
         let deprecated_tone = th.red;
@@ -535,16 +540,17 @@ impl Render for Workspace {
                         this.sidebar_open = false;
                         this.canvas
                             .update(cx, |canvas, cx| canvas.set_pane_offset(0.0, cx));
-                        this.save_settings();
+                        this.save_settings(cx);
                         cx.notify();
                     }))
                     .child(icon(Icon::PanelLeftClose, px(16.0), th.text_muted)),
             );
 
         // ---- canvas overlay: floating "View controls" card (left 16 / top 16)
+        let inset = if self.sidebar_open { 0.0 } else { 44.0 };
         let controls = div()
             .absolute()
-            .top(px(16.0))
+            .top(px(16.0 + inset))
             .left(px(16.0))
             .flex()
             .items_center()
@@ -566,7 +572,7 @@ impl Render for Workspace {
                 |this, _, cx| {
                     this.options.hide_primitive_fields = !this.options.hide_primitive_fields;
                     this.rebuild(cx);
-                    this.save_settings();
+                    this.save_settings(cx);
                 },
                 cx,
             ))
@@ -578,7 +584,7 @@ impl Render for Workspace {
                 |this, _, cx| {
                     this.hide_relay = !this.hide_relay;
                     this.reload_from_disk(cx);
-                    this.save_settings();
+                    this.save_settings(cx);
                 },
                 cx,
             ))
@@ -590,7 +596,7 @@ impl Render for Workspace {
                 |this, _, cx| {
                     this.options.show_descriptions = !this.options.show_descriptions;
                     this.rebuild(cx);
-                    this.save_settings();
+                    this.save_settings(cx);
                 },
                 cx,
             ))
@@ -602,7 +608,7 @@ impl Render for Workspace {
                 |this, _, cx| {
                     this.options.bundle_edges = !this.options.bundle_edges;
                     this.rebuild(cx);
-                    this.save_settings();
+                    this.save_settings(cx);
                 },
                 cx,
             ));
@@ -619,7 +625,7 @@ impl Render for Workspace {
         };
         let investigate_card = div()
             .absolute()
-            .top(px(56.0))
+            .top(px(56.0 + inset))
             .left(px(16.0))
             .flex()
             .flex_col()
@@ -691,146 +697,377 @@ impl Render for Workspace {
                     ),
             );
 
-        // Overlay dock: in-app SDL editor + live diff panel.
-        let dock = self.dock_open.then(|| {
-            let diff = self.overlay_diff.clone();
-            let error = self.overlay_error.clone();
-            let section = |title: &'static str,
-                           color: gpui::Hsla,
-                           items: Vec<String>,
-                           cx: &mut Context<Self>| {
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_0p5()
-                    .child(
+        // ---- overlay dock (web: collapsed strip by default) ----
+        let counts = self.overlay_diff.as_ref().map(|d| {
+            (
+                d.added_types.len() + d.added_fields.len(),
+                d.changed_fields.len(),
+                d.removed_types.len() + d.removed_fields.len(),
+            )
+        });
+        let applied = self.overlay_text.is_some();
+        let dirty = {
+            let draft = self.overlay_editor.read(cx).text().trim().to_string();
+            draft != self.overlay_text.clone().unwrap_or_default().trim()
+        };
+        let can_highlight = counts.map(|(a, c, _)| a + c > 0).unwrap_or(false);
+
+        let pill = |label: String, color: gpui::Hsla| {
+            div()
+                .rounded_full()
+                .px(px(6.0))
+                .py(px(1.0))
+                .text_size(px(10.0))
+                .bg(color.opacity(0.15))
+                .text_color(color)
+                .child(SharedString::from(label))
+        };
+        let count_pills = move |th: Theme| {
+            let mut row = div().flex().items_center().gap_1();
+            match counts {
+                Some((a, c, r)) if a + c + r > 0 => {
+                    if a > 0 {
+                        row = row.child(pill(format!("+{a}"), th.overlay_green));
+                    }
+                    if c > 0 {
+                        row = row.child(pill(format!("~{c}"), th.accent));
+                    }
+                    if r > 0 {
+                        // U+2212 MINUS SIGN, like the web
+                        row = row.child(pill(format!("\u{2212}{r}"), th.red));
+                    }
+                }
+                Some(_) => {
+                    row = row.child(
                         div()
-                            .text_xs()
-                            .text_color(color)
-                            .child(SharedString::from(format!("{title} · {}", items.len()))),
-                    )
-                    .children(items.into_iter().take(5).enumerate().map(|(i, name)| {
-                        let type_name: String =
-                            name.split('.').next().unwrap_or(&name).to_string();
-                        div()
-                            .id((title, i))
-                            .w_full()
-                            .text_xs()
-                            .font_family("Menlo")
+                            .text_size(px(10.0))
                             .text_color(th.text_muted)
-                            .whitespace_nowrap()
-                            .overflow_hidden()
-                            .cursor_pointer()
-                            .hover(|el| el.bg(th.hover_bg))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.navigate_to_type(&type_name, cx)
-                            }))
-                            .child(SharedString::from(name))
-                    }))
+                            .child("no change"),
+                    );
+                }
+                None => {}
+            }
+            row
+        };
+
+        let dock: gpui::AnyElement = if !self.dock_open {
+            // Collapsed: a single one-line strip.
+            let status: gpui::AnyElement = match (&self.overlay_error, applied) {
+                (Some(e), _) => div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(px(10.0))
+                    .text_color(th.red)
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .child(SharedString::from(format!("not applied — {e}")))
+                    .into_any_element(),
+                (None, true) => count_pills(th).flex_1().into_any_element(),
+                (None, false) => div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(px(10.0))
+                    .text_color(th.text_muted)
+                    .child("Sketch SDL on top of this schema")
+                    .into_any_element(),
             };
             div()
-                .absolute()
-                .bottom_0()
-                .left_0()
-                .right_0()
-                .h(px(240.0))
-                .bg(th.chrome_bg)
+                .id("dock-strip")
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap_2()
                 .border_t_1()
                 .border_color(th.panel_border)
-                .shadow_lg()
-                .flex()
-                .gap_3()
-                .p_3()
+                .bg(th.card_bg.opacity(0.4))
+                .px_3()
+                .py(px(6.0))
+                .cursor_pointer()
+                .hover(|el| el.bg(th.hover_bg))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.dock_open = true;
+                    cx.notify();
+                }))
+                .child(icon(Icon::Layers, px(14.0), th.overlay_green))
                 .child(
                     div()
-                        .flex_1()
-                        .min_w_0()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .child(div().text_sm().text_color(th.text).child("Overlay SDL"))
-                                .child(div().flex_1())
-                                .child(self.toggle_button(
-                                    th,
-                                    "Apply ⌘↵",
-                                    self.overlay_text.is_some(),
-                                    |this, _, cx| this.apply_overlay(cx),
-                                    cx,
-                                ))
-                                .child(self.toggle_button(
-                                    th,
-                                    "Load file…",
-                                    false,
-                                    |this, _, cx| this.open_overlay_file(cx),
-                                    cx,
-                                ))
-                                .child(self.toggle_button(
-                                    th,
-                                    "Clear",
-                                    false,
-                                    |this, _, cx| this.clear_overlay(cx),
-                                    cx,
-                                )),
-                        )
-                        .child(div().flex_1().min_h_0().child(self.overlay_editor.clone())),
+                        .flex_none()
+                        .text_xs()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(th.text)
+                        .child("Overlay"),
                 )
+                .child(status)
+                .child(icon(Icon::ChevronUp, px(14.0), th.text_muted))
+                .into_any_element()
+        } else {
+            let apply_enabled = dirty || !applied;
+            div()
+                .flex_none()
+                .h(px(self.dock_height))
+                .flex()
+                .flex_col()
+                .border_t_1()
+                .border_color(th.panel_border)
+                .bg(th.card_bg.opacity(0.4))
+                // header row
                 .child(
                     div()
-                        .w(px(300.0))
                         .flex_none()
                         .flex()
-                        .flex_col()
+                        .items_center()
                         .gap_2()
-                        .overflow_hidden()
-                        .when_some(error, |el, e| {
-                            el.child(
+                        .border_b_1()
+                        .border_color(th.panel_border)
+                        .px_3()
+                        .py(px(6.0))
+                        .child(icon(Icon::Layers, px(14.0), th.overlay_green))
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_xs()
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(th.text)
+                                .child("Overlay"),
+                        )
+                        .child(count_pills(th))
+                        .child(div().flex_1())
+                        .child(
+                            div()
+                                .id("overlay-highlight")
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .rounded_md()
+                                .border_1()
+                                .px_2()
+                                .py_1()
+                                .text_xs()
+                                .when(!can_highlight, |el| {
+                                    el.opacity(0.4).border_color(th.card_border)
+                                })
+                                .when(can_highlight && self.highlight_overlay, |el| {
+                                    el.border_color(th.overlay_green)
+                                        .bg(th.overlay_green.opacity(0.15))
+                                        .text_color(th.overlay_green)
+                                })
+                                .when(can_highlight && !self.highlight_overlay, |el| {
+                                    el.border_color(th.card_border)
+                                        .text_color(th.text_muted)
+                                        .cursor_pointer()
+                                        .hover(|el| el.bg(th.hover_bg))
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.highlight_overlay = !this.highlight_overlay;
+                                    let on = this.highlight_overlay;
+                                    this.canvas
+                                        .update(cx, |c, cx| c.set_highlight_overlay(on, cx));
+                                    cx.notify();
+                                }))
+                                .child(icon(Icon::Highlighter, px(14.0), th.text_muted))
+                                .child("Highlight"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(th.text_muted)
+                                .child(SharedString::from(if dirty && applied {
+                                    "Unapplied edits · ⌘↵"
+                                } else {
+                                    "⌘↵"
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("overlay-apply")
+                                .rounded_md()
+                                .px(px(10.0))
+                                .py_1()
+                                .text_xs()
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .when(apply_enabled, |el| {
+                                    el.bg(th.overlay_green)
+                                        .text_color(gpui::white())
+                                        .cursor_pointer()
+                                })
+                                .when(!apply_enabled, |el| {
+                                    el.bg(th.active_bg).text_color(th.text_muted)
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| this.apply_overlay(cx)))
+                                .child(SharedString::from(if applied && dirty {
+                                    "Re-apply"
+                                } else {
+                                    "Apply"
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("overlay-clear")
+                                .rounded_md()
+                                .border_1()
+                                .border_color(th.card_border)
+                                .px(px(10.0))
+                                .py_1()
+                                .text_xs()
+                                .when(applied, |el| {
+                                    el.text_color(th.text_muted)
+                                        .cursor_pointer()
+                                        .hover(|el| el.bg(th.hover_bg))
+                                })
+                                .when(!applied, |el| el.opacity(0.4).text_color(th.text_muted))
+                                .on_click(cx.listener(|this, _, _, cx| this.clear_overlay(cx)))
+                                .child("Clear"),
+                        )
+                        .child(
+                            div()
+                                .id("overlay-collapse")
+                                .rounded_md()
+                                .p_1()
+                                .cursor_pointer()
+                                .hover(|el| el.bg(th.hover_bg))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.dock_open = false;
+                                    cx.notify();
+                                }))
+                                .child(icon(Icon::ChevronDown, px(16.0), th.text_muted)),
+                        ),
+                )
+                // editor
+                .child(div().flex_1().min_h_0().p_2().child(self.overlay_editor.clone()))
+                // status strip
+                .when_some(self.overlay_error.clone(), |el, e| {
+                    el.child(
+                        div()
+                            .flex_none()
+                            .bg(th.red.opacity(0.1))
+                            .px_3()
+                            .py_2()
+                            .flex()
+                            .flex_col()
+                            .child(
                                 div()
-                                    .text_xs()
-                                    .font_family("Menlo")
+                                    .text_size(px(10.0))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .text_color(th.red)
+                                    .child("OVERLAY NOT APPLIED"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .font_family("Menlo")
+                                    .text_color(th.red.opacity(0.9))
                                     .child(SharedString::from(e)),
                             )
-                        })
-                        .child(match diff {
-                            Some(d) => div()
-                                .flex()
-                                .flex_col()
-                                .gap_2()
-                                .child(section(
-                                    "added types",
-                                    th.overlay_green,
-                                    d.added_types,
-                                    cx,
-                                ))
-                                .child(section(
-                                    "added fields",
-                                    th.overlay_green,
-                                    d.added_fields,
-                                    cx,
-                                ))
-                                .child(section("changed", th.accent, d.changed_fields, cx))
-                                .child(section(
-                                    "removed",
-                                    th.red,
-                                    d.removed_types
-                                        .into_iter()
-                                        .chain(d.removed_fields)
-                                        .collect(),
-                                    cx,
-                                )),
-                            None => div().text_xs().text_color(th.text_faint).child(
-                                "Sketch SDL here to augment / override / remove types on top \
-                                 of the loaded schema. `- Type.field` removes a member. \
-                                 ⌘↵ applies.",
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(th.text_muted)
+                                    .child(
+                                        "The graph is still showing the schema without the overlay.",
+                                    ),
                             ),
-                        }),
-                )
-        });
+                    )
+                })
+                .when(self.overlay_error.is_none() && applied, |el| {
+                    let d = self.overlay_diff.clone();
+                    el.child(
+                        div()
+                            .flex_none()
+                            .max_h(px(self.dock_height * 0.45))
+                            .overflow_hidden()
+                            .bg(th.overlay_green.opacity(0.1))
+                            .px_3()
+                            .py_2()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(th.overlay_green)
+                                    .child(SharedString::from(format!(
+                                        "OVERLAY APPLIED ({})",
+                                        change_label(counts)
+                                    ))),
+                            )
+                            .when_some(d, |el, d| {
+                                el.child(
+                                    div()
+                                        .flex()
+                                        .flex_wrap()
+                                        .gap_1()
+                                        .children(d.added_types.into_iter().take(12).enumerate().map(
+                                            |(i, name)| {
+                                                let t = name.clone();
+                                                div()
+                                                    .id(("added-type", i))
+                                                    .rounded_md()
+                                                    .bg(th.overlay_green.opacity(0.2))
+                                                    .px(px(6.0))
+                                                    .py(px(1.0))
+                                                    .text_size(px(10.0))
+                                                    .font_family("Menlo")
+                                                    .text_color(th.overlay_green)
+                                                    .cursor_pointer()
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.navigate_to_type(&t, cx)
+                                                    }))
+                                                    .child(SharedString::from(name))
+                                            },
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_wrap()
+                                        .gap_2()
+                                        .text_size(px(10.0))
+                                        .font_family("Menlo")
+                                        .text_color(th.text_muted)
+                                        .children(
+                                            d.added_fields
+                                                .into_iter()
+                                                .take(12)
+                                                .map(|f| SharedString::from(format!("+{f}"))),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_wrap()
+                                        .gap_2()
+                                        .text_size(px(10.0))
+                                        .font_family("Menlo")
+                                        .text_color(th.accent.opacity(0.9))
+                                        .children(
+                                            d.changed_fields
+                                                .into_iter()
+                                                .take(12)
+                                                .map(|f| SharedString::from(format!("~{f}"))),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_wrap()
+                                        .gap_2()
+                                        .text_size(px(10.0))
+                                        .font_family("Menlo")
+                                        .text_color(th.red.opacity(0.8))
+                                        .children(
+                                            d.removed_types
+                                                .into_iter()
+                                                .chain(d.removed_fields)
+                                                .take(12)
+                                                .map(|f| SharedString::from(format!("\u{2212}{f}"))),
+                                        ),
+                                )
+                            }),
+                    )
+                })
+                .into_any_element()
+        };
 
         // ---- canvas overlay: click-history "Recent" panel (right 16 / top 16)
         let recent = {
@@ -993,28 +1230,28 @@ impl Render for Workspace {
                 let offset = if this.sidebar_open { 340.0 } else { 0.0 };
                 this.canvas
                     .update(cx, |canvas, cx| canvas.set_pane_offset(offset, cx));
-                this.save_settings();
+                this.save_settings(cx);
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ToggleDescriptions, _, cx| {
                 this.options.show_descriptions = !this.options.show_descriptions;
                 this.rebuild(cx);
-                this.save_settings();
+                this.save_settings(cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleBundling, _, cx| {
                 this.options.bundle_edges = !this.options.bundle_edges;
                 this.rebuild(cx);
-                this.save_settings();
+                this.save_settings(cx);
             }))
             .on_action(cx.listener(|this, _: &TogglePrimitives, _, cx| {
                 this.options.hide_primitive_fields = !this.options.hide_primitive_fields;
                 this.rebuild(cx);
-                this.save_settings();
+                this.save_settings(cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleRelay, _, cx| {
                 this.hide_relay = !this.hide_relay;
                 this.reload_from_disk(cx);
-                this.save_settings();
+                this.save_settings(cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleInvestigate, _, cx| {
                 this.investigate = !this.investigate;
@@ -1082,7 +1319,7 @@ impl Render for Workspace {
                                             this.canvas.update(cx, |canvas, cx| {
                                                 canvas.set_pane_offset(340.0, cx)
                                             });
-                                            this.save_settings();
+                                            this.save_settings(cx);
                                             cx.notify();
                                         }))
                                         .child(icon(
@@ -1093,7 +1330,20 @@ impl Render for Workspace {
                                 )
                             }),
                     )
-                    .when_some(dock, |el, d| el.child(d)),
+                    .child(dock),
             )
     }
+}
+
+/// `2 additions, 1 override` — the web's applied-summary wording.
+fn change_label(counts: Option<(usize, usize, usize)>) -> String {
+    let Some((a, c, r)) = counts else { return "no change".into() };
+    let mut parts = Vec::new();
+    let plural = |n: usize, w: &str| {
+        if n == 1 { format!("{n} {w}") } else { format!("{n} {w}s") }
+    };
+    if a > 0 { parts.push(plural(a, "addition")); }
+    if c > 0 { parts.push(plural(c, "override")); }
+    if r > 0 { parts.push(plural(r, "removal")); }
+    if parts.is_empty() { "no change".into() } else { parts.join(", ") }
 }

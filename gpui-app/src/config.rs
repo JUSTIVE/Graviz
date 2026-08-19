@@ -11,6 +11,7 @@ pub struct Settings {
     pub hide_primitive_fields: bool,
     pub hide_relay: bool,
     pub sidebar_open: bool,
+    pub theme_mode: crate::theme::ThemeMode,
 }
 
 impl Default for Settings {
@@ -21,6 +22,7 @@ impl Default for Settings {
             hide_primitive_fields: false,
             hide_relay: true,
             sidebar_open: true,
+            theme_mode: crate::theme::ThemeMode::System,
         }
     }
 }

@@ -132,6 +132,54 @@ fn light() -> Theme {
     }
 }
 
+/// The web's three-way theme toggle (light → dark → system).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub enum ThemeMode {
+    Light,
+    Dark,
+    System,
+}
+
+impl ThemeMode {
+    pub fn next(self) -> Self {
+        match self {
+            ThemeMode::Light => ThemeMode::Dark,
+            ThemeMode::Dark => ThemeMode::System,
+            ThemeMode::System => ThemeMode::Light,
+        }
+    }
+}
+
+/// App-wide theme choice, so every view resolves the same palette.
+#[derive(Clone, Copy, Default)]
+pub struct ThemeState(pub Option<ThemeMode>);
+
+impl gpui::Global for ThemeState {}
+
+pub fn mode(cx: &gpui::App) -> ThemeMode {
+    cx.try_global::<ThemeState>()
+        .and_then(|s| s.0)
+        .unwrap_or(ThemeMode::System)
+}
+
+pub fn set_mode(cx: &mut gpui::App, mode: ThemeMode) {
+    cx.set_global(ThemeState(Some(mode)));
+}
+
+/// The palette every view should use: the explicit choice, else the system.
+pub fn current(cx: &gpui::App, appearance: WindowAppearance) -> Theme {
+    theme_for(mode(cx), appearance)
+}
+
+/// Palette for an explicit mode, falling back to the window appearance.
+pub fn theme_for(mode: ThemeMode, appearance: WindowAppearance) -> Theme {
+    match mode {
+        ThemeMode::Light => light(),
+        ThemeMode::Dark => dark(),
+        ThemeMode::System => theme(appearance),
+    }
+}
+
 pub fn theme(appearance: WindowAppearance) -> Theme {
     // Debug overrides so automated selfshots can exercise both palettes.
     if std::env::var("GOMPASS_LIGHT").is_ok() {

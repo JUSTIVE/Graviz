@@ -315,7 +315,7 @@ impl Focusable for TreePanel {
 
 impl Render for TreePanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let th = crate::theme::theme(window.appearance());
+        let th = crate::theme::current(cx, window.appearance());
         let focused = self.focus.is_focused(window);
         let count = self.item_count();
         let query_display: SharedString = if self.query.is_empty() {
@@ -427,7 +427,7 @@ impl Render for TreePanel {
                     "tree-items",
                     count,
                     cx.processor(|this, range: std::ops::Range<usize>, window, cx| {
-                        let th = crate::theme::theme(window.appearance());
+                        let th = crate::theme::current(cx, window.appearance());
                         range.map(|ix| this.render_row(ix, th, cx)).collect::<Vec<_>>()
                     }),
                 )

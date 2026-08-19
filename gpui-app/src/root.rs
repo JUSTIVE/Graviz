@@ -15,6 +15,8 @@ pub struct Root {
     workspace: Option<Entity<Workspace>>,
     recents: Vec<RecentEntry>,
     error: Option<String>,
+    /// "New" tab: show the landing even though a schema is loaded.
+    show_landing: bool,
 }
 
 impl Root {
@@ -24,10 +26,13 @@ impl Root {
     ) -> Self {
         let workspace = initial
             .map(|(loaded, path, overlay)| cx.new(|cx| Workspace::new(loaded, path, overlay, cx)));
+        let mode = config::load_settings().theme_mode;
+        crate::theme::set_mode(cx, mode);
         Self {
             workspace,
             recents: config::recents(),
             error: None,
+            show_landing: false,
         }
     }
 
@@ -36,6 +41,7 @@ impl Root {
         match loader::load(&path, None, hide_relay) {
             Ok(loaded) => {
                 self.error = None;
+                self.show_landing = false;
                 self.workspace = Some(cx.new(|cx| Workspace::new(loaded, path, None, cx)));
             }
             Err(e) => {
@@ -66,32 +72,35 @@ impl Root {
 
 impl Render for Root {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let th = crate::theme::theme(window.appearance());
+        let th = crate::theme::current(cx, window.appearance());
 
-        // Custom title strip: houses the traffic lights (transparent system
-        // titlebar) and acts as the window drag area.
-        let title_strip = div()
-            .flex_none()
-            .h(px(34.0))
-            .w_full()
-            .bg(th.panel)
-            .border_b_1()
-            .border_color(th.panel_border)
-            .flex()
-            .items_center()
-            .justify_center()
-            .on_mouse_down(MouseButton::Left, |_, window, _| {
-                window.start_window_move();
-            })
-            .child(
-                div()
-                    .text_xs()
-                    .font_family("Menlo")
-                    .text_color(th.text_faint)
-                    .child("GompassQL"),
-            );
+        let has_schema = self.workspace.is_some();
+        let route = if self.show_landing || !has_schema {
+            crate::shell::Route::New
+        } else {
+            crate::shell::Route::View
+        };
+        let header = crate::shell::header(
+            th,
+            route,
+            has_schema,
+            crate::theme::mode(cx),
+            |this: &mut Self, route, _window, cx| {
+                this.show_landing = route == crate::shell::Route::New;
+                cx.notify();
+            },
+            |_this: &mut Self, _window, cx| {
+                let next = crate::theme::mode(cx).next();
+                crate::theme::set_mode(cx, next);
+                let mut s = config::load_settings();
+                s.theme_mode = next;
+                config::save_settings(&s);
+                cx.notify();
+            },
+            cx,
+        );
 
-        let body: gpui::AnyElement = if let Some(ws) = &self.workspace {
+        let body: gpui::AnyElement = if let (Some(ws), false) = (&self.workspace, self.show_landing) {
             div().flex_1().min_h_0().child(ws.clone()).into_any_element()
         } else {
             let recents = self.recents.clone();
@@ -192,6 +201,7 @@ impl Render for Root {
 
         div()
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .bg(th.bg)
@@ -205,7 +215,8 @@ impl Render for Root {
                     this.open_path(path.clone(), cx);
                 }
             }))
-            .child(title_strip)
+            .child(header)
             .child(body)
+            .when_some(crate::shell::commit_badge(th), |el, b| el.child(b))
     }
 }
