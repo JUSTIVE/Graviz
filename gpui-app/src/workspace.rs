@@ -185,8 +185,9 @@ impl Workspace {
         let investigate = std::env::var("GOMPASS_INVESTIGATE").is_ok();
         let t_layout = std::time::Instant::now();
         let mut sliced = slice_graph(&loaded.graph, mode, None);
+        let mut options = options;
         if options.hide_custom_scalars {
-            crate::model::drop_custom_scalars(&mut sliced);
+            options.hidden_scalars = crate::model::drop_custom_scalars(&mut sliced);
         }
         let model = Rc::new(build_model(sliced, loaded.name.clone(), &options));
         if std::env::var("GOMPASS_PERF").is_ok() {
@@ -339,9 +340,11 @@ impl Workspace {
         // Only the canvas slice loses its scalars; the Orphaned and Deprecated
         // tabs work off the full graph and should still list them.
         let mut sliced = slice_graph(&self.full_graph, self.mode, self.root_override.as_deref());
-        if self.options.hide_custom_scalars {
-            crate::model::drop_custom_scalars(&mut sliced);
-        }
+        self.options.hidden_scalars = if self.options.hide_custom_scalars {
+            crate::model::drop_custom_scalars(&mut sliced)
+        } else {
+            Default::default()
+        };
         let model = Rc::new(build_model(sliced, self.schema_name.clone(), &self.options));
         self.model = model.clone();
         self.tree.update(cx, |tree, cx| tree.set_model(model.clone(), cx));

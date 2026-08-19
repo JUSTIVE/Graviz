@@ -1657,6 +1657,26 @@ fn paint_scene(
 
         // ---- body rows ----
         let pitch = card.body_pitch();
+        if k >= LOD_ROWS && card.rows.is_empty() && card.hidden_rows > 0 {
+            // Every field is behind a filter. An empty body would read as a
+            // type that declares nothing, which is a different fact.
+            text_errors += paint_baseline(
+                &text_system,
+                SharedString::from(format!(
+                    "… {} hidden field{}",
+                    card.hidden_rows,
+                    if card.hidden_rows == 1 { "" } else { "s" }
+                )),
+                &row_font,
+                px(ROW_FONT_PX * kt),
+                th.text_muted.opacity(0.7 * dim),
+                None,
+                to_screen(pos.x + CARD_PAD_X, 0.0).x.into(),
+                to_screen(0.0, pos.y + card.row_baseline(0)).y.into(),
+                window,
+                cx,
+            );
+        }
         if k >= LOD_ROWS {
             let (r_lo, r_hi) = visible_rows(card, pos.y, wy0, wy1);
             for (ri, row) in card.rows.iter().enumerate().take(r_hi).skip(r_lo) {

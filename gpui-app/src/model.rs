@@ -109,6 +109,9 @@ pub struct Row {
 pub struct Card {
     /// Index into `ParsedGraph::nodes` / `Model::cards`.
     pub index: u32,
+    /// Fields a filter is hiding. A card with every field hidden would
+    /// otherwise be indistinguishable from a type that declares none.
+    pub hidden_rows: usize,
     pub name: gpui::SharedString,
     /// Header name pre-fitted to the card width.
     pub name_fit: gpui::SharedString,
@@ -329,6 +332,9 @@ pub struct ModelOptions {
     pub hide_primitive_fields: bool,
     /// Drop declared scalars and the fields that reference them.
     pub hide_custom_scalars: bool,
+    /// Names `drop_custom_scalars` removed, so the fields pointing at them
+    /// can be hidden too — and counted.
+    pub hidden_scalars: std::collections::HashSet<String>,
     /// Today as `YYYY-MM-DD`, for `[until]` expiry coloring.
     pub today: String,
 }
@@ -340,6 +346,7 @@ impl Default for ModelOptions {
             bundle_edges: true,
             hide_primitive_fields: false,
             hide_custom_scalars: false,
+            hidden_scalars: std::collections::HashSet::new(),
             today: today_string(),
         }
     }
@@ -574,7 +581,7 @@ fn kind_label(kind: NodeKind) -> &'static str {
 /// they contribute a large share of the edges and almost none of the
 /// structure. Built-in scalars never become nodes at all, so this only
 /// touches the ones the schema declared.
-pub fn drop_custom_scalars(g: &mut ParsedGraph) {
+pub fn drop_custom_scalars(g: &mut ParsedGraph) -> std::collections::HashSet<String> {
     let scalars: std::collections::HashSet<String> = g
         .nodes
         .iter()
@@ -582,15 +589,13 @@ pub fn drop_custom_scalars(g: &mut ParsedGraph) {
         .map(|n| n.id.clone())
         .collect();
     if scalars.is_empty() {
-        return;
+        return scalars;
     }
     g.nodes.retain(|n| !scalars.contains(&n.id));
     g.edges.retain(|e| !scalars.contains(&e.source) && !scalars.contains(&e.target));
-    for n in g.nodes.iter_mut() {
-        if let Some(fields) = n.fields.as_mut() {
-            fields.retain(|f| !scalars.contains(&f.type_name));
-        }
-    }
+    // The fields that referenced them stay in the graph and are hidden while
+    // the card is built, so the card can say how many it is not showing.
+    scalars
 }
 
 pub fn build_model(graph: ParsedGraph, schema_name: String, options: &ModelOptions) -> Model {
@@ -624,8 +629,13 @@ pub fn build_model(graph: ParsedGraph, schema_name: String, options: &ModelOptio
         // (the web renderer paints exactly one of these grids).
         let mut rows: Vec<Row> = Vec::new();
         let mut row_map: Vec<Option<u32>> = Vec::new();
+        let mut hidden_rows = 0usize;
         for f in n.fields.as_deref().unwrap_or(&[]) {
-            if options.hide_primitive_fields && BUILTIN_SCALARS.contains(&f.type_name.as_str()) {
+            let hidden = (options.hide_primitive_fields
+                && BUILTIN_SCALARS.contains(&f.type_name.as_str()))
+                || options.hidden_scalars.contains(&f.type_name);
+            if hidden {
+                hidden_rows += 1;
                 row_map.push(None);
                 continue;
             }
@@ -807,6 +817,7 @@ pub fn build_model(graph: ParsedGraph, schema_name: String, options: &ModelOptio
         }
 
         cards.push(Card {
+            hidden_rows,
             index: i as u32,
             name: n.name.clone().into(),
             name_fit,
