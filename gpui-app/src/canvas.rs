@@ -30,14 +30,35 @@ const CLICK_DRAG_THRESHOLD: f32 = 4.0;
 const LOD_ROWS: f32 = 0.28;
 /// Below this zoom, header text gives way to a name bar.
 const LOD_HEADER: f32 = 0.2;
-/// Below this zoom, description lines are dropped.
+/// Zoom range over which description lines fade out, rather than a hard cut.
 ///
-/// Descriptions are the 9px text, so this is where they fall under ~3.8px on
+/// Descriptions are the 9px text, so below ~0.42 they fall under 3.8px on
 /// screen — a grey smear that reads as texture, not words, while costing a
 /// third of every shaped line on the canvas. Names and types keep their own,
 /// lower threshold, because at these zooms they are still the thing being
 /// scanned for.
+///
+/// The fade matters as much as the threshold: switching a whole screen of
+/// descriptions on at one zoom is a visible jolt mid-pinch, which is exactly
+/// what a reader notices even when the frame time never moves. Over this band
+/// they are still shaped — the saving is below it, and the band is narrow
+/// enough that it costs almost nothing.
 const LOD_DESC: f32 = 0.42;
+const LOD_DESC_FADE: f32 = 0.14;
+
+/// Steps the fade is quantized to.
+///
+/// The alpha ends up in the text color, and the color is part of the shaped
+/// line's identity — a value that drifts every frame would miss the cache on
+/// every description on screen and make the judder worse, not better. Eight
+/// steps is smooth to the eye and holds still for several frames of a pinch.
+const LOD_DESC_STEPS: f32 = 8.0;
+
+/// Opacity for description text at this zoom: 0 below the band, 1 above it.
+fn desc_alpha(k: f32, lod: f32) -> f32 {
+    let t = ((k - lod) / LOD_DESC_FADE).clamp(0.0, 1.0);
+    (t * LOD_DESC_STEPS).round() / LOD_DESC_STEPS
+}
 
 thread_local! {
     /// `GOMPASS_LOD_DESC` overrides the threshold for A/B measurement.
@@ -272,14 +293,17 @@ impl GraphCanvas {
 
     /// Advance the sweep, and once it has run its course print the
     /// distribution and quit.
-    fn bench_step(&mut self, vw: f32, vh: f32, window: &mut Window) {
+    fn bench_step(&mut self, vw: f32, vh: f32, window: &mut Window, cx: &mut Context<Self>) {
         let Some(bench) = &mut self.bench else { return };
         let i = bench.frame;
         bench.frame += 1;
         let done = bench.samples.borrow().len() >= BENCH_FRAMES;
         if !done {
             self.view = self.bench_view(i, vw, vh);
+            // Both: the animation frame asks the window to redraw, notify
+            // marks this view dirty so the redraw actually re-runs render.
             window.request_animation_frame();
+            cx.notify();
             return;
         }
         eprintln!(
@@ -1002,16 +1026,15 @@ const CURVE_TOL: f32 = 0.35;
 
 /// Line segments an edge layer may emit in one frame before the tolerance is
 /// relaxed to fit. Stroke tessellation measures at ~0.113µs per segment, so
-/// this is about 3.2ms — the share of a 120fps frame (8.3ms) that edges can
-/// have and still leave the ~3.5ms text is allowed plus what the cards cost.
+/// this is about 4.3ms at the ideal tolerance.
 ///
-/// It was 38_000 while the background lattice was still being drawn and text
-/// re-shaped itself every frame; with both gone the tail on the GitHub schema
-/// (2651 edges) sat at 8.8ms, and this is what puts it under. The tolerance
-/// only relaxes on frames that would blow the budget anyway, and at that point
-/// the screen is a wash of overlapping hairlines where the flattening error is
-/// not resolvable — 38_000 and 22_000 render indistinguishably there.
-const SEG_BUDGET: usize = 28_000;
+/// Since per-curve viewport culling landed this is a safety net, not an active
+/// quality cap: on the GitHub schema it touches 48 frames in 480 and never
+/// relaxes past 1.13px, and on crepe it never binds at all. Removing it
+/// entirely costs the same two over-budget frames but takes p99 from 5.60 to
+/// 7.95ms, so the net stays. When it does relax, the screen is a wash of
+/// overlapping hairlines where the flattening error is not resolvable.
+const SEG_BUDGET: usize = 38_000;
 
 thread_local! {
     /// `GOMPASS_SEGS` overrides the budget for A/B measurement.
@@ -1047,6 +1070,25 @@ fn cubic_steps(
 /// it was 17ms of a 17.7ms frame at k=0.6. Flattening here instead spends
 /// segments only where there is curvature to resolve: a gentle edge collapses
 /// to one segment when zoomed out and still bends smoothly when zoomed in.
+/// Does this cubic reach the cull rect at all?
+///
+/// A Bezier is contained in the convex hull of its control points, so the
+/// control-polygon bounds are a conservative test: if they miss the rect the
+/// curve cannot possibly touch it. Long edges span the whole world — at low
+/// zoom most of their length is off screen, and flattening it costs segments
+/// that tessellate into triangles nobody sees.
+fn cubic_visible(
+    p0: gompass_core::layout::Point,
+    c: &gompass_core::layout::CubicSeg,
+    cull: [f32; 4],
+) -> bool {
+    let minx = p0.x.min(c.c1.x).min(c.c2.x).min(c.end.x);
+    let maxx = p0.x.max(c.c1.x).max(c.c2.x).max(c.end.x);
+    let miny = p0.y.min(c.c1.y).min(c.c2.y).min(c.end.y);
+    let maxy = p0.y.max(c.c1.y).max(c.c2.y).max(c.end.y);
+    !(maxx < cull[0] || minx > cull[2] || maxy < cull[1] || miny > cull[3])
+}
+
 fn flatten_cubic(
     builder: &mut PathBuilder,
     p0: graviz_core::layout::Point,
@@ -1117,7 +1159,7 @@ impl Render for GraphCanvas {
         }
         let offscreen = vw > 0.0 && self.offscreen(vw, vh);
         if self.bench.is_some() && vw > 0.0 {
-            self.bench_step(vw, vh, window);
+            self.bench_step(vw, vh, window, cx);
         }
 
         // Ripple phase, or None once the pulse has run its course. Decorative
@@ -1772,6 +1814,10 @@ fn paint_scene(
     let wy1 = (vh - view.y) / k;
 
     let to_screen = |x: f32, y: f32| point(px(ox + x * k), px(oy + y * k));
+    // Visible rect plus a margin for stroke width, joins and arrowheads, so
+    // nothing that could show up at the edge of the viewport gets culled.
+    let m = 48.0 / k;
+    let cull = [wx0 - m, wy0 - m, wx1 + m, wy1 + m];
 
     // Cards one edge away from the focused one — lit alongside it.
     let neighbours: std::collections::HashSet<u32> = match focus.filter(|_| focused_edge.is_none())
@@ -1792,10 +1838,17 @@ fn paint_scene(
         None => std::collections::HashSet::new(),
     };
 
-    let lod_desc = LOD_DESC_AT.with(|v| *v);
+    let desc_a = desc_alpha(k, LOD_DESC_AT.with(|v| *v));
     // Setup: theme resolution, the visible world rect, and the first-degree
     // neighbour set, which walks every edge.
     let t_setup = t_frame.elapsed().as_secs_f32() * 1000.0;
+    // Edge sub-timers reset here, before the stage they measure — the text
+    // counters below reset after it, which is why they can share a block.
+    FLAT_NS.with(|c| c.set(0.0));
+    BUILD_NS.with(|c| c.set(0.0));
+    PAINT_NS.with(|c| c.set(0.0));
+    VERTS.with(|c| c.set(0));
+    BATCHES.with(|c| c.set(0));
     let t_probe = std::time::Instant::now();
     // Frame budget: price the edges at the ideal tolerance first, and if the
     // bill is too high, relax the tolerance just enough to fit. n scales with
@@ -1811,7 +1864,9 @@ fn paint_scene(
             }
             let mut p0 = e.start;
             for c in &e.curves {
-                want += cubic_steps(p0, c, k, CURVE_TOL);
+                if cubic_visible(p0, c, cull) {
+                    want += cubic_steps(p0, c, k, CURVE_TOL);
+                }
                 p0 = c.end;
             }
         }
@@ -1872,10 +1927,15 @@ fn paint_scene(
                          segs: &mut usize,
                          window: &mut Window| {
             if *any {
-                if let Ok(path) = std::mem::replace(builder, PathBuilder::stroke(px(stroke_w)))
-                    .build()
-                {
+                let t = std::time::Instant::now();
+                let built = std::mem::replace(builder, PathBuilder::stroke(px(stroke_w))).build();
+                BUILD_NS.with(|c| c.set(c.get() + t.elapsed().as_secs_f32()));
+                if let Ok(path) = built {
+                    VERTS.with(|c| c.set(c.get() + path.vertices.len()));
+                    BATCHES.with(|c| c.set(c.get() + 1));
+                    let t = std::time::Instant::now();
                     window.paint_path(path, color);
+                    PAINT_NS.with(|c| c.set(c.get() + t.elapsed().as_secs_f32()));
                 }
             }
             if *any_arrow {
@@ -1912,15 +1972,33 @@ fn paint_scene(
             if e.bbox[2] < wx0 || e.bbox[0] > wx1 || e.bbox[3] < wy0 || e.bbox[1] > wy1 {
                 continue;
             }
-            builder.move_to(to_screen(e.start.x, e.start.y));
+            let t_flat = std::time::Instant::now();
             let mut p0 = e.start;
+            // `pen` tracks whether the builder's current point is already p0 —
+            // a skipped run has to re-open the contour with a move_to.
+            let mut pen = false;
+            let mut drew = false;
             for c in &e.curves {
+                if !cubic_visible(p0, c, cull) {
+                    pen = false;
+                    p0 = c.end;
+                    continue;
+                }
+                if !pen {
+                    builder.move_to(to_screen(p0.x, p0.y));
+                    pen = true;
+                }
                 let n = flatten_cubic(&mut builder, p0, c, k, curve_tol, &to_screen);
                 segs += n;
                 n_pts += n;
+                drew = true;
                 p0 = c.end;
             }
+            if !drew {
+                continue;
+            }
             any = true;
+            FLAT_NS.with(|c| c.set(c.get() + t_flat.elapsed().as_secs_f32()));
 
             if draw_arrows {
                 // arrowhead oriented by the curve's final tangent
@@ -1990,15 +2068,22 @@ fn paint_scene(
     // re-shaping every visible glyph run each frame.
     let kt = 2f32.powf((k.log2() * 8.0).round() / 8.0);
     let mut text_errors = 0usize;
-    // GRAVIZ_PERF=1 reports what a frame actually costs.
-    let probe = std::env::var("GRAVIZ_PERF").is_ok();
+    // GOMPASS_PERF=1 reports what a frame actually costs.
+    let probe = PROBE.with(|p| p.get());
     let mut n_cards = 0usize;
     let mut n_rows = 0usize;
     SHAPES.with(|c| c.set(0));
+    // The budget exists to smooth motion, so it only applies while the camera
+    // is moving. Once it settles, the frame draws every line no matter what it
+    // costs — one long frame at rest beats a card that stays blank, which is
+    // what happens if the follow-up frame never arrives.
+    let cam = (view.x, view.y, view.k);
+    let moving = LAST_VIEW.with(|v| v.replace(cam)) != cam;
     TEXT_DEADLINE.with(|d| {
-        d.set(Some(std::time::Instant::now() + std::time::Duration::from_secs_f32(
-            TEXT_BUDGET_MS / 1000.0,
-        )))
+        d.set(moving.then(|| {
+            std::time::Instant::now()
+                + std::time::Duration::from_secs_f32(TEXT_BUDGET_AT.with(|v| *v) / 1000.0)
+        }))
     });
     TEXT_DEFERRED.with(|f| f.set(false));
     TEXT_SKIPPED.with(|c| c.set(0));
@@ -2138,13 +2223,13 @@ fn paint_scene(
                 window,
                 cx,
             );
-            if let Some(d) = card.header_desc.as_ref().filter(|_| k >= lod_desc) {
+            if let Some(d) = card.header_desc.as_ref().filter(|_| desc_a > 0.0) {
                 text_errors += paint_baseline(
                     &text_system,
                     d.clone(),
                     &row_font,
                     px(DESC_FONT_PX * kt),
-                    gpui::white().opacity(0.75 * dim),
+                    gpui::white().opacity(0.75 * dim * desc_a),
                     None,
                     to_screen(pos.x + HEADER_PAD_X, 0.0).x.into(),
                     to_screen(0.0, pos.y + 42.0).y.into(),
@@ -2283,13 +2368,13 @@ fn paint_scene(
                         th.overlay_green.opacity(dim),
                     ));
                 }
-                if let Some(d) = row.description_line.as_ref().filter(|_| k >= lod_desc) {
+                if let Some(d) = row.description_line.as_ref().filter(|_| desc_a > 0.0) {
                     text_errors += paint_baseline(
                         &text_system,
                         d.clone(),
                         &row_font,
                         px(DESC_FONT_PX * kt),
-                        th.text_muted.opacity(0.7 * dim),
+                        th.text_muted.opacity(0.7 * dim * desc_a),
                         None,
                         to_screen(pos.x + CARD_PAD_X, 0.0).x.into(),
                         to_screen(0.0, fy + 11.0).y.into(),
@@ -2527,11 +2612,17 @@ fn paint_scene(
         let shape = SHAPE_NS.with(|c| c.get()) * 1000.0;
         let glyph = GLYPH_NS.with(|c| c.get()) * 1000.0;
         let stroke = t_edges - t_price;
+        let flat = FLAT_NS.with(|c| c.get()) * 1000.0;
+        let build = BUILD_NS.with(|c| c.get()) * 1000.0;
+        let pth = PAINT_NS.with(|c| c.get()) * 1000.0;
         let total = t_setup + t_probe.elapsed().as_secs_f32() * 1000.0;
         eprintln!(
-            "perf: k={k:.2} tot {total:.2} = setup {t_setup:.2} price {t_price:.2} stroke {stroke:.2} shape {shape:.2} glyph {glyph:.2} quads {:.2} | cards={n_cards} rows={n_rows} shapes={} edges={n_edges} emit={n_pts} tol={curve_tol:.2} skip={}",
+            "perf: k={k:.2} tot {total:.2} = setup {t_setup:.2} price {t_price:.2} stroke {stroke:.2}(flat {flat:.2} lyon {build:.2} scene {pth:.2} scan {:.2}) shape {shape:.2} glyph {glyph:.2} quads {:.2} | cards={n_cards} rows={n_rows} shapes={} edges={n_edges} emit={n_pts} verts={} batches={} tol={curve_tol:.2} skip={}",
+            stroke - flat - build - pth,
             nodes - shape - glyph,
             SHAPES.with(|c| c.get()),
+            VERTS.with(|c| c.get()),
+            BATCHES.with(|c| c.get()),
             TEXT_SKIPPED.with(|c| c.get()),
         );
     }
@@ -2605,9 +2696,19 @@ thread_local! {
         std::cell::RefCell::new(TextCache::default());
     /// When text work has to stop this frame, and whether it did.
     static TEXT_DEADLINE: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+    /// Camera of the previous frame, to tell motion from rest.
+    static LAST_VIEW: Cell<(f32, f32, f32)> = const { Cell::new((f32::NAN, 0.0, 0.0)) };
     static TEXT_DEFERRED: Cell<bool> = const { Cell::new(false) };
     /// Lines skipped this frame for being over budget, for the bench report.
     static TEXT_SKIPPED: Cell<u32> = const { Cell::new(0) };
+    /// Edge-stage sub-timers, in seconds: emitting points into the builder,
+    /// lyon tessellation in `build()`, and handing the path to the scene.
+    static FLAT_NS: Cell<f32> = const { Cell::new(0.0) };
+    static BUILD_NS: Cell<f32> = const { Cell::new(0.0) };
+    static PAINT_NS: Cell<f32> = const { Cell::new(0.0) };
+    /// Vertices lyon emitted this frame, and how many paths carried them.
+    static VERTS: Cell<usize> = const { Cell::new(0) };
+    static BATCHES: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Share of the 8.3ms frame that newly-seen text may take before the rest is
@@ -2618,7 +2719,15 @@ thread_local! {
 /// into fresh cards exposes on the order of a hundred new lines, well inside
 /// the budget, so in practice it binds only on a hard jump across the graph,
 /// where it costs a frame or two of late text instead of a 15ms hitch.
-const TEXT_BUDGET_MS: f32 = 3.5;
+const TEXT_BUDGET_MS: f32 = 5.5;
+
+thread_local! {
+    /// `GOMPASS_TEXT_BUDGET` overrides the budget for A/B measurement.
+    static TEXT_BUDGET_AT: f32 = std::env::var("GOMPASS_TEXT_BUDGET")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(TEXT_BUDGET_MS);
+}
 
 /// Paints one shaped line with its BASELINE at `baseline` (screen px), the
 /// way the web's canvas `fillText` positions text.
@@ -2829,6 +2938,68 @@ mod tests {
     fn shaped_line_cache_key_separates_neighbouring_font_sizes() {
         let c = gpui::white();
         assert_ne!(key("id", 5.0, c, None), key("id", 5.000001, c, None));
+    }
+
+    fn seg(c1: (f32, f32), c2: (f32, f32), end: (f32, f32)) -> CubicSeg {
+        CubicSeg {
+            c1: Point { x: c1.0, y: c1.1 },
+            c2: Point { x: c2.0, y: c2.1 },
+            end: Point { x: end.0, y: end.1 },
+        }
+    }
+
+    /// Culling leans on the convex-hull property: the curve never leaves the
+    /// hull of its control points, so control-polygon bounds that miss the
+    /// rect prove the curve misses it. The test that matters is the other
+    /// direction — a curve whose *endpoints* are both outside but which bulges
+    /// through the viewport must survive, or edges would vanish mid-pan.
+    #[test]
+    fn curve_culling_keeps_anything_that_could_touch_the_viewport() {
+        let rect = [0.0, 0.0, 100.0, 100.0];
+        let origin = Point { x: -500.0, y: 50.0 };
+
+        // Entirely to the left, hull and all.
+        assert!(!cubic_visible(origin, &seg((-400.0, 50.0), (-300.0, 50.0), (-200.0, 50.0)), rect));
+        // Entirely above.
+        assert!(!cubic_visible(
+            Point { x: 50.0, y: -500.0 },
+            &seg((50.0, -400.0), (50.0, -300.0), (50.0, -200.0)),
+            rect
+        ));
+        // Both endpoints outside, control points pulling it across the rect.
+        assert!(cubic_visible(origin, &seg((50.0, 50.0), (60.0, 50.0), (600.0, 50.0)), rect));
+        // Straight through, no control point inside.
+        assert!(cubic_visible(origin, &seg((-200.0, 50.0), (300.0, 50.0), (600.0, 50.0)), rect));
+        // Touching the boundary counts as visible.
+        assert!(cubic_visible(
+            Point { x: -10.0, y: 0.0 },
+            &seg((-5.0, 0.0), (-2.0, 0.0), (0.0, 0.0)),
+            rect
+        ));
+    }
+
+    /// The fade is what keeps a pinch-zoom from jolting: descriptions must
+    /// arrive gradually, not all at one zoom.
+    #[test]
+    fn descriptions_fade_in_rather_than_appearing_at_one_zoom() {
+        assert_eq!(desc_alpha(0.20, 0.42), 0.0);
+        assert_eq!(desc_alpha(0.42, 0.42), 0.0);
+        assert_eq!(desc_alpha(0.56, 0.42), 1.0);
+        assert_eq!(desc_alpha(2.00, 0.42), 1.0);
+        assert_eq!(desc_alpha(0.49, 0.42), 0.5);
+        // Monotone, and every step small enough to read as a fade. The value
+        // is quantized, so it must also hold still: a band that produced a new
+        // alpha every frame would miss the text cache on every description.
+        let mut prev = 0.0;
+        let mut distinct = std::collections::HashSet::new();
+        for i in 0..=40 {
+            let a = desc_alpha(0.36 + i as f32 * 0.01, 0.42);
+            assert!(a >= prev - 1e-6, "not monotone at {i}");
+            assert!((a - prev) < 0.2, "step too large at {i}: {prev} -> {a}");
+            prev = a;
+            distinct.insert(a.to_bits());
+        }
+        assert!(distinct.len() <= LOD_DESC_STEPS as usize + 1, "{}", distinct.len());
     }
 
     #[test]
