@@ -42,11 +42,23 @@ pub struct Point {
     pub y: f32,
 }
 
+/// One cubic Bézier segment: two control points and an end point (the start
+/// is the previous segment's end, or `EdgePath::start`).
+#[derive(Debug, Clone, Copy)]
+pub struct CubicSeg {
+    pub c1: Point,
+    pub c2: Point,
+    pub end: Point,
+}
+
 #[derive(Debug, Clone)]
 pub struct EdgePath {
     /// Index into the input edge list.
     pub edge_index: u32,
-    /// Flattened smooth polyline in world coords, source port → target.
+    pub start: Point,
+    /// Smooth curve, drawn directly as Béziers (no polyline approximation).
+    pub curves: Vec<CubicSeg>,
+    /// Coarse flattening of the same curve, for hit-testing and bounds.
     pub points: Vec<Point>,
 }
 
@@ -269,13 +281,16 @@ pub fn layout(
         let port_y = e.from_port_y.clamp(8.0, (sn.h - 8.0).max(8.0));
         let waypoints = routes.get(&(e.from, e.to)).map(|v| v.as_slice()).unwrap_or(&[]);
         let (start, end) = anchor_points(sp, sn, tp, tn, port_y, waypoints);
-        let mut ctrl: Vec<Point> = Vec::with_capacity(waypoints.len() + 2);
-        ctrl.push(start);
-        ctrl.extend_from_slice(waypoints);
-        ctrl.push(end);
+        let mut knots: Vec<Point> = Vec::with_capacity(waypoints.len() + 2);
+        knots.push(start);
+        knots.extend_from_slice(waypoints);
+        knots.push(end);
+        let curves = spline(&knots);
         edge_paths.push(EdgePath {
             edge_index: ei as u32,
-            points: smooth_polyline(&ctrl),
+            start,
+            points: flatten(start, &curves),
+            curves,
         });
     }
 
@@ -312,39 +327,59 @@ fn anchor_points(
     (start, end)
 }
 
-/// Centripetal-ish Catmull-Rom through the control points, flattened.
-fn smooth_polyline(ctrl: &[Point]) -> Vec<Point> {
-    if ctrl.len() <= 2 {
-        // A straight edge is exactly two points — sampling it would only cost
-        // tessellation work with no visual difference.
-        return vec![ctrl[0], *ctrl.last().unwrap()];
+/// Catmull-Rom through the knots, expressed as cubic Béziers. The first
+/// and last tangents are forced horizontal so an edge leaves its source port
+/// and enters its target sideways — the layered "flow" look, which reads far
+/// cleaner than straight diagonals.
+fn spline(knots: &[Point]) -> Vec<CubicSeg> {
+    if knots.len() < 2 {
+        return Vec::new();
     }
-    let steps_per_seg = 8usize;
-    let mut out = Vec::with_capacity((ctrl.len() - 1) * steps_per_seg + 1);
-    out.push(ctrl[0]);
-    for i in 0..ctrl.len() - 1 {
-        let p0 = if i == 0 { ctrl[0] } else { ctrl[i - 1] };
-        let p1 = ctrl[i];
-        let p2 = ctrl[i + 1];
-        let p3 = if i + 2 < ctrl.len() { ctrl[i + 2] } else { ctrl[i + 1] };
-        for s in 1..=steps_per_seg {
-            let t = s as f32 / steps_per_seg as f32;
-            let t2 = t * t;
-            let t3 = t2 * t;
-            let x = 0.5
-                * ((2.0 * p1.x)
-                    + (-p0.x + p2.x) * t
-                    + (2.0 * p0.x - 5.0 * p1.x + 4.0 * p2.x - p3.x) * t2
-                    + (-p0.x + 3.0 * p1.x - 3.0 * p2.x + p3.x) * t3);
-            let y = 0.5
-                * ((2.0 * p1.y)
-                    + (-p0.y + p2.y) * t
-                    + (2.0 * p0.y - 5.0 * p1.y + 4.0 * p2.y - p3.y) * t2
-                    + (-p0.y + 3.0 * p1.y - 3.0 * p2.y + p3.y) * t3);
-            out.push(Point { x, y });
-        }
+    let n = knots.len();
+    let mut out = Vec::with_capacity(n - 1);
+    for i in 0..n - 1 {
+        let p1 = knots[i];
+        let p2 = knots[i + 1];
+        let dx = (p2.x - p1.x).abs();
+        // horizontal pull, proportional to the span but bounded
+        let h = (dx / 2.0).clamp(24.0, 160.0) * if p2.x >= p1.x { 1.0 } else { -1.0 };
+        let c1 = if i == 0 {
+            Point { x: p1.x + h, y: p1.y }
+        } else {
+            let p0 = knots[i - 1];
+            Point { x: p1.x + (p2.x - p0.x) / 6.0, y: p1.y + (p2.y - p0.y) / 6.0 }
+        };
+        let c2 = if i + 2 < n {
+            let p3 = knots[i + 2];
+            Point { x: p2.x - (p3.x - p1.x) / 6.0, y: p2.y - (p3.y - p1.y) / 6.0 }
+        } else {
+            Point { x: p2.x - h, y: p2.y }
+        };
+        out.push(CubicSeg { c1, c2, end: p2 });
     }
     out
+}
+
+/// Coarse sampling of the curve — used only for hit-testing and bounds, so a
+/// few samples per segment is plenty.
+fn flatten(start: Point, curves: &[CubicSeg]) -> Vec<Point> {
+    const STEPS: usize = 6;
+    let mut pts = Vec::with_capacity(curves.len() * STEPS + 1);
+    pts.push(start);
+    let mut p0 = start;
+    for c in curves {
+        for s in 1..=STEPS {
+            let t = s as f32 / STEPS as f32;
+            let mt = 1.0 - t;
+            let (a, b, cc, d) = (mt * mt * mt, 3.0 * mt * mt * t, 3.0 * mt * t * t, t * t * t);
+            pts.push(Point {
+                x: a * p0.x + b * c.c1.x + cc * c.c2.x + d * c.end.x,
+                y: a * p0.y + b * c.c1.y + cc * c.c2.y + d * c.end.y,
+            });
+        }
+        p0 = c.end;
+    }
+    pts
 }
 
 /// Writes component-local positions into `positions`, reports per-pair
@@ -462,6 +497,35 @@ fn layout_component(
                 rank[i] = 0;
             }
         }
+        // ALAP pass: a node with successors is pulled as far right as its
+        // earliest successor allows. Longest-path ranking alone leaves nodes
+        // sitting far left of everything that uses them, which is exactly
+        // what produces long edges sweeping across unrelated nodes.
+        let mut succ: Vec<Vec<u32>> = vec![Vec::new(); m];
+        let mut pred_max = vec![0i32; m];
+        for &((a, b), _) in &acyclic {
+            if a != b {
+                succ[a as usize].push(b);
+            }
+        }
+        for &((a, b), _) in &acyclic {
+            if a != b {
+                pred_max[b as usize] = pred_max[b as usize].max(rank[a as usize] + 1);
+            }
+        }
+        let mut order: Vec<u32> = (0..m as u32).collect();
+        order.sort_by_key(|&v| -rank[v as usize]);
+        for &v in &order {
+            let vi = v as usize;
+            if succ[vi].is_empty() || is_root[comp[vi] as usize] {
+                continue;
+            }
+            let earliest = succ[vi].iter().map(|&w| rank[w as usize]).min().unwrap_or(0);
+            let target = earliest - 1;
+            if target > rank[vi] && target >= pred_max[vi] {
+                rank[vi] = target;
+            }
+        }
     }
 
     // ---- virtual-node expansion ----
@@ -482,6 +546,8 @@ fn layout_component(
             h: nodes[comp[i] as usize].h,
         })
         .collect();
+    // Virtual-node budget: generous, but bounded.
+    let mut virtual_budget: usize = 60_000;
     // ordering adjacency (adjacent ranks only) over xnodes
     let mut xout: Vec<Vec<u32>> = vec![Vec::new(); m];
     let mut xin: Vec<Vec<u32>> = vec![Vec::new(); m];
@@ -495,14 +561,16 @@ fn layout_component(
         let (ra, rb) = (rank[a as usize], rank[b as usize]);
         let orig_pair = if reversed { (b, a) } else { (a, b) };
         let span = rb - ra;
-        // Only lane-route reasonable spans of edges that asked for it; hub
-        // and extreme edges stay direct so virtuals don't flood the ranks.
-        if span <= 1 || span > 8 || !routable.contains(&orig_pair) {
+        // Lane-route everything we can afford: routing is what keeps a long
+        // edge inside the gaps between ranks instead of crossing unrelated
+        // nodes. The budget stops pathological graphs from exploding.
+        if span <= 1 || virtual_budget == 0 || (span as usize) > virtual_budget {
             if span >= 1 {
                 push_edge(&mut xout, &mut xin, a, b);
             }
             continue;
         }
+        virtual_budget = virtual_budget.saturating_sub((rb - ra - 1) as usize);
         let mut prev = a;
         let mut chain = Vec::with_capacity((rb - ra - 1) as usize);
         for r in ra + 1..rb {

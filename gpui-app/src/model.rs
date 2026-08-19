@@ -288,7 +288,11 @@ pub struct EdgeVisual {
     pub from: u32,
     pub to: u32,
     pub group: EdgeGroup,
-    /// Flattened bezier polyline in world coords: [x0,y0, x1,y1, ...].
+    /// World-space start point of the curve.
+    pub start: layout::Point,
+    /// Cubic segments, drawn as real Béziers (no polyline approximation).
+    pub curves: Vec<layout::CubicSeg>,
+    /// Coarse flattening of the same curve, for hit-testing and culling.
     pub points: Vec<f32>,
     /// World-space bbox (min_x, min_y, max_x, max_y) for culling.
     pub bbox: [f32; 4],
@@ -844,6 +848,8 @@ pub fn build_model(graph: ParsedGraph, schema_name: String, options: &ModelOptio
             from: le.from,
             to: le.to,
             group,
+            start: path.start,
+            curves: path.curves.clone(),
             points,
             bbox,
             bundled: bundle_counts[path.edge_index as usize],

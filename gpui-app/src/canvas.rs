@@ -914,30 +914,62 @@ fn paint_scene(
         EdgeGroup::Arg,
     ];
     let stroke_w = (1.5 * k).clamp(0.6, 2.5);
-    // Zoomed out, bezier detail is subpixel: sample the flattened polyline at
-    // a stride (straight-ish lines) so tessellation stays cheap at overview
-    // zoom, where every one of the ~5k edges is on screen.
-    let stride: usize = if k < 0.05 {
-        8
-    } else if k < 0.15 {
-        4
-    } else if k < 0.35 {
+    let draw_arrows = k >= 0.3;
+    // Curvature only reads above a certain zoom; below it, stride-sample the
+    // pre-flattened polyline instead of tessellating every Bézier.
+    let smooth = k >= 0.45;
+    let stride: usize = if k < 0.12 {
+        3
+    } else if k < 0.3 {
         2
     } else {
         1
     };
-    let draw_arrows = k >= 0.3;
     // Edges live in their own layer so cards (next layer) always draw above
     // them — within a single layer GPUI batches by primitive type, which
     // does not guarantee paths-under-quads.
     window.paint_layer(bounds, |window| {
     // With a focused card, incident edges stay bright and the rest dim —
     // the web app's focus behavior, minus its re-tessellation dodge.
+    // GPUI tessellates a path into a u16-indexed vertex buffer, so a single
+    // path tops out around 65k vertices — pouring thousands of edges into one
+    // builder silently drops geometry. Flush in batches well under that cap
+    // (the web app hit the same wall and batched for the same reason).
+    const SEGS_PER_BATCH: usize = 900;
     for (group, dim_pass) in groups.iter().flat_map(|&g| [(g, false), (g, true)]) {
+        let color = if dim_pass {
+            edge_color(&th, group).opacity(0.35)
+        } else {
+            edge_color(&th, group)
+        };
         let mut builder = PathBuilder::stroke(px(stroke_w));
-        let mut any = false;
         let mut arrows = PathBuilder::fill();
+        let mut segs = 0usize;
+        let mut any = false;
         let mut any_arrow = false;
+        let flush = |builder: &mut PathBuilder,
+                         arrows: &mut PathBuilder,
+                         any: &mut bool,
+                         any_arrow: &mut bool,
+                         segs: &mut usize,
+                         window: &mut Window| {
+            if *any {
+                if let Ok(path) = std::mem::replace(builder, PathBuilder::stroke(px(stroke_w)))
+                    .build()
+                {
+                    window.paint_path(path, color);
+                }
+            }
+            if *any_arrow {
+                if let Ok(path) = std::mem::replace(arrows, PathBuilder::fill()).build() {
+                    window.paint_path(path, color);
+                }
+            }
+            *any = false;
+            *any_arrow = false;
+            *segs = 0;
+        };
+
         for (ei, e) in model.edges.iter().enumerate() {
             if e.group != group {
                 continue;
@@ -957,62 +989,77 @@ fn paint_scene(
             if e.bbox[2] < wx0 || e.bbox[0] > wx1 || e.bbox[3] < wy0 || e.bbox[1] > wy1 {
                 continue;
             }
-            let pts = &e.points;
-            builder.move_to(to_screen(pts[0], pts[1]));
-            let mut i = 2 * stride;
-            while i + 1 < pts.len() {
-                builder.line_to(to_screen(pts[i], pts[i + 1]));
-                i += 2 * stride;
+            builder.move_to(to_screen(e.start.x, e.start.y));
+            if smooth {
+                for c in &e.curves {
+                    builder.cubic_bezier_to(
+                        to_screen(c.end.x, c.end.y),
+                        to_screen(c.c1.x, c.c1.y),
+                        to_screen(c.c2.x, c.c2.y),
+                    );
+                }
+                segs += e.curves.len().max(1);
+            } else {
+                // Zoomed out the curvature is sub-pixel; the pre-flattened
+                // polyline tessellates far cheaper than adaptive Béziers.
+                let pts = &e.points;
+                let mut i = 2 * stride;
+                while i + 1 < pts.len() {
+                    builder.line_to(to_screen(pts[i], pts[i + 1]));
+                    i += 2 * stride;
+                }
+                let n = pts.len();
+                builder.line_to(to_screen(pts[n - 2], pts[n - 1]));
+                segs += pts.len() / (2 * stride).max(1) + 1;
             }
-            let n = pts.len();
-            builder.line_to(to_screen(pts[n - 2], pts[n - 1]));
             any = true;
-            if !draw_arrows {
-                continue;
+
+            if draw_arrows {
+                // arrowhead oriented by the curve's final tangent
+                let last = e.curves.last();
+                let (ex, ey) =
+                    last.map(|c| (c.end.x, c.end.y)).unwrap_or((e.start.x, e.start.y));
+                let (px_, py_) =
+                    last.map(|c| (c.c2.x, c.c2.y)).unwrap_or((e.start.x, e.start.y));
+                let (dx, dy) = (ex - px_, ey - py_);
+                let len = (dx * dx + dy * dy).sqrt().max(1e-3);
+                let (ux, uy) = (dx / len, dy / len);
+                let sz = 5.0f32.max(4.0 * k.min(1.0));
+                let tip = to_screen(ex, ey);
+                let bx = f32::from(tip.x) - ux * sz * 2.0;
+                let by = f32::from(tip.y) - uy * sz * 2.0;
+                arrows.move_to(tip);
+                arrows.line_to(point(px(bx - uy * sz), px(by + ux * sz)));
+                arrows.line_to(point(px(bx + uy * sz), px(by - ux * sz)));
+                arrows.close();
+                any_arrow = true;
+                segs += 1;
             }
-            // arrowhead: screen-space triangle at the end, oriented by the
-            // last polyline segment
-            let (ex, ey) = (pts[n - 2], pts[n - 1]);
-            let (px_, py_) = (pts[n - 4], pts[n - 3]);
-            let (dx, dy) = (ex - px_, ey - py_);
-            let len = (dx * dx + dy * dy).sqrt().max(1e-3);
-            let (ux, uy) = (dx / len, dy / len);
-            let s = 5.0f32.max(4.0 * k.min(1.0));
-            let tip = to_screen(ex, ey);
-            let bx = f32::from(tip.x) - ux * s * 2.0;
-            let by = f32::from(tip.y) - uy * s * 2.0;
-            arrows.move_to(tip);
-            arrows.line_to(point(px(bx - uy * s), px(by + ux * s)));
-            arrows.line_to(point(px(bx + uy * s), px(by - ux * s)));
-            arrows.close();
-            any_arrow = true;
-        }
-        let color = if dim_pass {
-            edge_color(&th, group).opacity(0.22)
-        } else {
-            edge_color(&th, group)
-        };
-        if any {
-            if let Ok(path) = builder.build() {
-                window.paint_path(path, color);
-            }
-        }
-        if any_arrow {
-            if let Ok(path) = arrows.build() {
-                window.paint_path(path, color);
+            if segs >= SEGS_PER_BATCH {
+                flush(
+                    &mut builder,
+                    &mut arrows,
+                    &mut any,
+                    &mut any_arrow,
+                    &mut segs,
+                    window,
+                );
             }
         }
+        flush(&mut builder, &mut arrows, &mut any, &mut any_arrow, &mut segs, window);
     }
+
     // The hovered edge draws on top, brighter and thicker.
     if let Some(ei) = hovered_edge {
         if let Some(e) = model.edges.get(ei as usize) {
             let mut builder = PathBuilder::stroke(px((stroke_w * 2.0).max(2.0)));
-            let pts = &e.points;
-            builder.move_to(to_screen(pts[0], pts[1]));
-            let mut i = 2;
-            while i + 1 < pts.len() {
-                builder.line_to(to_screen(pts[i], pts[i + 1]));
-                i += 2;
+            builder.move_to(to_screen(e.start.x, e.start.y));
+            for c in &e.curves {
+                builder.cubic_bezier_to(
+                    to_screen(c.end.x, c.end.y),
+                    to_screen(c.c1.x, c.c1.y),
+                    to_screen(c.c2.x, c.c2.y),
+                );
             }
             if let Ok(path) = builder.build() {
                 window.paint_path(path, edge_color(&th, e.group).opacity(1.0));
@@ -1037,10 +1084,10 @@ fn paint_scene(
     let mut text_errors = 0usize;
     // GOMPASS_PERF=1 reports what a frame actually costs.
     let probe = std::env::var("GOMPASS_PERF").is_ok();
+    let t_probe = std::time::Instant::now();
     let mut n_cards = 0usize;
     let mut n_rows = 0usize;
     SHAPES.with(|c| c.set(0));
-    let t_probe = std::time::Instant::now();
 
     window.paint_layer(bounds, |window| {
     for (i, card) in model.cards.iter().enumerate() {

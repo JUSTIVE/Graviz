@@ -127,11 +127,22 @@ impl Workspace {
             options.show_descriptions = true;
         }
         let investigate = std::env::var("GOMPASS_INVESTIGATE").is_ok();
+        let t_layout = std::time::Instant::now();
         let model = Rc::new(build_model(
             slice_graph(&loaded.graph, mode, None),
             loaded.name.clone(),
             &options,
         ));
+        if std::env::var("GOMPASS_PERF").is_ok() {
+            eprintln!(
+                "perf: layout+model {}ms — {} cards, {} edges, world {:.0}×{:.0}",
+                t_layout.elapsed().as_millis(),
+                model.cards.len(),
+                model.edges.len(),
+                model.world_w,
+                model.world_h
+            );
+        }
         let tree = cx.new(|cx| TreePanel::new(model.clone(), cx));
         // The Orphaned / Deprecated tab bodies work off the FULL graph, since
         // their whole point is what the reachable slice leaves out.
