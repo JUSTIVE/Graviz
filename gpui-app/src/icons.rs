@@ -72,6 +72,11 @@ define_icons! {
     LoaderCircle => "loader-circle",
 }
 
+/// Asset path of the app wordmark's logo — the compass the web app uses as
+/// its favicon. It is a full-colour raster, not a tintable mask, so it is an
+/// image rather than one of the SVG icons above.
+pub const LOGO: &str = "logo.png";
+
 /// Render `name` as a square `size`×`size` glyph tinted with `color`.
 pub fn icon(name: Icon, size: Pixels, color: Hsla) -> impl IntoElement {
     svg()
@@ -85,8 +90,13 @@ pub fn icon(name: Icon, size: Pixels, color: Hsla) -> impl IntoElement {
 /// `application().with_assets(icons::Assets)`.
 pub struct Assets;
 
+const LOGO_BYTES: &[u8] = include_bytes!("../assets/logo.png");
+
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        if path == LOGO {
+            return Ok(Some(Cow::Borrowed(LOGO_BYTES)));
+        }
         Ok(EMBEDDED
             .iter()
             .find(|(asset_path, _)| *asset_path == path)

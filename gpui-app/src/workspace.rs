@@ -561,6 +561,7 @@ pub fn kind_badge(th: Theme, kind: gompass_core::graph::NodeKind, label: &'stati
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let th = crate::theme::current(cx, window.appearance());
+        let vh = f32::from(window.viewport_size().height);
 
         // ---- sidebar tab strip (web: it lives INSIDE the sidebar) ----
         let deprecated_tone = th.red;
@@ -1054,8 +1055,9 @@ impl Render for Workspace {
                     el.child(
                         div()
                             .flex_none()
+                            .id("dock-diff")
                             .max_h(px(self.dock_height * 0.45))
-                            .overflow_hidden()
+                            .overflow_y_scroll()
                             .bg(th.overlay_green.opacity(0.1))
                             .px_3()
                             .py_2()
@@ -1222,8 +1224,12 @@ impl Render for Workspace {
                     .when(open, |el| {
                         el.child(
                             div()
-                                .max_h(px(360.0))
-                                .overflow_hidden()
+                                .id("recent-list")
+                                // 60vh, matching the web — a fixed height
+                                // wastes a tall window and overflows a short
+                                // one.
+                                .max_h(px(vh * 0.6))
+                                .overflow_y_scroll()
                                 .py_1()
                                 .flex()
                                 .flex_col()

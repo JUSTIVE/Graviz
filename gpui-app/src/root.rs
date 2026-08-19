@@ -48,7 +48,8 @@ impl Root {
             // Debug: GOMPASS_ABOUT=1 opens on the About page, for selfshots.
             show_about: std::env::var("GOMPASS_ABOUT").is_ok(),
             editor,
-            recents_open: false,
+            // Debug: GOMPASS_RECENTS=1 opens the list, for selfshots.
+            recents_open: std::env::var("GOMPASS_RECENTS").is_ok(),
             warnings: Vec::new(),
             dragging: false,
             schema_name: None,

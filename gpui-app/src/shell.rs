@@ -3,7 +3,15 @@
 
 use crate::icons::{icon, Icon};
 use crate::theme::{Theme, ThemeMode};
-use gpui::{div, prelude::*, px, MouseButton, SharedString, Stateful, Window};
+use gpui::{div, img, prelude::*, px, MouseButton, SharedString, Stateful, Window};
+
+/// Left inset that keeps the header's contents clear of the window controls.
+/// The titlebar is transparent and the traffic lights are drawn by the system
+/// at (10, 10), so without this the wordmark sits on top of them.
+#[cfg(target_os = "macos")]
+const CONTROLS_INSET: f32 = 78.0;
+#[cfg(not(target_os = "macos"))]
+const CONTROLS_INSET: f32 = 16.0;
 
 /// Short commit the build was made from, stamped bottom-center like the web.
 pub const COMMIT: Option<&str> = option_env!("GOMPASS_COMMIT");
@@ -19,6 +27,9 @@ pub enum Route {
 fn nav_link(th: Theme, id: &'static str, label: &'static str, active: bool) -> Stateful<gpui::Div> {
     div()
         .id(id)
+        // The header is also the window's drag strip; without this a press on
+        // a nav link would start moving the window instead of navigating.
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .rounded_md()
         .px_3()
         .py(px(6.0))
@@ -50,18 +61,31 @@ pub fn header<T: 'static>(
     let on_nav_new = on_nav.clone();
     let on_nav_view = on_nav.clone();
     div()
+        .id("titlebar")
         .flex_none()
         .h(px(56.0))
         .w_full()
         .flex()
         .items_center()
         .justify_between()
-        .px_4()
+        .pl(px(CONTROLS_INSET))
+        .pr_4()
         .bg(th.bg)
         .border_b_1()
         .border_color(th.panel_border)
-        // the header doubles as the window drag strip (no system titlebar)
+        // The header doubles as the titlebar (there is no system one): drag
+        // moves the window, and a double-click does whatever the system's
+        // "double-click a window's title bar to" setting says — usually zoom,
+        // which is the maximize toggle.
         .on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
+        .on_click(|ev, window, _| {
+            if ev.click_count() == 2 {
+                #[cfg(target_os = "macos")]
+                window.titlebar_double_click();
+                #[cfg(not(target_os = "macos"))]
+                window.zoom_window();
+            }
+        })
         .child(
             div()
                 .flex()
@@ -73,9 +97,7 @@ pub fn header<T: 'static>(
                         .items_center()
                         .gap_2()
                         .text_color(th.text)
-                        .child(icon(Icon::Waypoints, px(20.0), th.kind_color(
-                            gompass_core::graph::NodeKind::Object,
-                        )))
+                        .child(img(crate::icons::LOGO).size(px(20.0)).flex_none())
                         .child(div().text_base().font_weight(gpui::FontWeight::SEMIBOLD).child("Graviz")),
                 )
                 .child(
@@ -111,6 +133,7 @@ pub fn header<T: 'static>(
         .child(
             div()
                 .id("theme-toggle")
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .h(px(32.0))
                 .flex()
                 .items_center()

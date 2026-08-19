@@ -246,8 +246,12 @@ pub fn view<T: 'static>(
                             .when(recents_open, |el| {
                                 el.child(
                                     div()
+                                        // Scrolls rather than clips: the list
+                                        // grows with every schema opened, and
+                                        // clipping simply hides the older ones.
+                                        .id("landing-recents")
                                         .max_h(px(192.0))
-                                        .overflow_hidden()
+                                        .overflow_y_scroll()
                                         .border_t_1()
                                         .border_color(th.panel_border)
                                         .flex()
@@ -370,8 +374,9 @@ pub fn view<T: 'static>(
                             .flex()
                             .items_start()
                             .gap_2()
+                            .id("landing-error")
                             .max_h(px(128.0))
-                            .overflow_hidden()
+                            .overflow_y_scroll()
                             .rounded_md()
                             .border_1()
                             .border_color(th.red.opacity(0.4))
