@@ -83,13 +83,6 @@ pub struct LayoutConfig {
     pub ordering_sweeps: usize,
     /// Adjacent-swap refinement passes after the barycenter sweeps.
     pub transpose_passes: usize,
-    /// Lay the graph out so every edge runs left to right — laminar flow, at
-    /// the cost of depth. Off by default: on a schema with real cycles
-    /// (User → Repository → owner → User) a monotone layering is 72 columns
-    /// wide here instead of 37, and the extra width costs 79% average edge
-    /// length and 49% more edges cutting across cards, for backflow down
-    /// from 2371 edges to 449.
-    pub monotone: bool,
 }
 
 impl Default for LayoutConfig {
@@ -102,7 +95,6 @@ impl Default for LayoutConfig {
             // measurable on a 4000-edge schema.
             ordering_sweeps: 14,
             transpose_passes: 8,
-            monotone: false,
         }
     }
 }
@@ -599,23 +591,86 @@ pub fn layout(
                 flat += 1;
             }
         }
+        // Edges that end at a dangling node — one with nothing leaving it.
+        // A leaf carries no structure of its own, so the only thing its edge
+        // has to say is "this belongs to that"; the further it reaches, the
+        // more it costs to say it.
+        let mut has_out = vec![false; nodes.len()];
+        for e in edges {
+            if e.from != e.to {
+                has_out[e.from as usize] = true;
+            }
+        }
+        let (mut leaf_len, mut leaf_n) = (0.0f32, 0usize);
+        let (mut leaf_dx, mut leaf_dy) = (0.0f32, 0.0f32);
+        for e in edges {
+            if !has_out[e.to as usize] {
+                let (a, b) = (positions[e.from as usize], positions[e.to as usize]);
+                leaf_len += (b.x - a.x).hypot(b.y - a.y);
+                leaf_dx += (b.x - a.x).abs();
+                leaf_dy += (b.y - a.y).abs();
+                leaf_n += 1;
+            }
+        }
+        {
+            let mut preds = vec![0usize; nodes.len()];
+            for e in edges {
+                if e.from != e.to && !has_out[e.to as usize] {
+                    preds[e.to as usize] += 1;
+                }
+            }
+            let leaves: Vec<usize> = (0..nodes.len()).filter(|&i| preds[i] > 0).collect();
+            let shared: Vec<usize> = leaves.iter().copied().filter(|&i| preds[i] > 1).collect();
+            let (mut single_len, mut single_n) = (0.0f32, 0usize);
+            let (mut shared_len, mut shared_n) = (0.0f32, 0usize);
+            for e in edges {
+                if e.from == e.to || has_out[e.to as usize] {
+                    continue;
+                }
+                let (a, b) = (positions[e.from as usize], positions[e.to as usize]);
+                let l = (b.x - a.x).hypot(b.y - a.y);
+                if preds[e.to as usize] > 1 {
+                    shared_len += l;
+                    shared_n += 1;
+                } else {
+                    single_len += l;
+                    single_n += 1;
+                }
+            }
+            eprintln!(
+                "leaves: {} total, {} referenced more than once; \
+                 {} single-ref edges avg {:.0}, {} shared-ref edges avg {:.0}",
+                leaves.len(),
+                shared.len(),
+                single_n,
+                single_len / single_n.max(1) as f32,
+                shared_n,
+                shared_len / shared_n.max(1) as f32
+            );
+        }
         let n_edges = edges.len().max(1) as f32;
         eprintln!(
-            "layout: {} nodes, {} edges, routed {}, avg len {:.0} (dx {:.0} dy {:.0}), longest {:.0}, backward {}, crossings {} ({:.2}/edge), world {:.0}x{:.0}, tangles {} ({:.1} per edge), same-col {}, union gap {:.0} col {}/{} tight {}/{}",
+            "layout: {} nodes, {} edges, routed {}, avg len {:.0} = {:.1}% of the diagonal (dx {:.0} dy {:.0}), longest {:.0}, backward {}, crossings {} ({:.2}/edge), tangles {} ({:.1} per edge), to-leaf {} avg {:.0} (dx {:.0} dy {:.0}), same-col {}, union gap {:.0} col {}/{} tight {}/{}",
             nodes.len(),
             edges.len(),
             routed,
             total_len / n_edges,
+            // Relative to the drawing's diagonal. Absolute pixels only say
+            // how big the picture is; what costs the reader is how far across
+            // it an edge makes them travel.
+            100.0 * (total_len / n_edges) / (packed_w.hypot(packed_h)).max(1.0),
             total_dx / n_edges,
             total_dy / n_edges,
             longest,
             backward,
             crossed,
             crossed as f32 / n_edges,
-            packed_w,
-            packed_h,
             edge_x,
             2.0 * edge_x as f32 / n_edges,
+            leaf_n,
+            leaf_len / leaf_n.max(1) as f32,
+            leaf_dx / leaf_n.max(1) as f32,
+            leaf_dy / leaf_n.max(1) as f32,
             flat,
             gap_sum / gap_n.max(1) as f32,
             same_col,
@@ -653,47 +708,6 @@ fn anchor_points(
     let end = Point { x: tp.x, y: tp.y + tn.h / 2.0 };
     (start, end)
 }
-
-/// Distance from the roots, the shallow-but-infeasible layering. Kept as a
-/// fallback: it halves the depth of a deep schema, at the price of leaving
-/// edges that point backwards.
-fn bfs_rank(
-    m: usize,
-    succ: &[Vec<u32>],
-    pred: &[Vec<u32>],
-    comp: &[u32],
-    is_root: &[bool],
-) -> Vec<i32> {
-    let mut rank = vec![-1i32; m];
-    let mut queue: std::collections::VecDeque<u32> = (0..m as u32)
-        .filter(|&v| is_root[comp[v as usize] as usize] || pred[v as usize].is_empty())
-        .collect();
-    for &v in &queue {
-        rank[v as usize] = 0;
-    }
-    for seed in 0..m {
-        if rank[seed] < 0 && queue.is_empty() {
-            rank[seed] = 0;
-            queue.push_back(seed as u32);
-        }
-        while let Some(v) = queue.pop_front() {
-            let d = rank[v as usize];
-            for &w in &succ[v as usize] {
-                if rank[w as usize] < 0 {
-                    rank[w as usize] = d + 1;
-                    queue.push_back(w);
-                }
-            }
-        }
-    }
-    for r in rank.iter_mut() {
-        if *r < 0 {
-            *r = 0;
-        }
-    }
-    rank
-}
-
 
 /// Relax the interior of a routed chain toward its neighbours.
 ///
@@ -922,18 +936,14 @@ fn layout_component(
     acyclic.dedup_by_key(|&mut (p, _)| p);
 
     // ---- ranking ----
-    // Every node's column is its rank, so the sum of edge spans *is* the
-    // horizontal half of total edge length — three quarters of it, measured.
-    // `ranking::network_simplex` minimises that sum exactly, and is available
-    // behind GOMPASS_SIMPLEX, but it is not the default: minimal *rank span*
-    // and minimal *pixel length* turn out to be different objectives once a
-    // rank's height is bounded. Requiring every edge to advance a column
-    // makes this schema 72 columns wide (avg length 8256 against BFS's 4600);
-    // relaxing non-tree edges to minlen 0 cuts the span from 24888 to 8785,
-    // but then whole ranks overflow and the height balancing spends the
-    // saving back. BFS depth is infeasible — a third of the edges come out
-    // backwards, and those are routed as such — but it is measurably the
-    // shorter drawing.
+    // Every edge must advance at least one column, so the drawing reads left
+    // to right with no backflow: `ranking::network_simplex` finds the layering
+    // that does that with the smallest total rank span, which is the
+    // horizontal half of edge length. It costs depth — this schema is 72
+    // columns instead of the 37 a breadth-first depth would give — but with
+    // edges anchored right face to left face, an edge that points backwards
+    // has to loop the whole way around, and those loops cost more in
+    // crossings than the extra width does.
     let mut succ: Vec<Vec<u32>> = vec![Vec::new(); m];
     let mut pred: Vec<Vec<u32>> = vec![Vec::new(); m];
     for &((a, b), _) in &acyclic {
@@ -942,21 +952,19 @@ fn layout_component(
             pred[b as usize].push(a);
         }
     }
-    let mut rank = if !config.monotone {
-        bfs_rank(m, &succ, &pred, comp, is_root)
-    } else {
-        let redges: Vec<crate::ranking::RankEdge> = acyclic
-            .iter()
-            .filter(|((a, b), _)| a != b)
-            .map(|&((a, b), _)| crate::ranking::RankEdge {
-                from: a,
-                to: b,
-                weight: 1,
-                minlen: 1,
-            })
-            .collect();
-        crate::ranking::network_simplex(m, &redges, SIMPLEX_PIVOTS)
-    };
+    // Weighting edges into dangling nodes was tried, so the simplex would
+    // spend its slack attaching leaves rather than threading the graph: it
+    // moves the leaf edges 5% closer and costs 1.4% more edge crossings,
+    // because a leaf referenced from two distant columns has to sit after the
+    // later one whatever the weight says. The structure, not the weight, is
+    // what makes those edges long.
+    let redges: Vec<crate::ranking::RankEdge> = acyclic
+        .iter()
+        .filter(|((a, b), _)| a != b)
+        .map(|&((a, b), _)| crate::ranking::RankEdge { from: a, to: b, weight: 1, minlen: 1 })
+        .collect();
+    let mut rank = crate::ranking::network_simplex(m, &redges, SIMPLEX_PIVOTS);
+
 
     // ---- balance over-tall ranks into real ranks ----
     // BFS depth alone leaves one rank holding hundreds of nodes, which turns

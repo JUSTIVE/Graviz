@@ -607,12 +607,30 @@ fn edge_is_dimmed(
     }
 }
 
-/// Should this card be drawn dimmed? With an edge pinned only its two
-/// endpoints stay lit; otherwise only the focused card does.
-fn card_is_dimmed(card: u32, pinned_ends: Option<(u32, u32)>, focus: Option<u32>) -> bool {
+/// Is this card fully documented — description on the type and on every field
+/// or enum value it lists?
+fn card_is_documented(card: &crate::model::Card) -> bool {
+    card.description.is_some()
+        && !card.rows.iter().any(|r| {
+            matches!(r.kind, RowKind::Field | RowKind::EnumValue) && r.description.is_none()
+        })
+}
+
+/// Should this card be drawn dimmed?
+///
+/// With an edge pinned only its two endpoints stay lit. With a card focused,
+/// its immediate neighbours stay lit too: what you want to see after clicking
+/// a type is the type *and what it touches*, and dimming the far end of every
+/// edge you just lit up leaves those edges running into the dark.
+fn card_is_dimmed(
+    card: u32,
+    pinned_ends: Option<(u32, u32)>,
+    focus: Option<u32>,
+    neighbour: &dyn Fn(u32) -> bool,
+) -> bool {
     match pinned_ends {
         Some((from, to)) => card != from && card != to,
-        None => matches!(focus, Some(f) if f != card),
+        None => matches!(focus, Some(f) if f != card && !neighbour(card)),
     }
 }
 
@@ -1231,6 +1249,25 @@ fn paint_scene(
 
     let to_screen = |x: f32, y: f32| point(px(ox + x * k), px(oy + y * k));
 
+    // Cards one edge away from the focused one — lit alongside it.
+    let neighbours: std::collections::HashSet<u32> = match focus.filter(|_| focused_edge.is_none())
+    {
+        Some(f) => model
+            .edges
+            .iter()
+            .filter_map(|e| {
+                if e.from == f {
+                    Some(e.to)
+                } else if e.to == f {
+                    Some(e.from)
+                } else {
+                    None
+                }
+            })
+            .collect(),
+        None => std::collections::HashSet::new(),
+    };
+
     let t_probe = std::time::Instant::now();
     // ---- dot grid, under everything ----
     // A 24px world lattice of dots, like the web canvas. It is what makes
@@ -1316,7 +1353,7 @@ fn paint_scene(
             // With a focus of any kind the dimmed edges have to recede hard;
             // without one this pass is only the hub fading, which should stay
             // legible.
-            let a = if focused_edge.is_some() || focus.is_some() {
+            let a = if focused_edge.is_some() || focus.is_some() || investigate {
                 FOCUS_DIM_ALPHA
             } else {
                 0.35
@@ -1362,7 +1399,16 @@ fn paint_scene(
             }
             // With a focus, everything non-incident dims; without one, only
             // hub-star edges dim (the web app's hub fading).
-            let dimmed = edge_is_dimmed(ei as u32, e.from, e.to, e.hub_faded, focused_edge, focus);
+            let mut dimmed =
+                edge_is_dimmed(ei as u32, e.from, e.to, e.hub_faded, focused_edge, focus);
+            // In investigate mode an edge is only interesting if it touches
+            // something undocumented; the rest recede with their cards.
+            if investigate && !dimmed {
+                let touches_gap = [e.from, e.to].iter().any(|&c| {
+                    model.cards.get(c as usize).is_some_and(|c| !card_is_documented(c))
+                });
+                dimmed = !touches_gap;
+            }
             if dimmed != dim_pass {
                 continue;
             }
@@ -1465,10 +1511,15 @@ fn paint_scene(
             && !card.rows.iter().any(|r| r.is_overlay)
         {
             DIM_ALPHA
+        } else if investigate && card_is_documented(card) {
+            // Investigate is a search for what is missing; a fully documented
+            // type is the answer "not here", and leaving it at full strength
+            // makes the reader do the filtering the mode exists to do.
+            DIM_ALPHA
         } else {
             let pinned_ends =
                 focused_edge.and_then(|fe| model.edges.get(fe as usize)).map(|e| (e.from, e.to));
-            if card_is_dimmed(ci, pinned_ends, focus) {
+            if card_is_dimmed(ci, pinned_ends, focus, &|c| neighbours.contains(&c)) {
                 DIM_ALPHA
             } else {
                 1.0
@@ -2013,9 +2064,10 @@ mod tests {
         // ...even an edge touching the previously focused card
         assert!(edge_is_dimmed(8, 3, 4, false, pinned, Some(3)));
         // only the two endpoints stay lit
-        assert!(!card_is_dimmed(3, Some((3, 9)), None));
-        assert!(!card_is_dimmed(9, Some((3, 9)), None));
-        assert!(card_is_dimmed(4, Some((3, 9)), Some(4)));
+        let none = |_: u32| false;
+        assert!(!card_is_dimmed(3, Some((3, 9)), None, &none));
+        assert!(!card_is_dimmed(9, Some((3, 9)), None, &none));
+        assert!(card_is_dimmed(4, Some((3, 9)), Some(4), &none));
     }
 
     #[test]
@@ -2023,15 +2075,18 @@ mod tests {
         assert!(!edge_is_dimmed(8, 3, 4, false, None, Some(3)));
         assert!(!edge_is_dimmed(8, 3, 4, false, None, Some(4)));
         assert!(edge_is_dimmed(8, 3, 4, false, None, Some(5)));
-        assert!(!card_is_dimmed(3, None, Some(3)));
-        assert!(card_is_dimmed(4, None, Some(3)));
+        // The focused card, and anything one edge from it, stay lit.
+        let nbr = |c: u32| c == 4;
+        assert!(!card_is_dimmed(3, None, Some(3), &nbr));
+        assert!(!card_is_dimmed(4, None, Some(3), &nbr));
+        assert!(card_is_dimmed(5, None, Some(3), &nbr));
     }
 
     #[test]
     fn with_no_focus_at_all_only_hub_edges_fade() {
         assert!(edge_is_dimmed(8, 3, 4, true, None, None));
         assert!(!edge_is_dimmed(8, 3, 4, false, None, None));
-        assert!(!card_is_dimmed(4, None, None));
+        assert!(!card_is_dimmed(4, None, None, &|_| false));
     }
 
     #[test]

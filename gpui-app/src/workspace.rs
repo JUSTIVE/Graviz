@@ -29,7 +29,7 @@ actions!(
         ToggleSidebar,
         ToggleDescriptions,
         ToggleBundling,
-        ToggleFlow,
+        ToggleCustomScalars,
         ToggleInvestigate,
         TogglePrimitives,
         ToggleRelay,
@@ -47,7 +47,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-b", ToggleSidebar, None),
         KeyBinding::new("cmd-d", ToggleDescriptions, None),
         KeyBinding::new("cmd-e", ToggleBundling, None),
-        KeyBinding::new("cmd-l", ToggleFlow, None),
+        KeyBinding::new("cmd-shift-s", ToggleCustomScalars, None),
         KeyBinding::new("cmd-i", ToggleInvestigate, None),
         KeyBinding::new("cmd-p", TogglePrimitives, None),
         KeyBinding::new("cmd-r", ToggleRelay, None),
@@ -170,7 +170,7 @@ impl Workspace {
         let mut options = ModelOptions {
             show_descriptions: settings.show_descriptions,
             bundle_edges: settings.bundle_edges,
-            monotone: settings.monotone,
+            hide_custom_scalars: settings.hide_custom_scalars,
             hide_primitive_fields: settings.hide_primitive_fields,
             ..Default::default()
         };
@@ -184,19 +184,17 @@ impl Workspace {
         }
         let investigate = std::env::var("GOMPASS_INVESTIGATE").is_ok();
         let t_layout = std::time::Instant::now();
-        let model = Rc::new(build_model(
-            slice_graph(&loaded.graph, mode, None),
-            loaded.name.clone(),
-            &options,
-        ));
+        let mut sliced = slice_graph(&loaded.graph, mode, None);
+        if options.hide_custom_scalars {
+            crate::model::drop_custom_scalars(&mut sliced);
+        }
+        let model = Rc::new(build_model(sliced, loaded.name.clone(), &options));
         if std::env::var("GOMPASS_PERF").is_ok() {
             eprintln!(
-                "perf: layout+model {}ms — {} cards, {} edges, world {:.0}×{:.0}",
+                "perf: layout+model {}ms — {} cards, {} edges",
                 t_layout.elapsed().as_millis(),
                 model.cards.len(),
-                model.edges.len(),
-                model.world_w,
-                model.world_h
+                model.edges.len()
             );
         }
         let tree = cx.new(|cx| TreePanel::new(model.clone(), cx));
@@ -327,7 +325,7 @@ impl Workspace {
         config::save_settings(&config::Settings {
             show_descriptions: self.options.show_descriptions,
             bundle_edges: self.options.bundle_edges,
-            monotone: self.options.monotone,
+            hide_custom_scalars: self.options.hide_custom_scalars,
             hide_primitive_fields: self.options.hide_primitive_fields,
             hide_relay: self.hide_relay,
             sidebar_open: self.sidebar_open,
@@ -338,11 +336,13 @@ impl Workspace {
     }
 
     fn rebuild(&mut self, cx: &mut Context<Self>) {
-        let model = Rc::new(build_model(
-            slice_graph(&self.full_graph, self.mode, self.root_override.as_deref()),
-            self.schema_name.clone(),
-            &self.options,
-        ));
+        // Only the canvas slice loses its scalars; the Orphaned and Deprecated
+        // tabs work off the full graph and should still list them.
+        let mut sliced = slice_graph(&self.full_graph, self.mode, self.root_override.as_deref());
+        if self.options.hide_custom_scalars {
+            crate::model::drop_custom_scalars(&mut sliced);
+        }
+        let model = Rc::new(build_model(sliced, self.schema_name.clone(), &self.options));
         self.model = model.clone();
         self.tree.update(cx, |tree, cx| tree.set_model(model.clone(), cx));
         let full_model = Rc::new(build_model(
@@ -706,11 +706,11 @@ impl Render for Workspace {
             ))
             .child(self.chip(
                 th,
-                "flow",
-                "Left-to-right flow",
-                self.options.monotone,
+                "hide-custom-scalars",
+                "Hide custom scalars",
+                self.options.hide_custom_scalars,
                 |this, _, cx| {
-                    this.options.monotone = !this.options.monotone;
+                    this.options.hide_custom_scalars = !this.options.hide_custom_scalars;
                     this.rebuild(cx);
                     this.save_settings(cx);
                 },
@@ -1400,11 +1400,12 @@ impl Render for Workspace {
                 this.rebuild(cx);
                 this.save_settings(cx);
             }))
-            .on_action(cx.listener(|this, _: &ToggleFlow, _, cx| {
-                this.options.monotone = !this.options.monotone;
+            .on_action(cx.listener(|this, _: &ToggleCustomScalars, _, cx| {
+                this.options.hide_custom_scalars = !this.options.hide_custom_scalars;
                 this.rebuild(cx);
                 this.save_settings(cx);
             }))
+
             .on_action(cx.listener(|this, _: &ToggleBundling, _, cx| {
                 this.options.bundle_edges = !this.options.bundle_edges;
                 this.rebuild(cx);

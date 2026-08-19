@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 pub struct Settings {
     pub show_descriptions: bool,
     pub bundle_edges: bool,
-    pub monotone: bool,
+    pub hide_custom_scalars: bool,
     pub hide_primitive_fields: bool,
     pub hide_relay: bool,
     pub sidebar_open: bool,
@@ -30,7 +30,7 @@ impl Default for Settings {
         Settings {
             show_descriptions: false,
             bundle_edges: true,
-            monotone: false,
+            hide_custom_scalars: false,
             hide_primitive_fields: false,
             hide_relay: true,
             sidebar_open: true,

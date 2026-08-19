@@ -325,10 +325,10 @@ pub struct ModelOptions {
     pub show_descriptions: bool,
     /// Collapse parallel field edges sharing source→target into one arrow.
     pub bundle_edges: bool,
-    /// Lay the graph out so every edge runs left to right.
-    pub monotone: bool,
     /// Hide fields whose return type is a builtin scalar (String/Int/…).
     pub hide_primitive_fields: bool,
+    /// Drop declared scalars and the fields that reference them.
+    pub hide_custom_scalars: bool,
     /// Today as `YYYY-MM-DD`, for `[until]` expiry coloring.
     pub today: String,
 }
@@ -338,8 +338,8 @@ impl Default for ModelOptions {
         ModelOptions {
             show_descriptions: false,
             bundle_edges: true,
-            monotone: false,
             hide_primitive_fields: false,
+            hide_custom_scalars: false,
             today: today_string(),
         }
     }
@@ -564,6 +564,32 @@ fn kind_label(kind: NodeKind) -> &'static str {
         NodeKind::Enum => "enum",
         NodeKind::Scalar => "scalar",
         NodeKind::Input => "input",
+    }
+}
+
+/// Remove every declared scalar and the fields that reference it.
+///
+/// A custom scalar is a leaf — `DateTime`, `URI`, `HTML` — with nothing
+/// inside it, but a schema mentions the same handful hundreds of times, so
+/// they contribute a large share of the edges and almost none of the
+/// structure. Built-in scalars never become nodes at all, so this only
+/// touches the ones the schema declared.
+pub fn drop_custom_scalars(g: &mut ParsedGraph) {
+    let scalars: std::collections::HashSet<String> = g
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Scalar)
+        .map(|n| n.id.clone())
+        .collect();
+    if scalars.is_empty() {
+        return;
+    }
+    g.nodes.retain(|n| !scalars.contains(&n.id));
+    g.edges.retain(|e| !scalars.contains(&e.source) && !scalars.contains(&e.target));
+    for n in g.nodes.iter_mut() {
+        if let Some(fields) = n.fields.as_mut() {
+            fields.retain(|f| !scalars.contains(&f.type_name));
+        }
     }
 }
 
@@ -900,8 +926,8 @@ pub fn build_model(graph: ParsedGraph, schema_name: String, options: &ModelOptio
             (members.len() > 1).then_some(layout::Cluster { parent, members })
         })
         .collect();
-    let cfg = LayoutConfig { monotone: options.monotone, ..LayoutConfig::default() };
-    let result = layout::layout(&layout_nodes, &layout_edges, &roots, &unions, &cfg);
+    let result =
+        layout::layout(&layout_nodes, &layout_edges, &roots, &unions, &LayoutConfig::default());
 
     // ---- flatten edge paths ----
     let mut edges: Vec<EdgeVisual> = Vec::with_capacity(result.edges.len());
