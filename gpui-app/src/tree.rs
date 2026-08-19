@@ -1,68 +1,129 @@
-//! Sidebar: type list + fuzzy search (the web app's TreePanel).
+//! Sidebar: the web app's `TreePanel`, section for section.
+//!
+//! Top to bottom: the search input, the recent-search list (which replaces
+//! everything below it while the input is focused and empty), the kind-filter
+//! chips + search results, then the browse tree — root operation picker,
+//! collapsible "All types", the context sections (implemented by / members /
+//! referenced by) and the `TypeDetail` pane.
 //!
 //! The search box is a minimal key-capture input (schema identifiers are
 //! ASCII); results come from `gompass_core::search::search_graph`.
 
-use crate::model::Model;
-use gompass_core::graph::{EdgeKind, NodeKind};
-use gompass_core::search::{search_graph, SearchResult};
+use crate::icons::{icon, Icon};
+use crate::model::{Model, RowKind};
 use crate::theme::Theme;
+use crate::workspace::kind_badge;
+use gompass_core::graph::NodeKind;
+use gompass_core::search::{search_graph, SearchResult, SnippetKind};
 use gpui::{
-    div, prelude::*, px, uniform_list, App, Context, EventEmitter, FocusHandle, Focusable,
-    KeyDownEvent, ScrollStrategy, SharedString, UniformListScrollHandle, Window,
+    div, prelude::*, px, transparent_black, uniform_list, AnyElement, App, Context, EventEmitter,
+    FocusHandle, Focusable, FontWeight, HighlightStyle, Hsla, KeyDownEvent, ScrollHandle,
+    SharedString, StyledText, Window,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-const KIND_CHIPS: [(NodeKind, &str); 6] = [
+/// Kind filter chips, in the web's `KIND_STYLES` declaration order.
+const KIND_ORDER: [(NodeKind, &str); 6] = [
     (NodeKind::Object, "type"),
-    (NodeKind::Interface, "iface"),
+    (NodeKind::Interface, "interface"),
     (NodeKind::Union, "union"),
     (NodeKind::Enum, "enum"),
-    (NodeKind::Input, "input"),
     (NodeKind::Scalar, "scalar"),
+    (NodeKind::Input, "input"),
 ];
+
+/// Scalars that are never navigable (web `BUILTIN`).
+const BUILTIN: [&str; 5] = ["String", "Int", "Float", "Boolean", "ID"];
+
+/// Row pitch and height cap of the capped type lists — the web's
+/// `VLIST_ROW_H` and `max-h-48`.
+const LIST_ROW_H: f32 = 24.0;
+const LIST_MAX_H: f32 = 192.0;
+
+const MONO: &str = "Menlo";
+
+fn kind_label(kind: NodeKind) -> &'static str {
+    KIND_ORDER
+        .iter()
+        .find(|(k, _)| *k == kind)
+        .map(|(_, l)| *l)
+        .unwrap_or("type")
+}
 
 pub enum TreeEvent {
     Select { node_index: usize, row: Option<usize> },
+    /// A root operation button was picked in the root selector.
+    RootPicked(String),
 }
 
 pub struct TreePanel {
     model: Rc<Model>,
     query: String,
+    /// Unfiltered hits — the kind chips count over these.
     results: Vec<SearchResult>,
-    /// Alphabetical card indices for the no-query "all types" list.
+    /// Indices into `results` surviving `kind_filter`.
+    filtered: Vec<usize>,
+    kind_counts: HashMap<NodeKind, usize>,
+    kind_filter: HashSet<NodeKind>,
+    /// Alphabetical card indices for the "All types" list.
     all_sorted: Vec<u32>,
+    /// Index into `filtered` for keyboard navigation.
     active: usize,
     focus: FocusHandle,
-    scroll: UniformListScrollHandle,
-    kind_filter: HashSet<NodeKind>,
+    results_scroll: ScrollHandle,
     search_history: Vec<String>,
-    /// Card index of the type shown in the detail section.
+    /// Card index of the type shown in `TypeDetail`.
     selected: Option<u32>,
-    /// `(referencing card, "Type.field")` rows for the detail section.
-    referenced_by: Vec<(u32, SharedString)>,
+    /// `(card, display row)` of the field highlighted on the canvas.
+    pinned: Option<(u32, usize)>,
+    all_types_open: bool,
+    root_pick: Option<SharedString>,
+    /// `(card, the other interfaces it implements)` — Interface selection only.
+    implementers: Vec<(u32, Vec<SharedString>)>,
+    /// `(card, the other unions it belongs to)` — Union selection only.
+    union_members: Vec<(u32, Vec<SharedString>)>,
+    /// `(card, ".field" names pointing at the selection)`.
+    referenced_by: Vec<(u32, Vec<SharedString>)>,
 }
 
 impl TreePanel {
     pub fn new(model: Rc<Model>, cx: &mut Context<Self>) -> Self {
-        let mut all_sorted: Vec<u32> = (0..model.cards.len() as u32).collect();
-        all_sorted.sort_by(|&a, &b| {
-            model.cards[a as usize].name.cmp(&model.cards[b as usize].name)
-        });
-        Self {
+        let all_sorted = sorted_cards(&model);
+        let root_pick = first_root(&model);
+        let mut this = Self {
             model,
             query: String::new(),
             results: Vec::new(),
+            filtered: Vec::new(),
+            kind_counts: HashMap::new(),
+            kind_filter: HashSet::new(),
             all_sorted,
             active: 0,
             focus: cx.focus_handle(),
-            scroll: UniformListScrollHandle::new(),
-            kind_filter: HashSet::new(),
+            results_scroll: ScrollHandle::new(),
             search_history: crate::config::search_history(),
             selected: None,
+            pinned: None,
+            all_types_open: false,
+            root_pick,
+            implementers: Vec::new(),
+            union_members: Vec::new(),
             referenced_by: Vec::new(),
+        };
+        // TEMP DEBUG
+        if let Ok(q) = std::env::var("GOMPASS_TREE") {
+            this.query = q;
+            this.refresh();
         }
+        if let Ok(name) = std::env::var("GOMPASS_TREE_SEL") {
+            if let Some(&c) = this.model.index_of.get(&name) {
+                this.selected = Some(c);
+                this.recompute_sections(c);
+                this.all_types_open = true;
+            }
+        }
+        this
     }
 
     pub fn focus_handle(&self) -> FocusHandle {
@@ -71,39 +132,45 @@ impl TreePanel {
 
     /// Swap in a different slice of the schema (mode change).
     pub fn set_model(&mut self, model: Rc<Model>, cx: &mut Context<Self>) {
-        let mut all_sorted: Vec<u32> = (0..model.cards.len() as u32).collect();
-        all_sorted.sort_by(|&a, &b| {
-            model.cards[a as usize].name.cmp(&model.cards[b as usize].name)
-        });
+        self.all_sorted = sorted_cards(&model);
+        self.root_pick = first_root(&model);
         self.model = model;
-        self.all_sorted = all_sorted;
         self.query.clear();
+        self.kind_filter.clear();
         self.selected = None;
+        self.pinned = None;
+        self.implementers.clear();
+        self.union_members.clear();
         self.referenced_by.clear();
         self.refresh();
         cx.notify();
     }
 
-    fn item_count(&self) -> usize {
-        if self.query.is_empty() {
-            self.all_sorted.len()
-        } else {
-            self.results.len()
-        }
-    }
-
     fn refresh(&mut self) {
-        self.results = if self.query.is_empty() {
+        self.results = if self.query.trim().is_empty() {
             Vec::new()
         } else {
-            let mut results = search_graph(&self.model.graph, &self.query);
-            if !self.kind_filter.is_empty() {
-                results.retain(|r| self.kind_filter.contains(&r.type_kind));
-            }
-            results
+            search_graph(&self.model.graph, &self.query)
         };
+        self.kind_counts.clear();
+        for r in &self.results {
+            *self.kind_counts.entry(r.type_kind).or_insert(0) += 1;
+        }
+        self.filtered = self
+            .results
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| self.kind_filter.is_empty() || self.kind_filter.contains(&r.type_kind))
+            .map(|(i, _)| i)
+            .collect();
         self.active = 0;
-        self.scroll.scroll_to_item(0, ScrollStrategy::Top);
+        self.results_scroll.scroll_to_item(0);
+    }
+
+    fn set_query(&mut self, q: String, cx: &mut Context<Self>) {
+        self.query = q;
+        self.refresh();
+        cx.notify();
     }
 
     fn toggle_kind(&mut self, kind: NodeKind, cx: &mut Context<Self>) {
@@ -114,55 +181,121 @@ impl TreePanel {
         cx.notify();
     }
 
-    /// Recompute the detail section for `card` (incoming field references).
-    fn select_card(&mut self, card: u32, row: Option<usize>, cx: &mut Context<Self>) {
-        self.selected = Some(card);
-        let id = &self.model.graph.nodes[card as usize].id;
-        let mut refs: Vec<(u32, SharedString)> = self
-            .model
-            .graph
-            .edges
-            .iter()
-            .filter(|e| e.kind == EdgeKind::Field && &e.target == id && &e.source != id)
-            .filter_map(|e| {
-                let src = *self.model.index_of.get(&e.source)?;
-                let field = e.source_field.as_deref().unwrap_or("?");
-                Some((src, SharedString::from(format!("{}.{}", e.source, field))))
-            })
-            .collect();
-        refs.sort_by(|a, b| a.1.cmp(&b.1));
-        refs.dedup_by(|a, b| a.1 == b.1);
-        refs.truncate(200);
-        self.referenced_by = refs;
-        cx.emit(TreeEvent::Select { node_index: card as usize, row });
-        cx.notify();
-    }
-
-    fn select(&mut self, ix: usize, cx: &mut Context<Self>) {
-        let target = if self.query.is_empty() {
-            self.all_sorted.get(ix).map(|&card| (card, None))
-        } else {
-            self.results
-                .get(ix)
-                .map(|r| (r.node_index as u32, r.row_index))
-        };
-        if let Some((card, row)) = target {
-            if !self.query.is_empty() {
-                crate::config::push_search(&self.query);
-                self.search_history = crate::config::search_history();
-            }
-            self.active = ix;
-            self.select_card(card, row, cx);
-        }
-    }
-
-    fn set_query(&mut self, q: String, cx: &mut Context<Self>) {
-        self.query = q;
+    fn clear_kind_filter(&mut self, cx: &mut Context<Self>) {
+        self.kind_filter.clear();
         self.refresh();
         cx.notify();
     }
 
-    fn on_key_down(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn remove_history(&mut self, q: &str, cx: &mut Context<Self>) {
+        self.search_history.retain(|s| s != q);
+        crate::config::set_search_history(&self.search_history);
+        cx.notify();
+    }
+
+    fn clear_history(&mut self, cx: &mut Context<Self>) {
+        self.search_history.clear();
+        crate::config::set_search_history(&self.search_history);
+        cx.notify();
+    }
+
+    /// Recompute the three context sections for `card`.
+    fn recompute_sections(&mut self, card: u32) {
+        let model = self.model.clone();
+        let name = model.cards[card as usize].name.clone();
+        let kind = model.cards[card as usize].kind;
+        let by_name = |a: &(u32, Vec<SharedString>), b: &(u32, Vec<SharedString>)| {
+            model.cards[a.0 as usize].name.cmp(&model.cards[b.0 as usize].name)
+        };
+
+        let mut implementers: Vec<(u32, Vec<SharedString>)> = Vec::new();
+        if kind == NodeKind::Interface {
+            for c in &model.cards {
+                if c.implements.contains(&name) {
+                    let others = c.implements.iter().filter(|i| **i != name).cloned().collect();
+                    implementers.push((c.index, others));
+                }
+            }
+            implementers.sort_by(by_name);
+        }
+
+        let mut union_members: Vec<(u32, Vec<SharedString>)> = Vec::new();
+        if kind == NodeKind::Union {
+            for r in &model.cards[card as usize].rows {
+                if r.kind != RowKind::UnionMember {
+                    continue;
+                }
+                let Some(t) = r.target else { continue };
+                let others = model.cards[t as usize]
+                    .member_of_unions
+                    .iter()
+                    .filter(|u| **u != name)
+                    .cloned()
+                    .collect();
+                union_members.push((t, others));
+            }
+            union_members.sort_by(by_name);
+        }
+
+        let mut referenced_by: Vec<(u32, Vec<SharedString>)> = Vec::new();
+        for c in &model.cards {
+            let fields: Vec<SharedString> = c
+                .rows
+                .iter()
+                .filter(|r| r.kind == RowKind::Field && r.target == Some(card))
+                .map(|r| SharedString::from(format!(".{}", r.left)))
+                .collect();
+            if !fields.is_empty() {
+                referenced_by.push((c.index, fields));
+            }
+        }
+        referenced_by.sort_by(by_name);
+
+        self.implementers = implementers;
+        self.union_members = union_members;
+        self.referenced_by = referenced_by;
+    }
+
+    /// Focus `card` in the detail pane and tell the canvas to navigate.
+    fn select_card(&mut self, card: u32, row: Option<usize>, cx: &mut Context<Self>) {
+        self.selected = Some(card);
+        self.pinned = row
+            .and_then(|r| self.model.cards[card as usize].display_row(r))
+            .map(|d| (card, d));
+        self.recompute_sections(card);
+        cx.emit(TreeEvent::Select { node_index: card as usize, row });
+        cx.notify();
+    }
+
+    /// Commit search result `ix` (an index into `filtered`) — the web's
+    /// `jumpToAndClose`: remember the query, jump, then empty the box.
+    fn select_result(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(&ri) = self.filtered.get(ix) else { return };
+        let (card, row) = {
+            let r = &self.results[ri];
+            (r.node_index as u32, r.row_index)
+        };
+        if !self.query.trim().is_empty() {
+            crate::config::push_search(&self.query);
+            self.search_history = crate::config::search_history();
+        }
+        self.active = ix;
+        self.select_card(card, row, cx);
+        self.query.clear();
+        self.refresh();
+    }
+
+    fn pick_root(&mut self, name: SharedString, cx: &mut Context<Self>) {
+        self.root_pick = Some(name.clone());
+        cx.emit(TreeEvent::RootPicked(name.to_string()));
+        cx.notify();
+    }
+
+    fn is_navigable(&self, type_name: &str) -> bool {
+        !BUILTIN.contains(&type_name) && self.model.index_of.contains_key(type_name)
+    }
+
+    fn on_key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
         if ks.modifiers.platform || ks.modifiers.control {
             return;
@@ -175,17 +308,18 @@ impl TreePanel {
             "escape" => {
                 self.query.clear();
                 self.refresh();
+                window.blur();
             }
             "up" => {
                 self.active = self.active.saturating_sub(1);
-                self.scroll.scroll_to_item(self.active, ScrollStrategy::Nearest);
+                self.results_scroll.scroll_to_item(self.active);
             }
             "down" => {
-                self.active = (self.active + 1).min(self.item_count().saturating_sub(1));
-                self.scroll.scroll_to_item(self.active, ScrollStrategy::Nearest);
+                self.active = (self.active + 1).min(self.filtered.len().saturating_sub(1));
+                self.results_scroll.scroll_to_item(self.active);
             }
             "enter" => {
-                self.select(self.active, cx);
+                self.select_result(self.active, cx);
                 return;
             }
             _ => {
@@ -202,92 +336,915 @@ impl TreePanel {
         cx.notify();
     }
 
-    fn render_row(&self, ix: usize, th: Theme, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let is_active = ix == self.active;
-        let (dot, main, hl_chars, detail): (gpui::Hsla, SharedString, Vec<usize>, Option<String>) =
-            if self.query.is_empty() {
-                let card = &self.model.cards[self.all_sorted[ix] as usize];
-                let detail = card.description.as_ref().map(|d| {
-                    let one: String = d.split_whitespace().collect::<Vec<_>>().join(" ");
-                    one.chars().take(60).collect::<String>()
-                });
-                (th.kind_color(card.kind), card.name.clone(), Vec::new(), detail)
-            } else {
-                let r = &self.results[ix];
-                let main = match &r.field_name {
-                    Some(f) => format!("{}.{}", r.type_name, f),
-                    None => r.type_name.clone(),
-                };
-                // fuzzy-match highlight indices, mapped into the combined
-                // "Type.field" string
-                let mut hl: Vec<usize> = Vec::new();
-                if let Some(ti) = &r.type_match_indices {
-                    hl.extend(ti.iter().copied());
-                }
-                if r.field_name.is_some() {
-                    let off = r.type_name.chars().count() + 1;
-                    hl.extend(r.match_indices.iter().map(|i| i + off));
-                } else {
-                    hl.extend(r.match_indices.iter().copied());
-                }
-                let detail = r
-                    .snippet
-                    .as_ref()
-                    .map(|s| s.snippet.clone())
-                    .or_else(|| r.field_type.clone());
-                (th.kind_color(r.type_kind), main.into(), hl, detail)
-            };
-        let main_el: gpui::AnyElement = if hl_chars.is_empty() {
-            SharedString::from(main).into_any_element()
-        } else {
-            let ranges = char_byte_ranges(&main, &hl_chars);
-            let style = gpui::HighlightStyle {
-                color: Some(th.accent),
-                font_weight: Some(gpui::FontWeight::BOLD),
-                ..Default::default()
-            };
-            gpui::StyledText::new(main)
-                .with_highlights(ranges.into_iter().map(|r| (r, style)))
-                .into_any_element()
-        };
+    // ---- 1. search input -------------------------------------------------
 
+    fn render_search(&self, th: Theme, focused: bool, cx: &mut Context<Self>) -> AnyElement {
+        let empty = self.query.is_empty();
+        let text: SharedString = if empty {
+            "Search types & fields…".into()
+        } else {
+            self.query.clone().into()
+        };
         div()
-            .id(ix)
-            .w_full()
-            .px_2()
-            .h(px(ROW_H))
-            .flex()
-            .items_center()
-            .gap_2()
-            .cursor_pointer()
-            .when(is_active, |el| el.bg(th.active_bg))
-            .hover(|el| el.bg(th.hover_bg))
-            .on_click(cx.listener(move |this, _, _, cx| this.select(ix, cx)))
-            .child(div().size(px(7.0)).rounded_full().bg(dot).flex_none())
+            .flex_none()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(th.panel_border)
             .child(
                 div()
-                    .flex_none()
-                    .text_xs()
-                    .text_color(th.text)
-                    .whitespace_nowrap()
-                    .child(main_el),
+                    .w_full()
+                    .h(px(30.0))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px(px(8.0))
+                    .rounded(px(4.0))
+                    .border_1()
+                    .border_color(if focused { th.accent } else { th.panel_border })
+                    .bg(th.bg)
+                    .child(icon(Icon::Search, px(12.0), th.text_muted))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(12.0))
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_color(if empty { th.text_muted } else { th.text })
+                            .child(text),
+                    )
+                    .child(if empty {
+                        div()
+                            .flex_none()
+                            .font_family(MONO)
+                            .text_size(px(10.0))
+                            .text_color(th.text_muted.opacity(0.5))
+                            .child("⌘K")
+                            .into_any_element()
+                    } else {
+                        div()
+                            .id("search-clear")
+                            .flex_none()
+                            .cursor_pointer()
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.set_query(String::new(), cx)),
+                            )
+                            .child(icon(Icon::X, px(12.0), th.text_muted))
+                            .into_any_element()
+                    }),
             )
-            .when_some(detail, |el, d| {
-                el.child(
+            .into_any_element()
+    }
+
+    // ---- 2. search history -----------------------------------------------
+
+    fn render_history(&self, th: Theme, cx: &mut Context<Self>) -> AnyElement {
+        let rows = self.search_history.clone().into_iter().enumerate().map(|(i, q)| {
+            let fill = q.clone();
+            let del = q.clone();
+            div()
+                .id(("history", i))
+                .w_full()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py(px(6.0))
+                .cursor_pointer()
+                .hover(|el| el.bg(th.hover_bg))
+                .on_click(cx.listener(move |this, _, _, cx| this.set_query(fill.clone(), cx)))
+                .child(icon(Icon::Clock, px(12.0), th.text_muted))
+                .child(
                     div()
                         .flex_1()
                         .min_w_0()
-                        .text_xs()
-                        .text_color(th.text_muted)
+                        .font_family(MONO)
+                        .text_size(px(12.0))
+                        .text_color(th.text)
                         .whitespace_nowrap()
                         .overflow_hidden()
-                        .child(SharedString::from(d)),
+                        .child(SharedString::from(q)),
+                )
+                .child(
+                    div()
+                        .id(("history-del", i))
+                        .flex_none()
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.remove_history(&del, cx);
+                        }))
+                        .child(icon(Icon::X, px(12.0), th.text_muted)),
+                )
+        });
+
+        div()
+            .id("history-list")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_3()
+                    .py(px(6.0))
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(th.text_muted)
+                            .child("RECENT"),
+                    )
+                    .child(
+                        div()
+                            .id("history-clear-all")
+                            .cursor_pointer()
+                            .text_size(px(10.0))
+                            .text_color(th.text_muted)
+                            .hover(|el| el.text_color(th.text))
+                            .on_click(cx.listener(|this, _, _, cx| this.clear_history(cx)))
+                            .child("Clear all"),
+                    ),
+            )
+            .children(rows)
+            .into_any_element()
+    }
+
+    // ---- 3. kind filter chips --------------------------------------------
+
+    fn render_kind_chips(&self, th: Theme, cx: &mut Context<Self>) -> AnyElement {
+        let chips = KIND_ORDER
+            .into_iter()
+            .filter(|(k, _)| self.kind_counts.get(k).copied().unwrap_or(0) > 0)
+            .map(|(kind, label)| {
+                let active = self.kind_filter.contains(&kind);
+                let tone = th.kind_color(kind);
+                let count = self.kind_counts.get(&kind).copied().unwrap_or(0);
+                div()
+                    .id(label)
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .rounded_full()
+                    .border_1()
+                    .px_2()
+                    .py(px(2.0))
+                    .text_size(px(10.0))
+                    .cursor_pointer()
+                    .border_color(if active { transparent_black() } else { th.card_border })
+                    .when(active, |el| el.bg(tone.opacity(0.1)).text_color(tone))
+                    .when(!active, |el| el.text_color(th.text_muted))
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_kind(kind, cx)))
+                    .child(SharedString::from(label))
+                    .child(
+                        div()
+                            .font_family(MONO)
+                            .text_size(px(9.0))
+                            .text_color(if active { tone } else { th.text_muted.opacity(0.7) })
+                            .child(SharedString::from(count.to_string())),
+                    )
+            });
+
+        div()
+            .flex_none()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_1()
+            .px_3()
+            .py(px(6.0))
+            .border_b_1()
+            .border_color(th.panel_border)
+            .children(chips)
+            .when(!self.kind_filter.is_empty(), |el| {
+                el.child(
+                    div()
+                        .id("kind-clear")
+                        .ml_auto()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .rounded_full()
+                        .px(px(6.0))
+                        .py(px(2.0))
+                        .text_size(px(10.0))
+                        .text_color(th.text_muted)
+                        .cursor_pointer()
+                        .hover(|el| el.text_color(th.text))
+                        .on_click(cx.listener(|this, _, _, cx| this.clear_kind_filter(cx)))
+                        .child(icon(Icon::X, px(10.0), th.text_muted))
+                        .child("Clear"),
                 )
             })
+            .into_any_element()
+    }
+
+    // ---- 4. results list --------------------------------------------------
+
+    fn render_results(&self, th: Theme, cx: &mut Context<Self>) -> AnyElement {
+        let rows = self
+            .filtered
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(i, ri)| self.render_result_row(i, ri, th, cx))
+            .collect::<Vec<_>>();
+        let empty = rows.is_empty();
+
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .when(!self.results.is_empty(), |el| {
+                el.child(self.render_kind_chips(th, cx))
+            })
+            .child(
+                div()
+                    .id("results")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.results_scroll)
+                    .when(empty, |el| {
+                        el.child(
+                            div()
+                                .p(px(24.0))
+                                .text_center()
+                                .text_size(px(12.0))
+                                .text_color(th.text_muted)
+                                .child("No results"),
+                        )
+                    })
+                    .children(rows),
+            )
+            .into_any_element()
+    }
+
+    fn render_result_row(
+        &self,
+        ix: usize,
+        ri: usize,
+        th: Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let r = &self.results[ri];
+        let selected = ix == self.active;
+
+        // Line 1: kind badge · name · raw return type.
+        let name_block = match &r.field_name {
+            Some(field) => div()
+                .flex()
+                .flex_1()
+                .min_w_0()
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(th.text_muted)
+                        .child(highlighted(
+                            &r.type_name,
+                            r.type_match_indices.as_deref().unwrap_or(&[]),
+                            th.primary,
+                        )),
+                )
+                .child(div().flex_none().text_color(th.text_muted).child("."))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(th.text)
+                        .child(highlighted(field, &r.match_indices, th.primary)),
+                ),
+            None => div()
+                .flex()
+                .flex_1()
+                .min_w_0()
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(th.text)
+                        .child(highlighted(&r.type_name, &r.match_indices, th.primary)),
+                ),
+        };
+
+        let line1 = div()
+            .w_full()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(kind_badge(th, r.type_kind, kind_label(r.type_kind)))
+            .child(name_block)
+            .when_some(r.field_type.clone(), |el, ft| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .text_size(px(10.0))
+                        .text_color(th.text_muted)
+                        .child(SharedString::from(ft)),
+                )
+            });
+
+        // Line 2: the prose snippet, tagged by which prose field matched.
+        let line2 = r.snippet.as_ref().map(|s| {
+            let deprecated = r.snippet_kind == Some(SnippetKind::DeprecationReason);
+            let (tag_bg, tag_fg, tag) = if deprecated {
+                (th.type_amber.opacity(0.15), th.type_amber, "deprecated")
+            } else {
+                (th.active_bg, th.text_muted, "desc")
+            };
+            div()
+                .flex()
+                .min_w_0()
+                .items_center()
+                .gap_1()
+                .pl(px(4.0))
+                .text_size(px(10.0))
+                .text_color(th.text_muted)
+                .child(
+                    div()
+                        .flex_none()
+                        .rounded(px(4.0))
+                        .px(px(4.0))
+                        .py(px(1.0))
+                        .text_size(px(9.0))
+                        .bg(tag_bg)
+                        .text_color(tag_fg)
+                        .child(tag),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .italic()
+                        .whitespace_nowrap()
+                        .overflow_hidden()
+                        .child(highlighted(&s.snippet, &s.indices, th.primary)),
+                )
+        });
+
+        div()
+            .id(("result", ix))
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .px_3()
+            .py(px(6.0))
+            .font_family(MONO)
+            .text_size(px(12.0))
+            .cursor_pointer()
+            .when(selected, |el| el.bg(th.active_bg))
+            .hover(|el| el.bg(th.hover_bg))
+            .on_click(cx.listener(move |this, _, _, cx| this.select_result(ix, cx)))
+            .child(line1)
+            .children(line2)
+            .into_any_element()
+    }
+
+    // ---- 5. root type selector -------------------------------------------
+
+    fn render_roots(&self, th: Theme, cx: &mut Context<Self>) -> AnyElement {
+        let label: SharedString = if self.model.schema_name.is_empty() {
+            "Schema".into()
+        } else {
+            self.model.schema_name.clone().into()
+        };
+        let buttons = self.model.roots.iter().enumerate().map(|(i, &card)| {
+            let name = self.model.cards[card as usize].name.clone();
+            let active = self.root_pick.as_ref() == Some(&name);
+            let pick = name.clone();
+            div()
+                .id(("root", i))
+                .rounded(px(4.0))
+                .px_2()
+                .py_1()
+                .font_family(MONO)
+                .text_size(px(12.0))
+                .cursor_pointer()
+                .when(active, |el| el.bg(th.primary).text_color(th.primary_fg))
+                .when(!active, |el| el.bg(th.active_bg).text_color(th.text_muted))
+                .on_click(cx.listener(move |this, _, _, cx| this.pick_root(pick.clone(), cx)))
+                .child(name)
+        });
+
+        div()
+            .flex_none()
+            .p_3()
+            .border_b_1()
+            .border_color(th.panel_border)
+            .child(
+                div()
+                    .mb(px(4.0))
+                    .text_size(px(10.0))
+                    .text_color(th.text_muted)
+                    .child(label),
+            )
+            .child(div().flex().flex_wrap().gap_1().children(buttons))
+            .into_any_element()
+    }
+
+    // ---- 6. "All types" ---------------------------------------------------
+
+    fn render_all_types(&self, th: Theme, cx: &mut Context<Self>) -> AnyElement {
+        if self.all_sorted.is_empty() {
+            return div().into_any_element();
+        }
+        let open = self.all_types_open;
+        let count = self.all_sorted.len();
+        let mut section = div()
+            .flex_none()
+            .border_b_1()
+            .border_color(th.panel_border)
+            .child(
+                div()
+                    .id("all-types-toggle")
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_3()
+                    .py_2()
+                    .text_size(px(10.0))
+                    .text_color(th.text_muted)
+                    .cursor_pointer()
+                    .hover(|el| el.bg(th.hover_bg))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.all_types_open = !this.all_types_open;
+                        cx.notify();
+                    }))
+                    .child(icon(
+                        if open { Icon::ChevronDown } else { Icon::ChevronRight },
+                        px(12.0),
+                        th.text_muted,
+                    ))
+                    .child(SharedString::from(format!("All types ({count})"))),
+            );
+
+        if open {
+            section = section.child(
+                uniform_list(
+                    "all-types",
+                    count,
+                    cx.processor(|this, range: std::ops::Range<usize>, window, cx| {
+                        let th = crate::theme::current(cx, window.appearance());
+                        range
+                            .map(|ix| {
+                                let card = this.all_sorted[ix];
+                                this.type_row("all-type", ix, card, &[], th, cx)
+                            })
+                            .collect::<Vec<_>>()
+                    }),
+                )
+                .h(px((count as f32 * LIST_ROW_H).min(LIST_MAX_H)))
+                .border_t_1()
+                .border_color(th.panel_border),
+            );
+        }
+        section.into_any_element()
+    }
+
+    // ---- 7. context sections ----------------------------------------------
+
+    fn render_sections(&self, th: Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut out = Vec::new();
+        if !self.implementers.is_empty() {
+            out.push(self.render_section(
+                "implemented-by",
+                format!("Implemented by ({})", self.implementers.len()),
+                self.implementers.len(),
+                th,
+                cx.processor(|this, range: std::ops::Range<usize>, window, cx| {
+                    let th = crate::theme::current(cx, window.appearance());
+                    range
+                        .map(|ix| {
+                            let (card, chips) = this.implementers[ix].clone();
+                            this.type_row("impl-row", ix, card, &chips, th, cx)
+                        })
+                        .collect::<Vec<_>>()
+                }),
+            ));
+        }
+        if !self.union_members.is_empty() {
+            out.push(self.render_section(
+                "members",
+                format!("Members ({})", self.union_members.len()),
+                self.union_members.len(),
+                th,
+                cx.processor(|this, range: std::ops::Range<usize>, window, cx| {
+                    let th = crate::theme::current(cx, window.appearance());
+                    range
+                        .map(|ix| {
+                            let (card, chips) = this.union_members[ix].clone();
+                            this.type_row("member-row", ix, card, &chips, th, cx)
+                        })
+                        .collect::<Vec<_>>()
+                }),
+            ));
+        }
+        if !self.referenced_by.is_empty() {
+            out.push(self.render_section(
+                "referenced-by",
+                format!("Referenced by ({})", self.referenced_by.len()),
+                self.referenced_by.len(),
+                th,
+                cx.processor(|this, range: std::ops::Range<usize>, window, cx| {
+                    let th = crate::theme::current(cx, window.appearance());
+                    range
+                        .map(|ix| {
+                            let (card, chips) = this.referenced_by[ix].clone();
+                            this.type_row("ref-row", ix, card, &chips, th, cx)
+                        })
+                        .collect::<Vec<_>>()
+                }),
+            ));
+        }
+        out
+    }
+
+    fn render_section<R: IntoElement>(
+        &self,
+        id: &'static str,
+        title: String,
+        count: usize,
+        th: Theme,
+        items: impl 'static + Fn(std::ops::Range<usize>, &mut Window, &mut App) -> Vec<R>,
+    ) -> AnyElement {
+        div()
+            .flex_none()
+            .border_b_1()
+            .border_color(th.panel_border)
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_3()
+                    .py_2()
+                    .text_size(px(10.0))
+                    .text_color(th.text_muted)
+                    .child(SharedString::from(title)),
+            )
+            .child(
+                uniform_list(id, count, items)
+                    .h(px((count as f32 * LIST_ROW_H).min(LIST_MAX_H)))
+                    .border_t_1()
+                    .border_color(th.panel_border),
+            )
+            .into_any_element()
+    }
+
+    /// A capped-list row: kind badge, truncated name, trailing chips.
+    fn type_row(
+        &self,
+        ns: &'static str,
+        ix: usize,
+        card: u32,
+        chips: &[SharedString],
+        th: Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let c = &self.model.cards[card as usize];
+        let selected = self.selected == Some(card);
+        let badge = kind_badge(th, c.kind, c.kind_label);
+        let badge = if selected {
+            badge.bg(th.primary_fg.opacity(0.2)).text_color(th.primary_fg)
+        } else {
+            badge
+        };
+        let chip_els = chips
+            .iter()
+            .cloned()
+            .map(|label| {
+                div()
+                    .flex_none()
+                    .rounded(px(4.0))
+                    .px(px(4.0))
+                    .py(px(1.0))
+                    .text_size(px(9.0))
+                    .bg(if selected { th.primary_fg.opacity(0.2) } else { th.active_bg })
+                    .text_color(if selected { th.primary_fg } else { th.text_muted })
+                    .child(label)
+            })
+            .collect::<Vec<_>>();
+        let has_chips = !chip_els.is_empty();
+
+        div()
+            .id((ns, ix))
+            .w_full()
+            .h(px(LIST_ROW_H))
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_1()
+            .font_family(MONO)
+            .text_size(px(12.0))
+            .cursor_pointer()
+            .when(selected, |el| el.bg(th.primary).text_color(th.primary_fg))
+            .when(!selected, |el| {
+                el.text_color(th.text).hover(|el| el.bg(th.hover_bg))
+            })
+            .on_click(cx.listener(move |this, _, _, cx| this.select_card(card, None, cx)))
+            .child(badge)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .child(c.name.clone()),
+            )
+            .when(has_chips, |el| {
+                el.child(
+                    div()
+                        .ml_auto()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .gap_1()
+                        .children(chip_els),
+                )
+            })
+            .into_any_element()
+    }
+
+    // ---- 8. TypeDetail -----------------------------------------------------
+
+    fn render_detail(&self, th: Theme, cx: &mut Context<Self>) -> AnyElement {
+        let pane = div().id("type-detail").flex_1().min_h_0().overflow_y_scroll();
+        let Some(card) = self.selected else {
+            return pane
+                .child(
+                    div()
+                        .p(px(24.0))
+                        .text_center()
+                        .text_size(px(12.0))
+                        .text_color(th.text_muted)
+                        .child("Select a type to start exploring."),
+                )
+                .into_any_element();
+        };
+        let c = &self.model.cards[card as usize];
+
+        // The implements band becomes clickable interface buttons.
+        let iface_row = (!c.implements.is_empty()).then(|| {
+            let buttons = c.implements.iter().cloned().enumerate().map(|(i, name)| {
+                let navigable = self.is_navigable(&name);
+                let target = self.model.index_of.get(name.as_ref()).copied();
+                div()
+                    .id(("iface", i))
+                    .rounded(px(4.0))
+                    .px(px(6.0))
+                    .py(px(2.0))
+                    .font_family(MONO)
+                    .when(navigable, |el| {
+                        el.cursor_pointer().bg(th.active_bg).hover(|el| el.bg(th.hover_bg))
+                    })
+                    .when(!navigable, |el| el.opacity(0.6))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(t) = target {
+                            this.select_card(t, None, cx);
+                        }
+                    }))
+                    .child(name)
+            });
+            div()
+                .mb_3()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_1()
+                .text_size(px(11.0))
+                .text_color(th.text_muted)
+                .child("implements")
+                .children(buttons)
+        });
+
+        // Body: one row per field / enum value / union member.
+        let body: Vec<AnyElement> = if c.rows.is_empty() {
+            let empty = if c.kind == NodeKind::Enum { "no values" } else { "no fields" };
+            vec![div()
+                .px_2()
+                .py_1()
+                .italic()
+                .text_color(th.text_muted)
+                .child(empty)
+                .into_any_element()]
+        } else {
+            (0..c.rows.len())
+                .map(|i| self.render_field_row(card, i, th, cx))
+                .collect()
+        };
+
+        pane.child(
+            div()
+                .p_3()
+                .child(
+                    div()
+                        .mb_2()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            kind_badge(th, c.kind, c.kind_label)
+                                .px(px(8.0))
+                                .py(px(2.0))
+                                .text_size(px(12.0)),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .whitespace_nowrap()
+                                .overflow_hidden()
+                                .font_family(MONO)
+                                .text_size(px(14.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(th.text)
+                                .child(c.name.clone()),
+                        ),
+                )
+                .when_some(c.description.clone(), |el, d| {
+                    el.child(
+                        div()
+                            .mb_3()
+                            .text_size(px(12.0))
+                            .text_color(th.text_muted)
+                            .child(SharedString::from(d)),
+                    )
+                })
+                .children(iface_row)
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .font_family(MONO)
+                        .text_size(px(12.0))
+                        .children(body),
+                ),
+        )
+        .into_any_element()
+    }
+
+    fn render_field_row(
+        &self,
+        card: u32,
+        dix: usize,
+        th: Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let c = &self.model.cards[card as usize];
+        let row = &c.rows[dix];
+        let expired = row.until_expired;
+        let deprecated = row.deprecated;
+        let pinned = self.pinned == Some((card, dix));
+        let is_member = row.kind == RowKind::UnionMember;
+        let target = row.target;
+        let navigable = target.is_some();
+        // Graph row index — the canvas maps it back through `row_map`.
+        let graph_row = c.row_map.iter().position(|&m| m == Some(dix as u32));
+
+        let label: SharedString = if is_member {
+            format!("| {}", row.left).into()
+        } else {
+            row.left.clone()
+        };
+
+        // Line 1, left: field name (+ arity badge).
+        let left = div()
+            .flex()
+            .min_w_0()
+            .items_center()
+            .gap_1()
+            .child(
+                div()
+                    .min_w_0()
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .text_color(if expired { th.red } else { th.text })
+                    .when(deprecated, |el| el.line_through())
+                    .child(label),
+            )
+            .when(!row.args.is_empty(), |el| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .text_size(px(10.0))
+                        .text_color(th.text_muted)
+                        .child(SharedString::from(format!(
+                            "({}/{})",
+                            row.required_args,
+                            row.args.len()
+                        ))),
+                )
+            });
+
+        // Line 1, right: the return type chip.
+        let mut chip = div()
+            .id(("field-type", dix))
+            .flex()
+            .min_w_0()
+            .items_center()
+            .gap(px(2.0))
+            .rounded(px(4.0))
+            .when(row.is_relay, |el| {
+                el.child(icon(Icon::Link2, px(10.0), th.relay_orange))
+            });
+        if !row.right.is_empty() {
+            chip = chip.child(
+                div()
+                    .min_w_0()
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .text_color(th.type_amber)
+                    .child(row.right.clone()),
+            );
+        }
+        if navigable {
+            chip = chip
+                .cursor_pointer()
+                .hover(|el| el.bg(th.primary.opacity(0.15)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    if let Some(t) = target {
+                        this.select_card(t, None, cx);
+                    }
+                }))
+                .child(icon(Icon::ChevronRight, px(12.0), th.text_muted));
+        }
+
+        let line1 = div()
+            .w_full()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .child(left)
+            .child(div().flex().min_w_0().items_center().justify_end().child(chip));
+
+        // Line 2: the deprecation note. Line 3: the description.
+        let note = deprecated.then(|| {
+            let text: SharedString = row
+                .deprecation_reason
+                .clone()
+                .map(SharedString::from)
+                .unwrap_or_else(|| "Deprecated".into());
+            let tone = if expired { th.red } else { th.type_amber };
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .text_size(px(11.0))
+                .text_color(tone)
+                .child(icon(Icon::TriangleAlert, px(10.0), tone))
+                .child(text)
+        });
+        let desc = row.description.clone().map(|d| {
+            div()
+                .text_size(px(11.0))
+                .text_color(th.text_muted)
+                .child(SharedString::from(d))
+        });
+
+        div()
+            .id(("field", dix))
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .rounded(px(4.0))
+            .px_2()
+            .py_1()
+            .border_1()
+            .border_color(if pinned { th.pin } else { transparent_black() })
+            .cursor_pointer()
+            .when(pinned, |el| el.bg(th.pin.opacity(0.1)))
+            .when(!pinned && expired, |el| el.bg(th.red.opacity(0.1)))
+            .when(!pinned && !expired && deprecated, |el| {
+                el.bg(th.type_amber.opacity(0.1)).opacity(0.6)
+            })
+            .hover(|el| el.bg(th.hover_bg))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if is_member {
+                    if let Some(t) = target {
+                        this.select_card(t, None, cx);
+                    }
+                } else {
+                    this.select_card(card, graph_row, cx);
+                }
+            }))
+            .child(line1)
+            .children(note)
+            .children(desc)
+            .into_any_element()
     }
 }
-
-const ROW_H: f32 = 26.0;
 
 /// Merge sorted char indices into byte ranges over `text`.
 fn char_byte_ranges(text: &str, char_idxs: &[usize]) -> Vec<std::ops::Range<usize>> {
@@ -305,6 +1262,32 @@ fn char_byte_ranges(text: &str, char_idxs: &[usize]) -> Vec<std::ops::Range<usiz
     out
 }
 
+/// Fuzzy-match highlight: matched chars bold in `color`, no background.
+fn highlighted(text: &str, char_idxs: &[usize], color: Hsla) -> AnyElement {
+    if char_idxs.is_empty() {
+        return SharedString::from(text.to_owned()).into_any_element();
+    }
+    let ranges = char_byte_ranges(text, char_idxs);
+    let style = HighlightStyle {
+        color: Some(color),
+        font_weight: Some(FontWeight::BOLD),
+        ..Default::default()
+    };
+    StyledText::new(text.to_owned())
+        .with_highlights(ranges.into_iter().map(|r| (r, style)))
+        .into_any_element()
+}
+
+fn sorted_cards(model: &Model) -> Vec<u32> {
+    let mut all: Vec<u32> = (0..model.cards.len() as u32).collect();
+    all.sort_by(|&a, &b| model.cards[a as usize].name.cmp(&model.cards[b as usize].name));
+    all
+}
+
+fn first_root(model: &Model) -> Option<SharedString> {
+    model.roots.first().map(|&r| model.cards[r as usize].name.clone())
+}
+
 impl EventEmitter<TreeEvent> for TreePanel {}
 
 impl Focusable for TreePanel {
@@ -317,214 +1300,33 @@ impl Render for TreePanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let th = crate::theme::current(cx, window.appearance());
         let focused = self.focus.is_focused(window);
-        let count = self.item_count();
-        let query_display: SharedString = if self.query.is_empty() {
-            "Search types…  (⌘K)".into()
-        } else {
-            self.query.clone().into()
-        };
+        let query_empty = self.query.trim().is_empty();
+        // The web hides the tree while the recent list is showing.
+        let show_history = focused && query_empty && !self.search_history.is_empty();
 
-        div()
+        let mut root = div()
             .flex()
             .flex_col()
             .size_full()
+            .min_h_0()
             .bg(th.panel)
             .border_r_1()
             .border_color(th.panel_border)
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key_down))
-            .child(
-                div()
-                    .m_2()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(if focused { th.accent } else { th.card_border })
-                    .bg(th.input_bg)
-                    .text_sm()
-                    .font_family("Menlo")
-                    .text_color(if self.query.is_empty() {
-                        th.text_faint
-                    } else {
-                        th.text
-                    })
-                    .whitespace_nowrap()
-                    .overflow_hidden()
-                    .child(query_display),
-            )
-            .child(
-                div()
-                    .px_3()
-                    .pb_1()
-                    .text_xs()
-                    .text_color(th.text_faint)
-                    .child(SharedString::from(if self.query.is_empty() {
-                        format!("All types · {count}")
-                    } else {
-                        format!("{count} results")
-                    })),
-            )
-            .when(self.query.is_empty() && !self.search_history.is_empty(), |el| {
-                el.child(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .gap_1()
-                        .px_2()
-                        .pb_1()
-                        .children(self.search_history.iter().take(6).cloned().enumerate().map(
-                            |(i, q)| {
-                                let label = q.clone();
-                                div()
-                                    .id(("hist", i))
-                                    .px_2()
-                                    .py(px(2.0))
-                                    .rounded_full()
-                                    .border_1()
-                                    .border_color(th.card_border)
-                                    .text_xs()
-                                    .font_family("Menlo")
-                                    .text_color(th.text_muted)
-                                    .cursor_pointer()
-                                    .hover(|el| el.bg(th.hover_bg))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.set_query(q.clone(), cx)
-                                    }))
-                                    .child(SharedString::from(label))
-                            },
-                        )),
-                )
-            })
-            .when(!self.query.is_empty(), |el| {
-                el.child(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .gap_1()
-                        .px_2()
-                        .pb_1()
-                        .children(KIND_CHIPS.map(|(kind, label)| {
-                            let active = self.kind_filter.contains(&kind);
-                            div()
-                                .id(label)
-                                .px_2()
-                                .py(px(2.0))
-                                .rounded_full()
-                                .cursor_pointer()
-                                .border_1()
-                                .border_color(if active { th.kind_color(kind) } else { th.card_border })
-                                .when(active, |el| el.bg(th.hover_bg))
-                                .text_xs()
-                                .text_color(th.kind_color(kind))
-                                .on_click(cx.listener(move |this, _, _, cx| this.toggle_kind(kind, cx)))
-                                .child(SharedString::from(label))
-                        })),
-                )
-            })
-            .child(
-                uniform_list(
-                    "tree-items",
-                    count,
-                    cx.processor(|this, range: std::ops::Range<usize>, window, cx| {
-                        let th = crate::theme::current(cx, window.appearance());
-                        range.map(|ix| this.render_row(ix, th, cx)).collect::<Vec<_>>()
-                    }),
-                )
-                .flex_1()
-                .track_scroll(&self.scroll),
-            )
-            .when_some(self.selected, |el, card| {
-                let c = &self.model.cards[card as usize];
-                let refs = self.referenced_by.clone();
-                let desc = c.description.clone();
-                el.child(
-                    div()
-                        .flex_none()
-                        .max_h(px(320.0))
-                        .border_t_1()
-                        .border_color(th.panel_border)
-                        .flex()
-                        .flex_col()
-                        .child(
-                            div()
-                                .px_3()
-                                .pt_2()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .child(div().size(px(7.0)).rounded_full().bg(th.kind_color(c.kind)).flex_none())
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_family("Menlo")
-                                        .text_color(th.text)
-                                        .child(c.name.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(th.kind_color(c.kind))
-                                        .child(SharedString::from(c.kind_label)),
-                                ),
-                        )
-                        .when_some(desc, |el, d| {
-                            el.child(
-                                div()
-                                    .px_3()
-                                    .pt_1()
-                                    .text_xs()
-                                    .text_color(th.text_muted)
-                                    .max_h(px(80.0))
-                                    .overflow_hidden()
-                                    .child(SharedString::from(d)),
-                            )
-                        })
-                        .child(
-                            div()
-                                .px_3()
-                                .pt_2()
-                                .pb_1()
-                                .text_xs()
-                                .text_color(th.text_faint)
-                                .child(SharedString::from(format!(
-                                    "Referenced by · {}",
-                                    refs.len()
-                                ))),
-                        )
-                        .child(
-                            uniform_list(
-                                "referenced-by",
-                                refs.len(),
-                                cx.processor(move |this: &mut Self, range: std::ops::Range<usize>, _w, cx| {
-                                    range
-                                        .map(|ix| {
-                                            let (src, label) = this.referenced_by[ix].clone();
-                                            div()
-                                                .id(ix)
-                                                .w_full()
-                                                .px_3()
-                                                .h(px(22.0))
-                                                .flex()
-                                                .items_center()
-                                                .cursor_pointer()
-                                                .hover(|el| el.bg(th.hover_bg))
-                                                .text_xs()
-                                                .font_family("Menlo")
-                                                .text_color(th.text_muted)
-                                                .whitespace_nowrap()
-                                                .overflow_hidden()
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.select_card(src, None, cx)
-                                                }))
-                                                .child(label)
-                                        })
-                                        .collect::<Vec<_>>()
-                                }),
-                            )
-                            .h(px((refs.len() as f32 * 22.0).min(176.0))),
-                        ),
-                )
-            })
+            .child(self.render_search(th, focused, cx));
+
+        if show_history {
+            root = root.child(self.render_history(th, cx));
+        } else if !query_empty {
+            root = root.child(self.render_results(th, cx));
+        } else {
+            root = root
+                .child(self.render_roots(th, cx))
+                .child(self.render_all_types(th, cx))
+                .children(self.render_sections(th, cx))
+                .child(self.render_detail(th, cx));
+        }
+        root
     }
 }

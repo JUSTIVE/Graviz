@@ -22,6 +22,19 @@ pub fn load(
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| schema_path.display().to_string());
+    let loaded = load_sdl(&sdl, name, overlay_sdl, hide_relay)?;
+    crate::config::push_recent(schema_path);
+    Ok(loaded)
+}
+
+/// Same pipeline, but from SDL already in memory (pasted into the landing
+/// editor). Warnings from the base parse are surfaced for the banner.
+pub fn load_sdl(
+    sdl: &str,
+    name: String,
+    overlay_sdl: Option<&str>,
+    hide_relay: bool,
+) -> Result<LoadedSchema> {
 
     let base_options = SdlToGraphOptions {
         hide_relay_boilerplate: hide_relay,
@@ -62,7 +75,6 @@ pub fn load(
         applied_diff = Some(diff);
     }
 
-    crate::config::push_recent(schema_path);
     Ok(LoadedSchema { graph, name, diff: applied_diff })
 }
 

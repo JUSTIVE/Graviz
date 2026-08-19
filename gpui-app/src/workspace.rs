@@ -9,6 +9,7 @@ use crate::config;
 use crate::editor::{EditorEvent, TextArea};
 use crate::loader;
 use crate::model::{build_model, root_candidates, slice_graph, Mode, Model, ModelOptions};
+use crate::panels::{OrphanPanel, PanelEvent, UntilPanel};
 use crate::icons::{icon, Icon};
 use crate::theme::Theme;
 use crate::tree::{TreeEvent, TreePanel};
@@ -64,6 +65,8 @@ pub struct Workspace {
     investigate: bool,
     root_override: Option<String>,
     tree: Entity<TreePanel>,
+    orphan_panel: Entity<OrphanPanel>,
+    until_panel: Entity<UntilPanel>,
     canvas: Entity<GraphCanvas>,
     overlay_editor: Entity<TextArea>,
     sidebar_open: bool,
@@ -104,7 +107,13 @@ impl Workspace {
         initial_overlay: Option<String>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let mode = Mode::Reachable;
+        // Debug: GOMPASS_MODE=orphaned|deprecated opens on that tab so
+        // selfshots can verify each sidebar body.
+        let mode = match std::env::var("GOMPASS_MODE").as_deref() {
+            Ok("orphaned") => Mode::Orphaned,
+            Ok("deprecated") => Mode::Deprecated,
+            _ => Mode::Reachable,
+        };
         let settings = config::load_settings();
         let mut options = ModelOptions {
             show_descriptions: settings.show_descriptions,
@@ -124,6 +133,15 @@ impl Workspace {
             &options,
         ));
         let tree = cx.new(|cx| TreePanel::new(model.clone(), cx));
+        // The Orphaned / Deprecated tab bodies work off the FULL graph, since
+        // their whole point is what the reachable slice leaves out.
+        let full_model = Rc::new(build_model(
+            loaded.graph.clone(),
+            loaded.name.clone(),
+            &options,
+        ));
+        let orphan_panel = cx.new(|cx| OrphanPanel::new(full_model.clone(), cx));
+        let until_panel = cx.new(|cx| UntilPanel::new(full_model, cx));
         let canvas = cx.new(|cx| {
             let mut c = GraphCanvas::new(model.clone());
             c.set_investigate(investigate, cx);
@@ -145,8 +163,19 @@ impl Workspace {
                     canvas.navigate_to(node_index as u32, row, cx);
                 });
             }
+            _ => {}
         })
         .detach();
+        for sub in [
+            cx.subscribe(&orphan_panel, |this: &mut Self, _, e: &PanelEvent, cx| {
+                this.on_panel_select(e, cx)
+            }),
+            cx.subscribe(&until_panel, |this: &mut Self, _, e: &PanelEvent, cx| {
+                this.on_panel_select(e, cx)
+            }),
+        ] {
+            sub.detach();
+        }
         cx.subscribe(&overlay_editor, |this: &mut Self, _, event: &EditorEvent, cx| {
             if matches!(event, EditorEvent::Submitted) {
                 this.apply_overlay(cx);
@@ -190,6 +219,8 @@ impl Workspace {
             investigate,
             root_override: None,
             tree,
+            orphan_panel,
+            until_panel,
             canvas,
             overlay_editor,
             sidebar_open,
@@ -203,6 +234,19 @@ impl Workspace {
             highlight_overlay: false,
             orphan_count: counts.0,
             deprecated_count: counts.1,
+        }
+    }
+
+    /// A row click in the Orphaned / Deprecated tab focuses that type.
+    fn on_panel_select(&mut self, event: &PanelEvent, cx: &mut Context<Self>) {
+        let PanelEvent::Select { node_index, row } = event;
+        let (node_index, row) = (*node_index, *row);
+        // Panels index the full graph; map the id into the current slice.
+        let name = self.model.graph.nodes.get(node_index).map(|n| n.id.clone());
+        let card = name.and_then(|n| self.model.index_of.get(&n).copied());
+        if let Some(card) = card {
+            self.canvas
+                .update(cx, |c, cx| c.navigate_to(card, row, cx));
         }
     }
 
@@ -225,6 +269,14 @@ impl Workspace {
         ));
         self.model = model.clone();
         self.tree.update(cx, |tree, cx| tree.set_model(model.clone(), cx));
+        let full_model = Rc::new(build_model(
+            self.full_graph.clone(),
+            self.schema_name.clone(),
+            &self.options,
+        ));
+        self.orphan_panel
+            .update(cx, |p, cx| p.set_model(full_model.clone(), cx));
+        self.until_panel.update(cx, |p, cx| p.set_model(full_model, cx));
         self.canvas.update(cx, |canvas, cx| {
             canvas.set_model(model, cx);
             canvas.set_investigate(self.investigate, cx);
@@ -1280,7 +1332,11 @@ impl Render for Workspace {
                         .border_r_1()
                         .border_color(th.panel_border)
                         .child(tab_row)
-                        .child(div().flex_1().min_h_0().child(self.tree.clone())),
+                        .child(div().flex_1().min_h_0().child(match self.mode {
+                            Mode::Reachable => self.tree.clone().into_any_element(),
+                            Mode::Orphaned => self.orphan_panel.clone().into_any_element(),
+                            Mode::Deprecated => self.until_panel.clone().into_any_element(),
+                        })),
                 )
             })
             .child(

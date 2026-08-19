@@ -2,6 +2,7 @@ mod canvas;
 mod config;
 mod editor;
 mod icons;
+mod landing;
 mod loader;
 mod model;
 mod panels;

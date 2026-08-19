@@ -80,6 +80,15 @@ pub fn push_search(query: &str) {
     write_json("searches.json", &list);
 }
 
+pub fn write_recents(list: &[RecentEntry]) {
+    write_json("recent.json", &list);
+}
+
+/// Replace the persisted list — the sidebar's per-row delete / "Clear all".
+pub fn set_search_history(list: &[String]) {
+    write_json("searches.json", &list.to_vec());
+}
+
 pub fn recents() -> Vec<RecentEntry> {
     read_json("recent.json").unwrap_or_default()
 }

@@ -3,6 +3,8 @@
 //! then the workspace.
 
 use crate::config::{self, RecentEntry};
+use crate::editor::TextArea;
+use crate::landing;
 use crate::loader;
 use crate::workspace::{OpenSchema, Workspace};
 use gpui::{
@@ -17,6 +19,11 @@ pub struct Root {
     error: Option<String>,
     /// "New" tab: show the landing even though a schema is loaded.
     show_landing: bool,
+    editor: Entity<TextArea>,
+    recents_open: bool,
+    warnings: Vec<String>,
+    dragging: bool,
+    schema_name: Option<String>,
 }
 
 impl Root {
@@ -28,11 +35,21 @@ impl Root {
             .map(|(loaded, path, overlay)| cx.new(|cx| Workspace::new(loaded, path, overlay, cx)));
         let mode = config::load_settings().theme_mode;
         crate::theme::set_mode(cx, mode);
+        let editor = cx.new(|cx| {
+            let mut e = TextArea::new(cx);
+            e.placeholder = "# Paste your GraphQL SDL here…";
+            e
+        });
         Self {
             workspace,
             recents: config::recents(),
             error: None,
             show_landing: false,
+            editor,
+            recents_open: false,
+            warnings: Vec::new(),
+            dragging: false,
+            schema_name: None,
         }
     }
 
@@ -48,6 +65,35 @@ impl Root {
                 self.error = Some(format!("{e:#}"));
                 self.recents = config::recents();
             }
+        }
+        cx.notify();
+    }
+
+    /// Parse whatever is in the editor and open the workspace on it.
+    fn visualize(&mut self, cx: &mut Context<Self>) {
+        let sdl = self.editor.read(cx).text().to_string();
+        if sdl.trim().is_empty() {
+            self.error = Some("Paste an SDL or drop a .graphql file.".into());
+            cx.notify();
+            return;
+        }
+        let hide_relay = config::load_settings().hide_relay;
+        let name = self
+            .schema_name
+            .clone()
+            .unwrap_or_else(|| "Pasted schema".to_string());
+        match loader::load_sdl(&sdl, name, None, hide_relay) {
+            Ok(loaded) if loaded.graph.nodes.is_empty() => {
+                self.error = Some("No types found in this SDL.".into());
+            }
+            Ok(loaded) => {
+                self.warnings = loaded.graph.warnings.clone();
+                self.error = None;
+                self.show_landing = false;
+                let path = PathBuf::from("(pasted)");
+                self.workspace = Some(cx.new(|cx| Workspace::new(loaded, path, None, cx)));
+            }
+            Err(e) => self.error = Some(format!("{e:#}")),
         }
         cx.notify();
     }
@@ -103,100 +149,44 @@ impl Render for Root {
         let body: gpui::AnyElement = if let (Some(ws), false) = (&self.workspace, self.show_landing) {
             div().flex_1().min_h_0().child(ws.clone()).into_any_element()
         } else {
-            let recents = self.recents.clone();
-            let error = self.error.clone();
-            div()
-                .flex_1()
-                .min_h_0()
-                .bg(th.bg)
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(
-                    div()
-                        .w(px(460.0))
-                        .flex()
-                        .flex_col()
-                        .gap_3()
-                        .child(
-                            div()
-                                .text_2xl()
-                                .font_family("Menlo")
-                                .text_color(th.text)
-                                .child("GompassQL"),
-                        )
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(th.text_muted)
-                                .child("GraphQL schema visualizer"),
-                        )
-                        .child(
-                            div()
-                                .id("open")
-                                .mt_2()
-                                .px_4()
-                                .py_2()
-                                .rounded_md()
-                                .bg(th.active_bg)
-                                .text_color(th.text)
-                                .text_sm()
-                                .cursor_pointer()
-                                .hover(|el| el.bg(th.hover_bg))
-                                .on_click(cx.listener(|this, _, _, cx| this.open_dialog(cx)))
-                                .child("Open schema…   ⌘O   (or drop a .graphql file)"),
-                        )
-                        .when_some(error, |el, e| {
-                            el.child(
-                                div().text_sm().text_color(th.red).child(SharedString::from(e)),
-                            )
-                        })
-                        .when(!recents.is_empty(), |el| {
-                            el.child(
-                                div()
-                                    .mt_4()
-                                    .text_xs()
-                                    .text_color(th.text_faint)
-                                    .child("Recent"),
-                            )
-                            .children(recents.into_iter().enumerate().map(|(i, r)| {
-                                let path = PathBuf::from(r.path.clone());
-                                div()
-                                    .id(i)
-                                    .w_full()
-                                    .px_3()
-                                    .py_1()
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .hover(|el| el.bg(th.hover_bg))
-                                    .flex()
-                                    .gap_2()
-                                    .items_center()
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.open_path(path.clone(), cx)
-                                    }))
-                                    .child(
-                                        div()
-                                            .flex_none()
-                                            .text_sm()
-                                            .font_family("Menlo")
-                                            .text_color(th.text)
-                                            .child(SharedString::from(r.name)),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .text_xs()
-                                            .text_color(th.text_faint)
-                                            .whitespace_nowrap()
-                                            .overflow_hidden()
-                                            .child(SharedString::from(r.path)),
-                                    )
-                            }))
-                        }),
-                )
-                .into_any_element()
+            landing::view(
+                landing::LandingProps {
+                    th,
+                    editor: &self.editor,
+                    recents: &self.recents,
+                    recents_open: self.recents_open,
+                    schema_name: self.schema_name.as_deref(),
+                    error: self.error.as_deref(),
+                    warnings: &self.warnings,
+                    dragging: self.dragging,
+                },
+                |this: &mut Self, _w, cx| this.open_dialog(cx),
+                |this: &mut Self, _w, cx| {
+                    this.editor
+                        .update(cx, |e, cx| e.set_text(landing::SAMPLE_SDL.to_string(), cx));
+                    this.schema_name = Some("Sample blog schema".into());
+                    this.error = None;
+                    cx.notify();
+                },
+                |this: &mut Self, _w, cx| this.visualize(cx),
+                |this: &mut Self, _w, cx| {
+                    this.recents_open = !this.recents_open;
+                    cx.notify();
+                },
+                |this: &mut Self, _w, cx| {
+                    config::write_recents(&[]);
+                    this.recents = config::recents();
+                    cx.notify();
+                },
+                |this: &mut Self, path, _w, cx| this.open_path(path, cx),
+                |this: &mut Self, path, _w, cx| {
+                    landing::remove_recent(&path);
+                    this.recents = config::recents();
+                    cx.notify();
+                },
+                cx,
+            )
+            .into_any_element()
         };
 
         div()
