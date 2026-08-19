@@ -11,8 +11,18 @@ pub struct Settings {
     pub hide_primitive_fields: bool,
     pub hide_relay: bool,
     pub sidebar_open: bool,
+    pub sidebar_width: f32,
+    pub dock_height: f32,
     pub theme_mode: crate::theme::ThemeMode,
 }
+
+/// Drag limits for the two resizable panes, matching the web's clamps.
+pub const SIDEBAR_MIN_W: f32 = 260.0;
+pub const SIDEBAR_MAX_W: f32 = 720.0;
+pub const SIDEBAR_DEFAULT_W: f32 = 340.0;
+pub const DOCK_MIN_H: f32 = 160.0;
+pub const DOCK_MAX_H: f32 = 720.0;
+pub const DOCK_DEFAULT_H: f32 = 280.0;
 
 impl Default for Settings {
     fn default() -> Self {
@@ -22,6 +32,8 @@ impl Default for Settings {
             hide_primitive_fields: false,
             hide_relay: true,
             sidebar_open: true,
+            sidebar_width: SIDEBAR_DEFAULT_W,
+            dock_height: DOCK_DEFAULT_H,
             theme_mode: crate::theme::ThemeMode::System,
         }
     }

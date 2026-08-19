@@ -78,8 +78,8 @@ pub struct GraphCanvas {
     last_sample: Rc<Cell<Option<std::time::Instant>>>,
     /// Cursor position in canvas-local coords, for tooltip placement.
     hover_pos: Option<(f32, f32)>,
-    /// Focus history for back navigation (⌘[).
-    history: Vec<u32>,
+    /// Focus history for back navigation (⌘[) and the Recent list.
+    history: Vec<HistoryItem>,
     /// Skip the history push for the next `center_on` (set by `go_back`).
     suppress_push: bool,
     /// Investigate mode: outline types/rows lacking descriptions.
@@ -87,9 +87,32 @@ pub struct GraphCanvas {
     highlight_overlay: bool,
     /// Edge under the cursor (when no card is hovered).
     hovered_edge: Option<u32>,
+    /// Edge pinned by a click. Unlike a hover this survives mouse movement:
+    /// the whole picture dims against it and a card naming both ends sits at
+    /// the bottom of the canvas until it is cleared.
+    focused_edge: Option<u32>,
+    /// Edge to re-frame on the next paint (needs the viewport size).
+    pending_edge: Option<u32>,
+    /// When the focused card last changed — bounds the ring ripple.
+    focus_changed_at: Option<std::time::Instant>,
     /// Horizontal window-space offset of the canvas pane (sidebar width),
     /// set by the workspace so fit/center math uses the pane, not the window.
     pane_offset_x: f32,
+}
+
+/// One stop in the navigation history: a type card, or an edge between two.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum HistoryItem {
+    Card(u32),
+    Edge(u32),
+}
+
+/// A rendered Recent-list row.
+pub struct RecentEntry {
+    pub item: HistoryItem,
+    pub kind: gompass_core::graph::NodeKind,
+    pub kind_label: &'static str,
+    pub label: SharedString,
 }
 
 impl GraphCanvas {
@@ -105,6 +128,8 @@ impl GraphCanvas {
                 _ => None,
             }
         });
+        let debug_edge: Option<u32> =
+            std::env::var("GOMPASS_EDGE").ok().and_then(|v| v.parse().ok());
         Self {
             model,
             view: preset.unwrap_or(ViewTransform { x: 40.0, y: 40.0, k: 1.0 }),
@@ -126,6 +151,13 @@ impl GraphCanvas {
             investigate: false,
             highlight_overlay: false,
             hovered_edge: None,
+            // Debug: GOMPASS_EDGE=<index> opens with that edge pinned, so a
+            // selfshot can reproduce the focused-edge state. Combined with
+            // GOMPASS_VIEW it pins without re-framing, which is how the dim
+            // is checked against a known camera.
+            focused_edge: preset.is_some().then_some(debug_edge).flatten(),
+            pending_edge: preset.is_none().then_some(debug_edge).flatten(),
+            focus_changed_at: None,
             pane_offset_x: 340.0,
         }
     }
@@ -152,13 +184,17 @@ impl GraphCanvas {
         }
     }
 
-    /// Navigate back to the previously focused card.
+    /// Navigate back to the previous history stop.
     pub fn go_back(&mut self, cx: &mut Context<Self>) {
-        if let Some(prev) = self.history.pop() {
-            self.pending_center = Some(prev);
-            self.suppress_push = true;
-            cx.notify();
+        match self.history.pop() {
+            Some(HistoryItem::Card(prev)) => {
+                self.pending_center = Some(prev);
+                self.suppress_push = true;
+            }
+            Some(HistoryItem::Edge(ei)) => self.pending_edge = Some(ei),
+            None => return,
         }
+        cx.notify();
     }
 
     pub fn clear_history(&mut self, cx: &mut Context<Self>) {
@@ -166,17 +202,52 @@ impl GraphCanvas {
         cx.notify();
     }
 
-    pub fn remove_history(&mut self, card: u32, cx: &mut Context<Self>) {
-        self.history.retain(|&c| c != card);
+    pub fn remove_history(&mut self, item: HistoryItem, cx: &mut Context<Self>) {
+        self.history.retain(|&h| h != item);
         cx.notify();
     }
 
-    pub fn history_entries(&self) -> Vec<(u32, gpui::SharedString)> {
+    /// Re-visit a history stop, leaving the rest of the stack alone.
+    pub fn revisit(&mut self, item: HistoryItem, cx: &mut Context<Self>) {
+        match item {
+            HistoryItem::Card(card) => {
+                self.pending_center = Some(card);
+                self.suppress_push = true;
+            }
+            HistoryItem::Edge(ei) => self.pending_edge = Some(ei),
+        }
+        cx.notify();
+    }
+
+    /// The Recent list, newest first. An edge stop reads `Source → Target`,
+    /// the same shape the web records when you click an edge.
+    pub fn history_entries(&self) -> Vec<RecentEntry> {
         self.history
             .iter()
             .rev()
             .take(50)
-            .map(|&i| (i, self.model.cards[i as usize].name.clone()))
+            .filter_map(|&item| match item {
+                HistoryItem::Card(c) => {
+                    let card = self.model.cards.get(c as usize)?;
+                    Some(RecentEntry {
+                        item,
+                        kind: card.kind,
+                        kind_label: card.kind_label,
+                        label: card.name.clone(),
+                    })
+                }
+                HistoryItem::Edge(ei) => {
+                    let e = self.model.edges.get(ei as usize)?;
+                    let from = self.model.cards.get(e.from as usize)?;
+                    let to = self.model.cards.get(e.to as usize)?;
+                    Some(RecentEntry {
+                        item,
+                        kind: from.kind,
+                        kind_label: from.kind_label,
+                        label: format!("{} → {}", from.name, to.name).into(),
+                    })
+                }
+            })
             .collect()
     }
 
@@ -191,6 +262,8 @@ impl GraphCanvas {
         self.pinned = None;
         self.hover_pos = None;
         self.hovered_edge = None;
+        self.focused_edge = None;
+        self.pending_edge = None;
         self.history.clear();
         self.suppress_push = false;
         cx.notify();
@@ -303,25 +376,35 @@ impl GraphCanvas {
         let k = (((vw - pad) / (x1 - x0).max(1.0))
             .min((vh - pad) / (y1 - y0).max(1.0)))
         .clamp(ZOOM_MIN, 1.2);
-        if let Some(f) = self.focus {
-            if f != e.from {
-                self.history.push(f);
-            }
+        // The web records the edge itself as the history stop, not whichever
+        // node it happened to focus — going back should land on the edge.
+        self.history.retain(|&h| h != HistoryItem::Edge(edge));
+        self.history.push(HistoryItem::Edge(edge));
+        if self.history.len() > 64 {
+            self.history.remove(0);
         }
         self.view = ViewTransform {
             x: vw / 2.0 - (x0 + x1) / 2.0 * k,
             y: vh / 2.0 - (y0 + y1) / 2.0 * k,
             k,
         };
-        self.focus = Some(e.from);
-        self.hovered_edge = Some(edge);
+        self.focus = None;
+        self.hovered_edge = None;
+        self.focused_edge = Some(edge);
+    }
+
+    /// Drop the pinned edge (the card's X button, Esc, or empty-canvas click).
+    pub fn clear_focused_edge(&mut self, cx: &mut Context<Self>) {
+        if self.focused_edge.take().is_some() {
+            cx.notify();
+        }
     }
 
     fn center_on(&mut self, card: u32, vw: f32, vh: f32) {
         if !self.suppress_push {
             if let Some(f) = self.focus {
                 if f != card {
-                    self.history.push(f);
+                    self.history.push(HistoryItem::Card(f));
                     if self.history.len() > 64 {
                         self.history.remove(0);
                     }
@@ -337,6 +420,9 @@ impl GraphCanvas {
             y: vh / 2.0 - (p.y + c.h / 2.0) * k,
             k,
         };
+        if self.focus != Some(card) {
+            self.focus_changed_at = Some(std::time::Instant::now());
+        }
         self.focus = Some(card);
     }
 
@@ -414,6 +500,7 @@ impl GraphCanvas {
                 self.focus = None;
                 self.pinned = None;
                 self.hovered_edge = None;
+                self.focused_edge = None;
             }
             let vw = f32::from(window.viewport_size().width) - self.pane_offset_x;
             let vh = f32::from(window.viewport_size().height);
@@ -423,6 +510,7 @@ impl GraphCanvas {
                 }
             }
             if let Some(hit) = self.hit_test(ev.position) {
+                self.focused_edge = None;
                 match hit.row {
                     Some(RowHit::Row(row)) => {
                         // Clicking the right-aligned type navigates; clicking
@@ -439,6 +527,9 @@ impl GraphCanvas {
                             Some(t) => self.center_on(t, vw, vh),
                             None => {
                                 self.pinned = Some((hit.card, row));
+                                if self.focus != Some(hit.card) {
+                                    self.focus_changed_at = Some(std::time::Instant::now());
+                                }
                                 self.focus = Some(hit.card);
                             }
                         }
@@ -480,15 +571,62 @@ impl GraphCanvas {
     }
 }
 
+/// Per-stroke alpha for edges faded behind a pinned one. Chosen for how it
+/// accumulates: a lone edge is a whisper, twenty stacked are a faint haze.
+const PIN_DIM_ALPHA: f32 = 0.015;
+
+/// Should this edge be drawn in the dim pass?
+///
+/// A pinned edge outranks the node focus: pinning is an explicit "show me
+/// only this", so everything else goes down, including edges that happen to
+/// touch whatever card was focused before.
+fn edge_is_dimmed(
+    index: u32,
+    from: u32,
+    to: u32,
+    hub_faded: bool,
+    focused_edge: Option<u32>,
+    focus: Option<u32>,
+) -> bool {
+    match (focused_edge, focus) {
+        (Some(pinned), _) => pinned != index,
+        (None, Some(f)) => from != f && to != f,
+        (None, None) => hub_faded,
+    }
+}
+
+/// Should this card be drawn dimmed? With an edge pinned only its two
+/// endpoints stay lit; otherwise only the focused card does.
+fn card_is_dimmed(card: u32, pinned_ends: Option<(u32, u32)>, focus: Option<u32>) -> bool {
+    match pinned_ends {
+        Some((from, to)) => card != from && card != to,
+        None => matches!(focus, Some(f) if f != card),
+    }
+}
+
+/// Focus-ring ripple: one pulse every `RIPPLE_CYCLE`, stopping after
+/// `RIPPLE_TOTAL` so a parked focus does not keep the window repainting
+/// forever. Matches the web's 1600ms × 3.
+const RIPPLE_CYCLE: f32 = 1.6;
+const RIPPLE_TOTAL: f32 = 4.8;
+
+/// World-space spacing of the background dot lattice, and the smallest
+/// on-screen spacing it is allowed to shrink to before the lattice doubles.
+const GRID_STEP: f32 = 24.0;
+const GRID_MIN_SCREEN_STEP: f32 = 18.0;
+/// Hard ceiling on dots per frame, as a guard against a degenerate viewport.
+const GRID_MAX_DOTS: usize = 40_000;
+
 /// Largest deviation, in screen pixels, we aim for between a flattened edge
 /// and the true curve. Below half a pixel the difference is not resolvable.
 const CURVE_TOL: f32 = 0.35;
 
 /// Line segments an edge layer may emit in one frame before the tolerance is
 /// relaxed to fit. Stroke tessellation measures at ~0.113µs per segment, so
-/// this is about 5.1ms — the share of a 120fps frame (8.3ms) that edges can
-/// have and still leave the ~2.1ms that cards and text cost at their worst.
-const SEG_BUDGET: usize = 45_000;
+/// this is about 4.3ms — the share of a 120fps frame (8.3ms) that edges can
+/// have and still leave the ~2.1ms that cards and text cost at their worst
+/// plus the ~0.6ms the background lattice takes.
+const SEG_BUDGET: usize = 38_000;
 
 /// Segments needed to keep one cubic within `tol` screen pixels of its chords.
 ///
@@ -580,6 +718,19 @@ impl Render for GraphCanvas {
         }
         if let Some(card) = self.pending_center.take() {
             self.center_on(card, vw, vh);
+        }
+        if let Some(ei) = self.pending_edge.take() {
+            self.focus_edge(ei, vw, vh);
+        }
+
+        // Ripple phase, or None once the pulse has run its course. Decorative
+        // motion, so it yields to the system's reduce-motion setting.
+        let ripple = self.focus_changed_at.filter(|_| !cx.reduce_motion()).and_then(|t| {
+            let elapsed = t.elapsed().as_secs_f32();
+            (elapsed < RIPPLE_TOTAL).then(|| (elapsed % RIPPLE_CYCLE) / RIPPLE_CYCLE)
+        });
+        if ripple.is_some() {
+            window.request_animation_frame();
         }
 
         let model = self.model.clone();
@@ -692,6 +843,7 @@ impl Render for GraphCanvas {
         let investigate = self.investigate;
         let highlight_overlay = self.highlight_overlay;
         let hovered_edge = self.hovered_edge;
+        let focused_edge = self.focused_edge;
         let th = crate::theme::current(cx, window.appearance());
         let bg = th.bg;
         let stats = self.stats_line();
@@ -734,7 +886,8 @@ impl Render for GraphCanvas {
                             |window| {
                                 paint_scene(
                                     &model, view, hover, focus, pinned, investigate,
-                                    highlight_overlay, hovered_edge, bounds, window, cx,
+                                    highlight_overlay, hovered_edge, focused_edge, ripple,
+                                    bounds, window, cx,
                                 );
                             },
                         );
@@ -932,6 +1085,107 @@ impl Render for GraphCanvas {
                         }),
                 )
             })
+            .when_some(
+                self.focused_edge.and_then(|ei| self.model.edges.get(ei as usize)),
+                |el, e| {
+                    // Web's focused-edge widget: a card centred at the bottom
+                    // naming both ends. That is what tells you *which* edge
+                    // survived the dim — a hover tooltip cannot do the job,
+                    // since it vanishes the moment you move the mouse to look.
+                    let from = &self.model.cards[e.from as usize];
+                    let to = &self.model.cards[e.to as usize];
+                    let joiner: Option<SharedString> = match e.group {
+                        EdgeGroup::Implements => Some("implements".into()),
+                        EdgeGroup::Union => Some("|".into()),
+                        _ => None,
+                    };
+                    let label: Option<SharedString> = if e.bundled > 1 {
+                        Some(format!("({} fields)", e.bundled).into())
+                    } else {
+                        e.labels.first().cloned()
+                    };
+                    let bundled = e.bundled > 1;
+                    let badge = |kind, text: &'static str| {
+                        div()
+                            .flex_none()
+                            .rounded_md()
+                            .px(px(4.0))
+                            .text_size(px(9.0))
+                            .bg(th.kind_color(kind))
+                            .text_color(gpui::white())
+                            .child(SharedString::from(text))
+                    };
+                    el.child(
+                        div()
+                            .absolute()
+                            .bottom(px(16.0))
+                            .left_0()
+                            .right_0()
+                            .flex()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.0))
+                                    .rounded_lg()
+                                    .border_1()
+                                    .border_color(th.card_border)
+                                    .bg(th.chrome_bg)
+                                    .shadow_lg()
+                                    .px_3()
+                                    .py_2()
+                                    .font_family("Menlo")
+                                    .text_xs()
+                                    .text_color(th.text)
+                                    .child(badge(from.kind, from.kind_label))
+                                    .child(
+                                        div()
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .child(from.name.clone()),
+                                    )
+                                    .when_some(label, |el, l| {
+                                        el.child(
+                                            div()
+                                                .text_color(if bundled {
+                                                    th.text_muted
+                                                } else {
+                                                    th.type_amber
+                                                })
+                                                .child(l),
+                                        )
+                                    })
+                                    .when_some(joiner, |el, j| {
+                                        el.child(div().text_color(th.text_muted).child(j))
+                                    })
+                                    .child(div().text_color(th.text_muted).child("→"))
+                                    .child(badge(to.kind, to.kind_label))
+                                    .child(
+                                        div()
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .child(to.name.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("clear-edge-focus")
+                                            .ml_2()
+                                            .rounded_md()
+                                            .p_1()
+                                            .cursor_pointer()
+                                            .hover(|el| el.bg(th.hover_bg))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.clear_focused_edge(cx)
+                                            }))
+                                            .child(crate::icons::icon(
+                                                crate::icons::Icon::X,
+                                                px(12.0),
+                                                th.text_muted,
+                                            )),
+                                    ),
+                            ),
+                    )
+                },
+            )
     }
 }
 
@@ -945,6 +1199,8 @@ fn paint_scene(
     investigate: bool,
     highlight_overlay: bool,
     hovered_edge: Option<u32>,
+    focused_edge: Option<u32>,
+    ripple: Option<f32>,
     bounds: Bounds<Pixels>,
     window: &mut Window,
     cx: &mut App,
@@ -964,6 +1220,38 @@ fn paint_scene(
     let to_screen = |x: f32, y: f32| point(px(ox + x * k), px(oy + y * k));
 
     let t_probe = std::time::Instant::now();
+    // ---- dot grid, under everything ----
+    // A 24px world lattice of dots, like the web canvas. It is what makes
+    // panning and zooming legible over an empty stretch of graph — without it
+    // a drag across blank space looks like nothing is happening. Only the
+    // dots inside the viewport are emitted, and the lattice doubles its step
+    // as you zoom out so the on-screen spacing stays in a readable band
+    // instead of collapsing into a grey wash.
+    {
+        let mut step = GRID_STEP;
+        while step * k < GRID_MIN_SCREEN_STEP {
+            step *= 2.0;
+        }
+        let dot = k.clamp(1.0, 2.0);
+        let color = th.text_muted.opacity(0.18);
+        let gx0 = (wx0 / step).floor() * step;
+        let gy0 = (wy0 / step).floor() * step;
+        let cols = ((wx1 - gx0) / step).ceil().max(0.0) as usize;
+        let rows = ((wy1 - gy0) / step).ceil().max(0.0) as usize;
+        if cols.saturating_mul(rows) <= GRID_MAX_DOTS {
+            for r in 0..=rows {
+                let wy = gy0 + r as f32 * step;
+                for c in 0..=cols {
+                    let wx = gx0 + c as f32 * step;
+                    window.paint_quad(fill(
+                        Bounds { origin: to_screen(wx, wy), size: size(px(dot), px(dot)) },
+                        color,
+                    ));
+                }
+            }
+        }
+    }
+
     // Frame budget: price the edges at the ideal tolerance first, and if the
     // bill is too high, relax the tolerance just enough to fit. n scales with
     // 1/sqrt(tol), so the correction is the square of the overrun. This is
@@ -1013,7 +1301,13 @@ fn paint_scene(
     const SEGS_PER_BATCH: usize = 900;
     for (group, dim_pass) in groups.iter().flat_map(|&g| [(g, false), (g, true)]) {
         let color = if dim_pass {
-            edge_color(&th, group).opacity(0.35)
+            // Pinning one edge out of thousands needs a far harder fade than
+            // dimming the edges that merely miss a focused node. It also has
+            // to be harder than it looks: the web fades a whole container, so
+            // its alpha composites once, while these are separate strokes and
+            // twenty overlapping hairlines at 0.1 add up to an opaque wash.
+            let a = if focused_edge.is_some() { PIN_DIM_ALPHA } else { 0.35 };
+            edge_color(&th, group).opacity(a)
         } else {
             edge_color(&th, group)
         };
@@ -1054,10 +1348,7 @@ fn paint_scene(
             }
             // With a focus, everything non-incident dims; without one, only
             // hub-star edges dim (the web app's hub fading).
-            let dimmed = match focus {
-                Some(f) => e.from != f && e.to != f,
-                None => e.hub_faded,
-            };
+            let dimmed = edge_is_dimmed(ei as u32, e.from, e.to, e.hub_faded, focused_edge, focus);
             if dimmed != dim_pass {
                 continue;
             }
@@ -1109,8 +1400,8 @@ fn paint_scene(
         flush(&mut builder, &mut arrows, &mut any, &mut any_arrow, &mut segs, window);
     }
 
-    // The hovered edge draws on top, brighter and thicker.
-    if let Some(ei) = hovered_edge {
+    // The hovered — or pinned — edge draws on top, brighter and thicker.
+    if let Some(ei) = hovered_edge.or(focused_edge) {
         if let Some(e) = model.edges.get(ei as usize) {
             let mut builder = PathBuilder::stroke(px((stroke_w * 2.0).max(2.0)));
             builder.move_to(to_screen(e.start.x, e.start.y));
@@ -1161,9 +1452,12 @@ fn paint_scene(
         {
             DIM_ALPHA
         } else {
-            match focus {
-                Some(f) if f != ci => DIM_ALPHA,
-                _ => 1.0,
+            let pinned_ends =
+                focused_edge.and_then(|fe| model.edges.get(fe as usize)).map(|e| (e.from, e.to));
+            if card_is_dimmed(ci, pinned_ends, focus) {
+                DIM_ALPHA
+            } else {
+                1.0
             }
         };
         let kind_c = th.kind_color(card.kind);
@@ -1565,6 +1859,23 @@ fn paint_scene(
                 }
             }
         }
+        if let (true, Some(t)) = (is_focused, ripple) {
+            // An expanding, fading echo of the ring: it is what makes a jump
+            // to a distant card readable as "here", instead of leaving you to
+            // hunt for which box grew a border.
+            let pad = t * 18.0;
+            window.paint_quad(quad(
+                Bounds {
+                    origin: to_screen(pos.x - pad, pos.y - pad),
+                    size: size(px((card.w + pad * 2.0) * k), px((card.h + pad * 2.0) * k)),
+                },
+                Corners::all(px((6.0 + pad) * k)),
+                gpui::transparent_black(),
+                Edges::all(px((2.0 * k).clamp(1.0, 3.0))),
+                kind_c.opacity((1.0 - t) * 0.6),
+                BorderStyle::Solid,
+            ));
+        }
         if is_focused || (is_hovered && !is_focused) {
             let (w_ring, a_ring) = if is_focused { (2.5, 0.75) } else { (1.5, 0.4) };
             window.paint_quad(quad(
@@ -1677,6 +1988,37 @@ fn paint_baseline(
 mod tests {
     use super::*;
     use gompass_core::layout::{CubicSeg, Point};
+
+
+    #[test]
+    fn pinning_an_edge_dims_everything_but_that_edge() {
+        // edge 7 runs 3 -> 9; pin it
+        let pinned = Some(7u32);
+        assert!(!edge_is_dimmed(7, 3, 9, false, pinned, None));
+        assert!(edge_is_dimmed(8, 3, 4, false, pinned, None));
+        // ...even an edge touching the previously focused card
+        assert!(edge_is_dimmed(8, 3, 4, false, pinned, Some(3)));
+        // only the two endpoints stay lit
+        assert!(!card_is_dimmed(3, Some((3, 9)), None));
+        assert!(!card_is_dimmed(9, Some((3, 9)), None));
+        assert!(card_is_dimmed(4, Some((3, 9)), Some(4)));
+    }
+
+    #[test]
+    fn without_a_pin_the_node_focus_decides() {
+        assert!(!edge_is_dimmed(8, 3, 4, false, None, Some(3)));
+        assert!(!edge_is_dimmed(8, 3, 4, false, None, Some(4)));
+        assert!(edge_is_dimmed(8, 3, 4, false, None, Some(5)));
+        assert!(!card_is_dimmed(3, None, Some(3)));
+        assert!(card_is_dimmed(4, None, Some(3)));
+    }
+
+    #[test]
+    fn with_no_focus_at_all_only_hub_edges_fade() {
+        assert!(edge_is_dimmed(8, 3, 4, true, None, None));
+        assert!(!edge_is_dimmed(8, 3, 4, false, None, None));
+        assert!(!card_is_dimmed(4, None, None));
+    }
 
     #[test]
     fn cubic_steps_scale_with_on_screen_curvature() {

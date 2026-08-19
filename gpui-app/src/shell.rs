@@ -13,6 +13,7 @@ pub const COMMIT: Option<&str> = option_env!("GOMPASS_COMMIT");
 pub enum Route {
     New,
     View,
+    About,
 }
 
 fn nav_link(th: Theme, id: &'static str, label: &'static str, active: bool) -> Stateful<gpui::Div> {
@@ -47,6 +48,7 @@ pub fn header<T: 'static>(
         ThemeMode::System => (Icon::Monitor, "System"),
     };
     let on_nav_new = on_nav.clone();
+    let on_nav_view = on_nav.clone();
     div()
         .flex_none()
         .h(px(56.0))
@@ -89,12 +91,21 @@ pub fn header<T: 'static>(
                             ),
                         )
                         .when(has_schema, |el| {
-                            el.child(nav_link(th, "nav-view", "View", route == Route::View).on_click(
+                            el.child(
+                                nav_link(th, "nav-view", "View", route == Route::View).on_click(
+                                    cx.listener(move |this, _, window, cx| {
+                                        on_nav_view(this, Route::View, window, cx)
+                                    }),
+                                ),
+                            )
+                        })
+                        .child(
+                            nav_link(th, "nav-about", "About", route == Route::About).on_click(
                                 cx.listener(move |this, _, window, cx| {
-                                    on_nav(this, Route::View, window, cx)
+                                    on_nav(this, Route::About, window, cx)
                                 }),
-                            ))
-                        }),
+                            ),
+                        ),
                 ),
         )
         .child(

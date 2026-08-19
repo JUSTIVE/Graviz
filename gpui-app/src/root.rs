@@ -18,6 +18,7 @@ pub struct Root {
     error: Option<String>,
     /// "New" tab: show the landing even though a schema is loaded.
     show_landing: bool,
+    show_about: bool,
     editor: Entity<TextArea>,
     recents_open: bool,
     warnings: Vec<String>,
@@ -44,6 +45,8 @@ impl Root {
             recents: config::recents(),
             error: None,
             show_landing: false,
+            // Debug: GOMPASS_ABOUT=1 opens on the About page, for selfshots.
+            show_about: std::env::var("GOMPASS_ABOUT").is_ok(),
             editor,
             recents_open: false,
             warnings: Vec::new(),
@@ -120,7 +123,9 @@ impl Render for Root {
         let th = crate::theme::current(cx, window.appearance());
 
         let has_schema = self.workspace.is_some();
-        let route = if self.show_landing || !has_schema {
+        let route = if self.show_about {
+            crate::shell::Route::About
+        } else if self.show_landing || !has_schema {
             crate::shell::Route::New
         } else {
             crate::shell::Route::View
@@ -131,6 +136,7 @@ impl Render for Root {
             has_schema,
             crate::theme::mode(cx),
             |this: &mut Self, route, _window, cx| {
+                this.show_about = route == crate::shell::Route::About;
                 this.show_landing = route == crate::shell::Route::New;
                 cx.notify();
             },
@@ -145,7 +151,18 @@ impl Render for Root {
             cx,
         );
 
-        let body: gpui::AnyElement = if let (Some(ws), false) = (&self.workspace, self.show_landing) {
+        let body: gpui::AnyElement = if self.show_about {
+            crate::about::view(
+                th,
+                |this: &mut Self, _w, cx| {
+                    this.show_about = false;
+                    this.show_landing = this.workspace.is_none();
+                    cx.notify();
+                },
+                cx,
+            )
+            .into_any_element()
+        } else if let (Some(ws), false) = (&self.workspace, self.show_landing) {
             div().flex_1().min_h_0().child(ws.clone()).into_any_element()
         } else {
             landing::view(

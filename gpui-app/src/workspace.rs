@@ -35,7 +35,8 @@ actions!(
         ToggleOverlayDock,
         OpenSchema,
         OpenOverlay,
-        Back
+        Back,
+        ClearSelection
     ]
 );
 
@@ -52,7 +53,47 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-o", OpenSchema, None),
         KeyBinding::new("cmd-shift-o", OpenOverlay, None),
         KeyBinding::new("cmd-[", Back, None),
+        KeyBinding::new("escape", ClearSelection, None),
     ]);
+}
+
+/// The two draggable pane edges.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Splitter {
+    Sidebar,
+    Dock,
+}
+
+/// A 5px grab strip on a pane's edge. It only records which splitter went
+/// down; the move and release are handled on the workspace root, so the drag
+/// keeps working after the cursor outruns the strip.
+fn splitter(
+    id: &'static str,
+    which: Splitter,
+    th: crate::theme::Theme,
+    active: bool,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement {
+    let vertical = matches!(which, Splitter::Sidebar);
+    div()
+        .id(id)
+        .absolute()
+        .when(vertical, |el| el.top_0().bottom_0().right(px(-2.0)).w(px(5.0)))
+        .when(!vertical, |el| el.left_0().right_0().top(px(-2.0)).h(px(5.0)))
+        .cursor(if vertical {
+            gpui::CursorStyle::ResizeLeftRight
+        } else {
+            gpui::CursorStyle::ResizeUpDown
+        })
+        .when(active, |el| el.bg(th.accent.opacity(0.5)))
+        .hover(|el| el.bg(th.accent.opacity(0.35)))
+        .on_mouse_down(
+            gpui::MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                this.resizing = Some(which);
+                cx.notify();
+            }),
+        )
 }
 
 pub struct Workspace {
@@ -70,6 +111,9 @@ pub struct Workspace {
     canvas: Entity<GraphCanvas>,
     overlay_editor: Entity<TextArea>,
     sidebar_open: bool,
+    sidebar_width: f32,
+    /// Which splitter is being dragged, if any.
+    resizing: Option<Splitter>,
     /// Latest built model, for name→card navigation from the overlay dock.
     model: Rc<Model>,
     /// The last APPLIED overlay text (reloads re-apply it).
@@ -122,6 +166,9 @@ impl Workspace {
             ..Default::default()
         };
         let sidebar_open = settings.sidebar_open;
+        let sidebar_width =
+            settings.sidebar_width.clamp(config::SIDEBAR_MIN_W, config::SIDEBAR_MAX_W);
+        let dock_height = settings.dock_height.clamp(config::DOCK_MIN_H, config::DOCK_MAX_H);
         // Debug presets so automated selfshots can exercise toggle states.
         if std::env::var("GOMPASS_DESC").is_ok() {
             options.show_descriptions = true;
@@ -237,13 +284,15 @@ impl Workspace {
             canvas,
             overlay_editor,
             sidebar_open,
+            sidebar_width,
+            resizing: None,
             model,
             overlay_text: initial_overlay,
             overlay_diff: loaded.diff,
             overlay_error: None,
             dock_open: std::env::var("GOMPASS_DOCK").is_ok(),
             history_open: false,
-            dock_height: 280.0,
+            dock_height,
             highlight_overlay: false,
             orphan_count: counts.0,
             deprecated_count: counts.1,
@@ -270,6 +319,8 @@ impl Workspace {
             hide_primitive_fields: self.options.hide_primitive_fields,
             hide_relay: self.hide_relay,
             sidebar_open: self.sidebar_open,
+            sidebar_width: self.sidebar_width,
+            dock_height: self.dock_height,
             theme_mode: crate::theme::mode(cx),
         });
     }
@@ -827,11 +878,19 @@ impl Render for Workspace {
             div()
                 .flex_none()
                 .h(px(self.dock_height))
+                .relative()
                 .flex()
                 .flex_col()
                 .border_t_1()
                 .border_color(th.panel_border)
                 .bg(th.card_bg.opacity(0.4))
+                .child(splitter(
+                    "dock-splitter",
+                    Splitter::Dock,
+                    th,
+                    self.resizing == Some(Splitter::Dock),
+                    cx,
+                ))
                 // header row
                 .child(
                     div()
@@ -1169,8 +1228,8 @@ impl Render for Workspace {
                                 .flex()
                                 .flex_col()
                                 .children(entries.into_iter().enumerate().map(
-                                    |(i, (card, name))| {
-                                        let c = &self.model.cards[card as usize];
+                                    |(i, entry)| {
+                                        let item = entry.item;
                                         div()
                                             .id(("recent", i))
                                             .group("recent-row")
@@ -1191,26 +1250,30 @@ impl Render for Workspace {
                                                     .px_2()
                                                     .py_1()
                                                     .cursor_pointer()
-                                                    .bg(th.kind_color(c.kind).opacity(0.1))
+                                                    .bg(th.kind_color(entry.kind).opacity(0.1))
                                                     .hover(|el| el.bg(th.hover_bg))
                                                     .on_click(cx.listener(
                                                         move |this, _, _, cx| {
                                                             this.canvas.update(cx, |canvas, cx| {
-                                                                canvas.navigate_to(card, None, cx)
+                                                                canvas.revisit(item, cx)
                                                             });
                                                         },
                                                     ))
-                                                    .child(kind_badge(th, c.kind, c.kind_label))
+                                                    .child(kind_badge(
+                                                        th,
+                                                        entry.kind,
+                                                        entry.kind_label,
+                                                    ))
                                                     .child(
                                                         div()
                                                             .flex_1()
                                                             .min_w_0()
                                                             .text_xs()
                                                             .font_family("Menlo")
-                                                            .text_color(th.kind_color(c.kind))
+                                                            .text_color(th.kind_color(entry.kind))
                                                             .whitespace_nowrap()
                                                             .overflow_hidden()
-                                                            .child(name),
+                                                            .child(entry.label),
                                                     ),
                                             )
                                             .child(
@@ -1223,7 +1286,7 @@ impl Render for Workspace {
                                                     .on_click(cx.listener(
                                                         move |this, _, _, cx| {
                                                             this.canvas.update(cx, |canvas, cx| {
-                                                                canvas.remove_history(card, cx)
+                                                                canvas.remove_history(item, cx)
                                                             });
                                                             cx.notify();
                                                         },
@@ -1241,6 +1304,35 @@ impl Render for Workspace {
             .flex()
             .size_full()
             .key_context("Workspace")
+            // A drag started on a splitter is tracked here, not on the strip
+            // itself: once the cursor outruns the 5px grab area the strip
+            // stops seeing moves, and the pane would stick mid-drag.
+            .on_mouse_move(cx.listener(|this, ev: &gpui::MouseMoveEvent, window, cx| {
+                let Some(which) = this.resizing else { return };
+                match which {
+                    Splitter::Sidebar => {
+                        this.sidebar_width = f32::from(ev.position.x)
+                            .clamp(config::SIDEBAR_MIN_W, config::SIDEBAR_MAX_W);
+                        let w = this.sidebar_width;
+                        this.canvas.update(cx, |c, cx| c.set_pane_offset(w, cx));
+                    }
+                    Splitter::Dock => {
+                        let vh = f32::from(window.viewport_size().height);
+                        this.dock_height = (vh - f32::from(ev.position.y))
+                            .clamp(config::DOCK_MIN_H, config::DOCK_MAX_H.min(vh * 0.7));
+                    }
+                }
+                cx.notify();
+            }))
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.resizing.take().is_some() {
+                        this.save_settings(cx);
+                        cx.notify();
+                    }
+                }),
+            )
             .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
                 this.sidebar_open = true;
                 let handle = this.tree.read(cx).focus_handle();
@@ -1249,7 +1341,7 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
                 this.sidebar_open = !this.sidebar_open;
-                let offset = if this.sidebar_open { 340.0 } else { 0.0 };
+                let offset = if this.sidebar_open { this.sidebar_width } else { 0.0 };
                 this.canvas
                     .update(cx, |canvas, cx| canvas.set_pane_offset(offset, cx));
                 this.save_settings(cx);
@@ -1290,10 +1382,13 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &Back, _, cx| {
                 this.canvas.update(cx, |canvas, cx| canvas.go_back(cx));
             }))
+            .on_action(cx.listener(|this, _: &ClearSelection, _, cx| {
+                this.canvas.update(cx, |canvas, cx| canvas.clear_focused_edge(cx));
+            }))
             .when(self.sidebar_open, |el| {
                 el.child(
                     div()
-                        .w(px(340.0))
+                        .w(px(self.sidebar_width))
                         .h_full()
                         .flex_none()
                         .flex()
@@ -1308,6 +1403,13 @@ impl Render for Workspace {
                             Mode::Deprecated => self.until_panel.clone().into_any_element(),
                         })),
                 )
+                .child(splitter(
+                    "sidebar-splitter",
+                    Splitter::Sidebar,
+                    th,
+                    self.resizing == Some(Splitter::Sidebar),
+                    cx,
+                ))
             })
             .child(
                 div()
@@ -1343,7 +1445,7 @@ impl Render for Workspace {
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.sidebar_open = true;
                                             this.canvas.update(cx, |canvas, cx| {
-                                                canvas.set_pane_offset(340.0, cx)
+                                                canvas.set_pane_offset(this.sidebar_width, cx)
                                             });
                                             this.save_settings(cx);
                                             cx.notify();

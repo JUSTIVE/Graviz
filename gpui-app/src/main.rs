@@ -1,3 +1,4 @@
+mod about;
 mod canvas;
 mod config;
 mod editor;
