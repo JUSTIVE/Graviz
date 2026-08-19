@@ -29,6 +29,7 @@ actions!(
         ToggleSidebar,
         ToggleDescriptions,
         ToggleBundling,
+        ToggleFlow,
         ToggleInvestigate,
         TogglePrimitives,
         ToggleRelay,
@@ -46,6 +47,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-b", ToggleSidebar, None),
         KeyBinding::new("cmd-d", ToggleDescriptions, None),
         KeyBinding::new("cmd-e", ToggleBundling, None),
+        KeyBinding::new("cmd-l", ToggleFlow, None),
         KeyBinding::new("cmd-i", ToggleInvestigate, None),
         KeyBinding::new("cmd-p", TogglePrimitives, None),
         KeyBinding::new("cmd-r", ToggleRelay, None),
@@ -162,6 +164,7 @@ impl Workspace {
         let mut options = ModelOptions {
             show_descriptions: settings.show_descriptions,
             bundle_edges: settings.bundle_edges,
+            monotone: settings.monotone,
             hide_primitive_fields: settings.hide_primitive_fields,
             ..Default::default()
         };
@@ -316,6 +319,7 @@ impl Workspace {
         config::save_settings(&config::Settings {
             show_descriptions: self.options.show_descriptions,
             bundle_edges: self.options.bundle_edges,
+            monotone: self.options.monotone,
             hide_primitive_fields: self.options.hide_primitive_fields,
             hide_relay: self.hide_relay,
             sidebar_open: self.sidebar_open,
@@ -681,6 +685,18 @@ impl Render for Workspace {
                 self.options.bundle_edges,
                 |this, _, cx| {
                     this.options.bundle_edges = !this.options.bundle_edges;
+                    this.rebuild(cx);
+                    this.save_settings(cx);
+                },
+                cx,
+            ))
+            .child(self.chip(
+                th,
+                "flow",
+                "Left-to-right flow",
+                self.options.monotone,
+                |this, _, cx| {
+                    this.options.monotone = !this.options.monotone;
                     this.rebuild(cx);
                     this.save_settings(cx);
                 },
@@ -1355,6 +1371,11 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &ToggleDescriptions, _, cx| {
                 this.options.show_descriptions = !this.options.show_descriptions;
+                this.rebuild(cx);
+                this.save_settings(cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleFlow, _, cx| {
+                this.options.monotone = !this.options.monotone;
                 this.rebuild(cx);
                 this.save_settings(cx);
             }))

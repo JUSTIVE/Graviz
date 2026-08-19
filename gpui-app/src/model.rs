@@ -316,6 +316,8 @@ pub struct ModelOptions {
     pub show_descriptions: bool,
     /// Collapse parallel field edges sharing source→target into one arrow.
     pub bundle_edges: bool,
+    /// Lay the graph out so every edge runs left to right.
+    pub monotone: bool,
     /// Hide fields whose return type is a builtin scalar (String/Int/…).
     pub hide_primitive_fields: bool,
     /// Today as `YYYY-MM-DD`, for `[until]` expiry coloring.
@@ -327,6 +329,7 @@ impl Default for ModelOptions {
         ModelOptions {
             show_descriptions: false,
             bundle_edges: true,
+            monotone: false,
             hide_primitive_fields: false,
             today: today_string(),
         }
@@ -844,8 +847,8 @@ pub fn build_model(graph: ParsedGraph, schema_name: String, options: &ModelOptio
             (members.len() > 1).then_some(layout::Cluster { parent, members })
         })
         .collect();
-    let result =
-        layout::layout(&layout_nodes, &layout_edges, &roots, &unions, &LayoutConfig::default());
+    let cfg = LayoutConfig { monotone: options.monotone, ..LayoutConfig::default() };
+    let result = layout::layout(&layout_nodes, &layout_edges, &roots, &unions, &cfg);
 
     // ---- flatten edge paths ----
     let mut edges: Vec<EdgeVisual> = Vec::with_capacity(result.edges.len());
