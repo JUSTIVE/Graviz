@@ -826,7 +826,26 @@ pub fn build_model(graph: ParsedGraph, schema_name: String, options: &ModelOptio
         .into_iter()
         .filter_map(|name| name.as_ref().and_then(|n| index_of.get(n).copied()))
         .collect();
-    let result = layout::layout(&layout_nodes, &layout_edges, &roots, &LayoutConfig::default());
+    // A union should read as one group: the union itself on the left, its
+    // variants stacked in the column immediately to its right.
+    let unions: Vec<layout::Cluster> = graph
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Union)
+        .filter_map(|n| {
+            let parent = *index_of.get(n.id.as_str())?;
+            let members: Vec<u32> = n
+                .members
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .filter_map(|m| index_of.get(m.as_str()).copied())
+                .collect();
+            (members.len() > 1).then_some(layout::Cluster { parent, members })
+        })
+        .collect();
+    let result =
+        layout::layout(&layout_nodes, &layout_edges, &roots, &unions, &LayoutConfig::default());
 
     // ---- flatten edge paths ----
     let mut edges: Vec<EdgeVisual> = Vec::with_capacity(result.edges.len());

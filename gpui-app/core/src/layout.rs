@@ -107,10 +107,31 @@ const VIRTUAL_H: f32 = 0.0;
 const VIRTUAL_SEP: f32 = 2.0;
 
 /// `roots` bias ranking so root types (Query/Mutation) start at rank 0.
+/// A parent type and the variants that should line up in the column directly
+/// to its right — a union and its members.
+#[derive(Debug, Clone)]
+pub struct Cluster {
+    pub parent: u32,
+    pub members: Vec<u32>,
+}
+
+/// `clusters` keep each parent's variants packed together in their column,
+/// with the parent to their left. Nothing in the graph connects the variants
+/// to one another, so crossing reduction has no reason to keep them near each
+/// other and a union otherwise reads as a spray of arrows into a scattered
+/// set of boxes rather than as one group.
+///
+/// This is an ordering constraint only. Forcing the variants onto a shared
+/// rank as well was measured: it raises the share of unions that end up in
+/// one column from 15/42 to 18/42, and costs 14% average edge length and 35%
+/// more edges cut across unrelated cards. Variants land in different columns
+/// because something else reaches them by a shorter path, and overriding that
+/// stretches every one of their other edges.
 pub fn layout(
     nodes: &[LayoutNode],
     edges: &[LayoutEdge],
     roots: &[u32],
+    clusters: &[Cluster],
     config: &LayoutConfig,
 ) -> LayoutResult {
     let n = nodes.len();
@@ -187,12 +208,27 @@ pub fn layout(
             continue;
         }
         let comp_index = comps.len();
+        // A cluster only means anything inside one component's ordering.
+        let comp_clusters: Vec<Cluster> = clusters
+            .iter()
+            .filter(|c| comp_of[c.parent as usize] as usize == ci)
+            .filter_map(|c| {
+                let members: Vec<u32> = c
+                    .members
+                    .iter()
+                    .copied()
+                    .filter(|&v| comp_of[v as usize] as usize == ci)
+                    .collect();
+                (members.len() > 1).then_some(Cluster { parent: c.parent, members })
+            })
+            .collect();
         let (w, h) = layout_component(
             &members[ci],
             &comp_edges[ci],
             nodes,
             edges,
             &is_root,
+            &comp_clusters,
             config,
             &mut positions,
             |pair, waypoints| {
@@ -368,9 +404,50 @@ pub fn layout(
             }
             crossed += hit.len();
         }
+        // How well the clusters actually held together: average distance
+        // between members, and the share of clusters whose members ended up
+        // in one unbroken run.
+        let (mut gap_sum, mut gap_n) = (0.0f32, 0usize);
+        let (mut tight, mut same_col, mut total) = (0usize, 0usize, 0usize);
+        for c in clusters {
+            let g = &c.members;
+            for (i, &a) in g.iter().enumerate() {
+                for &b in &g[i + 1..] {
+                    let (p, q) = (positions[a as usize], positions[b as usize]);
+                    gap_sum += ((q.x - p.x).powi(2) + (q.y - p.y).powi(2)).sqrt();
+                    gap_n += 1;
+                }
+            }
+            // "Tight" = the variants share a column and sit in one
+            // unbroken run down it. Cards are centred in their rank, so a
+            // shared centre-x is exactly "same column", whatever the widths.
+            total += 1;
+            let col = |v: usize| positions[v].x + nodes[v].w / 2.0;
+            let c0 = col(g[0] as usize);
+            if g.iter().all(|&v| (col(v as usize) - c0).abs() < 1.0) {
+                same_col += 1;
+                let mut spans: Vec<(f32, f32)> = g
+                    .iter()
+                    .map(|&v| {
+                        (positions[v as usize].y, positions[v as usize].y + nodes[v as usize].h)
+                    })
+                    .collect();
+                spans.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                let (top, bottom) = (spans[0].0, spans[spans.len() - 1].1);
+                let intruder = (0..nodes.len()).any(|o| {
+                    !g.contains(&(o as u32))
+                        && (col(o) - c0).abs() < 1.0
+                        && positions[o].y + nodes[o].h > top
+                        && positions[o].y < bottom
+                });
+                if !intruder {
+                    tight += 1;
+                }
+            }
+        }
         let n_edges = edges.len().max(1) as f32;
         eprintln!(
-            "layout: {} nodes, {} edges, routed {}, avg len {:.0} (dx {:.0} dy {:.0}), longest {:.0}, backward {}, crossings {} ({:.2}/edge), world {:.0}x{:.0}",
+            "layout: {} nodes, {} edges, routed {}, avg len {:.0} (dx {:.0} dy {:.0}), longest {:.0}, backward {}, crossings {} ({:.2}/edge), world {:.0}x{:.0}, union gap {:.0} col {}/{} tight {}/{}",
             nodes.len(),
             edges.len(),
             routed,
@@ -382,7 +459,12 @@ pub fn layout(
             crossed,
             crossed as f32 / n_edges,
             packed_w,
-            packed_h
+            packed_h,
+            gap_sum / gap_n.max(1) as f32,
+            same_col,
+            total,
+            tight,
+            total
         );
     }
     LayoutResult {
@@ -558,6 +640,7 @@ fn layout_component(
     nodes: &[LayoutNode],
     edges: &[LayoutEdge],
     is_root: &[bool],
+    clusters: &[Cluster],
     config: &LayoutConfig,
     positions: &mut [Point],
     mut emit_route: impl FnMut((u32, u32), Vec<Point>),
@@ -747,6 +830,38 @@ fn layout_component(
         let avg_w = (0..m).map(|v| nodes[comp[v] as usize].w).sum::<f32>() / m.max(1) as f32;
         // Cap chosen so the finished component lands near square.
         let cap = (total_h * (avg_w + config.rank_sep)).sqrt().max(2000.0);
+        // Each node's atomic unit: itself, or a shared id if it belongs to a
+        // cluster that is now sitting in one column. Splitting a rank must
+        // move a cluster whole or not at all, else it undoes the grouping.
+        // Units stay disjoint (a type can sit in two unions) and only a
+        // cluster that comfortably fits a column is protected — a union with
+        // dozens of members is taller than the cap by itself, and refusing to
+        // split it would stretch the whole picture for one group's sake.
+        let mut unit_of: Vec<usize> = (0..m).collect();
+        {
+            let mut order: Vec<usize> = (0..clusters.len()).collect();
+            order.sort_by_key(|&i| clusters[i].members.len());
+            let mut taken = vec![false; m];
+            for &ci in &order {
+                let members: Vec<usize> = clusters[ci]
+                    .members
+                    .iter()
+                    .filter_map(|v| local_of.get(v).copied())
+                    .map(|l| l as usize)
+                    .filter(|&l| !taken[l])
+                    .collect();
+                if members.len() < 2 || members.iter().any(|&l| rank[l] != rank[members[0]]) {
+                    continue;
+                }
+                if members.iter().map(|&l| node_h(l)).sum::<f32>() > cap * 0.5 {
+                    continue;
+                }
+                for &l in &members {
+                    unit_of[l] = m + ci;
+                    taken[l] = true;
+                }
+            }
+        }
         let mut succ_min: Vec<i32> = vec![i32::MAX / 2; m];
         for &((a, b), _) in &acyclic {
             if a != b {
@@ -760,17 +875,31 @@ fn layout_component(
             for v in 0..m {
                 heights[rank[v] as usize] += node_h(v);
             }
-            let Some(r) = (0..heights.len()).find(|&r| heights[r] > cap) else {
+            let mut rank_units: Vec<HashMap<usize, Vec<usize>>> =
+                vec![HashMap::new(); (max_rank + 1) as usize];
+            for v in 0..m {
+                rank_units[rank[v] as usize].entry(unit_of[v]).or_default().push(v);
+            }
+            // Only ranks that can actually be split: one holding a single unit
+            // is already as short as it may get, and picking it again would
+            // spin here until the iteration cap while every other over-tall
+            // rank went untouched.
+            let Some(r) = (0..heights.len())
+                .find(|&r| heights[r] > cap && rank_units[r].len() > 1)
+            else {
                 break;
             };
             let r = r as i32;
-            let mut members: Vec<usize> = (0..m).filter(|&v| rank[v] == r).collect();
-            if members.len() < 2 {
-                break;
-            }
-            // Nodes whose successors sit furthest away move first — they are
-            // the ones with room, and moving them shortens their edges.
-            members.sort_by_key(|&v| -succ_min[v]);
+            let mut members: Vec<(usize, Vec<usize>)> =
+                std::mem::take(&mut rank_units[r as usize]).into_iter().collect();
+            // Units whose successors sit furthest away move first — they are
+            // the ones with room, and moving them shortens their edges. The
+            // unit id breaks ties, because hash order is not stable across
+            // runs and the layout has to be.
+            members.sort_by_key(|(id, u)| {
+                (-u.iter().map(|&v| succ_min[v]).min().unwrap_or(0), *id)
+            });
+            let members: Vec<Vec<usize>> = members.into_iter().map(|(_, u)| u).collect();
             for x in rank.iter_mut() {
                 if *x > r {
                     *x += 1;
@@ -782,11 +911,14 @@ fn layout_component(
                 }
             }
             let mut kept = 0.0f32;
-            for (i, &v) in members.iter().enumerate() {
-                if i == 0 || kept + node_h(v) <= cap {
-                    kept += node_h(v);
+            for (i, unit) in members.iter().enumerate() {
+                let h: f32 = unit.iter().map(|&v| node_h(v)).sum();
+                if i == 0 || kept + h <= cap {
+                    kept += h;
                 } else {
-                    rank[v] = r + 1;
+                    for &v in unit {
+                        rank[v] = r + 1;
+                    }
                 }
             }
         }
@@ -982,6 +1114,138 @@ fn layout_component(
         }
     }
 
+    // ---- cluster contiguity ----
+    // Union members carry no edge to one another, so crossing reduction has
+    // no reason to keep them together and they end up scattered down the
+    // rank with the union's own edges fanning out between them. Pull each
+    // cluster's members into one contiguous block, centred on where they
+    // already sit. Done last, after the sweeps have settled, so it decides
+    // adjacency without fighting the edge-crossing work.
+    {
+        // A type can belong to several unions; it can only be adjacent to
+        // one of them, so it joins the first (smallest wins ties, since a
+        // small union is the tighter statement).
+        let mut order: Vec<usize> = (0..clusters.len()).collect();
+        order.sort_by_key(|&i| clusters[i].members.len());
+        let mut cluster_of: HashMap<u32, usize> = HashMap::new();
+        for &ci in &order {
+            for v in &clusters[ci].members {
+                if let Some(&l) = local_of.get(v) {
+                    cluster_of.entry(l).or_insert(ci);
+                }
+            }
+        }
+        for bucket in ranks.iter_mut() {
+            // Which clusters have two or more members in this rank, and where
+            // their members currently sit.
+            let mut slots: HashMap<usize, Vec<usize>> = HashMap::new();
+            for (i, &v) in bucket.iter().enumerate() {
+                if let Some(&c) = cluster_of.get(&v) {
+                    slots.entry(c).or_default().push(i);
+                }
+            }
+            let mut blocks: Vec<(usize, usize)> = slots
+                .iter()
+                .filter(|(_, idx)| idx.len() > 1)
+                .map(|(&c, idx)| (idx[idx.len() / 2], c))
+                .collect();
+            if blocks.is_empty() {
+                continue;
+            }
+            // Rebuild the rank left to right: everything keeps its order,
+            // except that each cluster is emitted whole at its median slot.
+            // Sorted by cluster id on ties — hash order is not stable across
+            // runs and the layout has to be.
+            blocks.sort_unstable();
+            let clustered: HashMap<usize, usize> = blocks
+                .iter()
+                .enumerate()
+                .flat_map(|(bi, &(_, c))| slots[&c].iter().map(move |&i| (i, bi)))
+                .collect();
+            let mut out: Vec<u32> = Vec::with_capacity(bucket.len());
+            let mut emitted = vec![false; blocks.len()];
+            for (i, &v) in bucket.iter().enumerate() {
+                match clustered.get(&i) {
+                    Some(&bi) => {
+                        if !emitted[bi] {
+                            emitted[bi] = true;
+                            out.extend(slots[&blocks[bi].1].iter().map(|&j| bucket[j]));
+                        }
+                    }
+                    None => out.push(v),
+                }
+            }
+            *bucket = out;
+            for (i, &v) in bucket.iter().enumerate() {
+                pos_in_rank[v as usize] = i as u32;
+            }
+        }
+
+        // Blocks were dropped at their old median without regard for what
+        // they now cross. Re-run the adjacent-swap refinement over *blocks*
+        // rather than nodes, so the groups keep their shape but are free to
+        // slide to where they cost the fewest crossings.
+        for _ in 0..config.transpose_passes {
+            let mut improved = false;
+            for bucket in ranks.iter_mut() {
+                // Segment the rank into blocks: a cluster's run, or a single
+                // node. The contiguity pass above guarantees a cluster's
+                // members are consecutive here.
+                let mut blocks: Vec<Vec<u32>> = Vec::with_capacity(bucket.len());
+                let mut i = 0;
+                while i < bucket.len() {
+                    let c = cluster_of.get(&bucket[i]).copied();
+                    let mut j = i + 1;
+                    if c.is_some() {
+                        while j < bucket.len() && cluster_of.get(&bucket[j]).copied() == c {
+                            j += 1;
+                        }
+                    }
+                    blocks.push(bucket[i..j].to_vec());
+                    i = j;
+                }
+                let mut k = 0;
+                while k + 1 < blocks.len() {
+                    let (before, after) = (blocks[k].clone(), blocks[k + 1].clone());
+                    // Crossings between the two blocks, in each order.
+                    let pairs = |a: &[u32], b: &[u32]| -> u64 {
+                        let mut n = 0u64;
+                        for &x in a {
+                            for &y in b {
+                                let (ab, _) =
+                                    crossings_between(x, y, &pos_in_rank, &xin, &xout);
+                                n += ab as u64;
+                            }
+                        }
+                        n
+                    };
+                    let ab = pairs(&before, &after);
+                    let ba = pairs(&after, &before);
+                    if ba < ab {
+                        blocks.swap(k, k + 1);
+                        improved = true;
+                        // Re-index so the next comparison sees the new order.
+                        let mut idx = 0u32;
+                        for b in blocks.iter() {
+                            for &v in b {
+                                pos_in_rank[v as usize] = idx;
+                                idx += 1;
+                            }
+                        }
+                    }
+                    k += 1;
+                }
+                *bucket = blocks.concat();
+                for (i, &v) in bucket.iter().enumerate() {
+                    pos_in_rank[v as usize] = i as u32;
+                }
+            }
+            if !improved {
+                break;
+            }
+        }
+    }
+
     let nranks = ranks.len();
     let mut xrank = vec![0usize; xn];
     for (ri, bucket) in ranks.iter().enumerate() {
@@ -1131,7 +1395,7 @@ mod tests {
     fn chain_ranks_left_to_right() {
         let nodes = vec![node(100.0, 40.0); 3];
         let edges = vec![edge(0, 1), edge(1, 2)];
-        let r = layout(&nodes, &edges, &[0], &LayoutConfig::default());
+        let r = layout(&nodes, &edges, &[0], &[], &LayoutConfig::default());
         assert!(r.positions[0].x < r.positions[1].x);
         assert!(r.positions[1].x < r.positions[2].x);
         assert_eq!(r.edges.len(), 2);
@@ -1142,7 +1406,7 @@ mod tests {
     fn cycle_does_not_hang_or_overlap_ranks() {
         let nodes = vec![node(100.0, 40.0); 3];
         let edges = vec![edge(0, 1), edge(1, 2), edge(2, 0)];
-        let r = layout(&nodes, &edges, &[], &LayoutConfig::default());
+        let r = layout(&nodes, &edges, &[], &[], &LayoutConfig::default());
         for p in &r.positions {
             assert!(p.x.is_finite() && p.y.is_finite());
         }
@@ -1156,7 +1420,7 @@ mod tests {
             nodes.push(node(120.0, 50.0));
             edges.push(edge(0, i));
         }
-        let r = layout(&nodes, &edges, &[0], &LayoutConfig::default());
+        let r = layout(&nodes, &edges, &[0], &[], &LayoutConfig::default());
         let mut ys: Vec<f32> = (1..=10).map(|i| r.positions[i].y).collect();
         ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
         for w in ys.windows(2) {
@@ -1204,6 +1468,30 @@ mod tests {
     }
 
     #[test]
+    fn cluster_members_end_up_contiguous_in_their_column() {
+        // Union 0 over variants 1..3, and an unrelated root 4 whose own
+        // target 5 shares the variants' column. Nothing joins 1, 2 and 3 to
+        // each other, so without the cluster the ordering is free to leave 5
+        // sitting in the middle of them.
+        let nodes = vec![node(100.0, 40.0); 6];
+        let edges = vec![edge(0, 1), edge(0, 2), edge(0, 3), edge(4, 5), edge(4, 2)];
+        let clusters = vec![Cluster { parent: 0, members: vec![1, 2, 3] }];
+        let r = layout(&nodes, &edges, &[0, 4], &clusters, &LayoutConfig::default());
+        let col = |i: usize| r.positions[i].x + nodes[i].w / 2.0;
+        // The variants share a column and the union sits to their left.
+        assert!((col(1) - col(2)).abs() < 1.0 && (col(1) - col(3)).abs() < 1.0);
+        assert!(col(0) < col(1));
+        // Nothing is wedged between them in that column.
+        let mut ys: Vec<f32> = [1usize, 2, 3].iter().map(|&i| r.positions[i].y).collect();
+        ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let (top, bottom) = (ys[0], ys[2] + 40.0);
+        let intruding = (col(5) - col(1)).abs() < 1.0
+            && r.positions[5].y + 40.0 > top
+            && r.positions[5].y < bottom;
+        assert!(!intruding, "an unrelated type split the union block: {:?}", r.positions);
+    }
+
+    #[test]
     fn long_edge_keeps_clear_of_the_ranks_it_spans() {
         // 0→1→2→3 chain plus a long edge 0→3. The long edge is lane-routed
         // through the intermediate ranks, so its path must stay outside the
@@ -1212,7 +1500,7 @@ mod tests {
         // is where it runs, not how many waypoints survive.)
         let nodes = vec![node(100.0, 40.0); 4];
         let edges = vec![edge(0, 1), edge(1, 2), edge(2, 3), edge(0, 3)];
-        let r = layout(&nodes, &edges, &[0], &LayoutConfig::default());
+        let r = layout(&nodes, &edges, &[0], &[], &LayoutConfig::default());
         let long = &r.edges[3];
         for mid in [1usize, 2] {
             let p = r.positions[mid];
@@ -1227,7 +1515,7 @@ mod tests {
     fn separate_components_do_not_overlap() {
         let nodes = vec![node(100.0, 40.0); 4];
         let edges = vec![edge(0, 1), edge(2, 3)];
-        let r = layout(&nodes, &edges, &[], &LayoutConfig::default());
+        let r = layout(&nodes, &edges, &[], &[], &LayoutConfig::default());
         let bb = |a: usize, b: usize| {
             let (pa, pb) = (r.positions[a], r.positions[b]);
             (
@@ -1247,7 +1535,7 @@ mod tests {
     fn singletons_form_grid() {
         let nodes = vec![node(100.0, 40.0); 5];
         let edges: Vec<LayoutEdge> = Vec::new();
-        let r = layout(&nodes, &edges, &[], &LayoutConfig::default());
+        let r = layout(&nodes, &edges, &[], &[], &LayoutConfig::default());
         for p in &r.positions {
             assert!(p.x.is_finite() && p.y.is_finite());
         }
