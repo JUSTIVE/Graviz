@@ -492,10 +492,15 @@ pub fn layout(
                 }
             }
         }
-        // Edge-edge crossings, the other half of visual complexity. Exact
-        // counting is 16M pairs; bucketing segments by cell makes it a
-        // few million tests, and a pair sharing several cells is counted
-        // once by keying on the (lower, higher) segment ids.
+        // Edge-edge crossings: **pairs of edges that cross**, counted once
+        // however many times their flattened paths intersect.
+        //
+        // Two things this deliberately does not count. Edges that share an
+        // endpoint meet there by construction — every reference into a hub
+        // arrives at the same point, and pairing them all up would report
+        // thousands of "crossings" that are just the fan converging. And a
+        // pair that intersects several times is one tangle to the eye, not
+        // three.
         const XCELL: f32 = 384.0;
         let mut segs: Vec<(Point, Point, u32)> = Vec::new();
         for (ei, p) in edge_paths.iter().enumerate() {
@@ -521,33 +526,40 @@ pub fn layout(
             let (d1, d2, d3, d4) = (d(p, q, r), d(p, q, s), d(r, s, p), d(r, s, q));
             ((d1 > 0.0) != (d2 > 0.0)) && ((d3 > 0.0) != (d4 > 0.0))
         };
-        let mut seen: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+        let shares_end = |i: usize, j: usize| {
+            let (a, b) = (&edges[i], &edges[j]);
+            a.from == b.from || a.from == b.to || a.to == b.from || a.to == b.to
+        };
+        let mut tangled: std::collections::HashSet<(u32, u32)> =
+            std::collections::HashSet::new();
         for ids in cells.values() {
             for (i, &a) in ids.iter().enumerate() {
                 for &b in &ids[i + 1..] {
                     let (sa, sb) = (&segs[a as usize], &segs[b as usize]);
-                    if sa.2 == sb.2 {
+                    let (ea, eb) = (sa.2, sb.2);
+                    if ea == eb {
                         continue;
                     }
-                    let key = if a < b { (a, b) } else { (b, a) };
-                    if !seen.insert(key) {
+                    let pair = if ea < eb { (ea, eb) } else { (eb, ea) };
+                    if tangled.contains(&pair) {
+                        continue;
+                    }
+                    if shares_end(ea as usize, eb as usize) {
                         continue;
                     }
                     if cross(sa.0, sa.1, sb.0, sb.1) {
-                        // counted via `seen`
-                    } else {
-                        seen.remove(&key);
+                        tangled.insert(pair);
                     }
                 }
             }
         }
-        let edge_x = seen.len();
+        let edge_x = tangled.len();
         // How concentrated are the crossings? If a small set of long edges
         // accounts for most of them, those are worth routing differently.
         let mut per_edge = vec![0u32; edges.len()];
-        for &(a, b) in &seen {
-            per_edge[segs[a as usize].2 as usize] += 1;
-            per_edge[segs[b as usize].2 as usize] += 1;
+        for &(a, b) in &tangled {
+            per_edge[a as usize] += 1;
+            per_edge[b as usize] += 1;
         }
         let mut by_len: Vec<usize> = (0..edges.len()).collect();
         by_len.sort_by(|&i, &j| {
@@ -576,7 +588,7 @@ pub fn layout(
         }
         let n_edges = edges.len().max(1) as f32;
         eprintln!(
-            "layout: {} nodes, {} edges, routed {}, avg len {:.0} (dx {:.0} dy {:.0}), longest {:.0}, backward {}, crossings {} ({:.2}/edge), world {:.0}x{:.0}, edge-x {} ({:.2}/edge), same-col {}, union gap {:.0} col {}/{} tight {}/{}",
+            "layout: {} nodes, {} edges, routed {}, avg len {:.0} (dx {:.0} dy {:.0}), longest {:.0}, backward {}, crossings {} ({:.2}/edge), world {:.0}x{:.0}, tangles {} ({:.1} per edge), same-col {}, union gap {:.0} col {}/{} tight {}/{}",
             nodes.len(),
             edges.len(),
             routed,
@@ -590,7 +602,7 @@ pub fn layout(
             packed_w,
             packed_h,
             edge_x,
-            edge_x as f32 / n_edges,
+            2.0 * edge_x as f32 / n_edges,
             flat,
             gap_sum / gap_n.max(1) as f32,
             same_col,
@@ -1679,6 +1691,61 @@ mod tests {
         ];
         simplify(&mut corner, 3.0);
         assert_eq!(corner.len(), 3, "a real corner must survive");
+    }
+
+    /// Pairs of laid-out edges whose paths properly cross, ignoring pairs that
+    /// share an endpoint — the same definition the metrics use.
+    fn tangles(r: &LayoutResult, edges: &[LayoutEdge]) -> usize {
+        let seg = |k: usize| {
+            let p = &r.edges[k];
+            let mut v = vec![p.start];
+            v.extend(p.points.iter().copied());
+            v
+        };
+        let d = |a: Point, b: Point, c: Point| {
+            (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+        };
+        let mut n = 0;
+        for i in 0..r.edges.len() {
+            for j in i + 1..r.edges.len() {
+                let (ei, ej) = (&edges[i], &edges[j]);
+                if ei.from == ej.from || ei.from == ej.to || ei.to == ej.from || ei.to == ej.to {
+                    continue;
+                }
+                let (a, b) = (seg(i), seg(j));
+                let hit = a.windows(2).any(|p| {
+                    b.windows(2).any(|q| {
+                        let (d1, d2) = (d(p[0], p[1], q[0]), d(p[0], p[1], q[1]));
+                        let (d3, d4) = (d(q[0], q[1], p[0]), d(q[0], q[1], p[1]));
+                        ((d1 > 0.0) != (d2 > 0.0)) && ((d3 > 0.0) != (d4 > 0.0))
+                    })
+                });
+                if hit {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn edges_sharing_an_endpoint_are_not_a_tangle() {
+        // A fan: one source, three targets. They all leave the same card, so
+        // however they spread they must never count as crossing each other.
+        let nodes = vec![node(100.0, 40.0); 4];
+        let edges = vec![edge(0, 1), edge(0, 2), edge(0, 3)];
+        let r = layout(&nodes, &edges, &[0], &[], &LayoutConfig::default());
+        assert_eq!(tangles(&r, &edges), 0);
+    }
+
+    #[test]
+    fn the_ordering_untangles_a_crossed_pair() {
+        // 0→3 and 1→2 with the targets arriving in the wrong order would
+        // cross; the ordering has to swap them.
+        let nodes = vec![node(100.0, 40.0); 4];
+        let edges = vec![edge(0, 3), edge(1, 2)];
+        let r = layout(&nodes, &edges, &[0, 1], &[], &LayoutConfig::default());
+        assert_eq!(tangles(&r, &edges), 0, "positions {:?}", r.positions);
     }
 
     #[test]
