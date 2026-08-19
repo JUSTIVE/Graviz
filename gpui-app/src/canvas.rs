@@ -384,6 +384,12 @@ impl GraphCanvas {
         let was_click = matches!(&self.drag, Some(d) if !d.moved);
         self.drag = None;
         if was_click {
+            // Web: clicking empty canvas clears focus + pin.
+            if self.hit_test(ev.position).is_none() && self.hit_test_edge(ev.position).is_none() {
+                self.focus = None;
+                self.pinned = None;
+                self.hovered_edge = None;
+            }
             if let Some(hit) = self.hit_test(ev.position) {
                 let vw = f32::from(window.viewport_size().width) - self.pane_offset_x;
                 let vh = f32::from(window.viewport_size().height);
@@ -501,62 +507,81 @@ impl Render for GraphCanvas {
         let last_sample = self.last_sample.clone();
 
         // Floating tooltip: field/header description + deprecation info.
+        /// Mirrors the web's three tooltip shapes (field / header / edge).
         struct Tooltip {
+            /// Kind badge shown before the name, when the hover has a type.
+            badge: Option<(gompass_core::graph::NodeKind, &'static str)>,
             title: String,
+            /// Right-hand return type, painted amber like the web.
+            type_text: Option<gpui::SharedString>,
             description: Option<String>,
             deprecation: Option<String>,
             expired: bool,
+            /// Edge tooltips use the wider `rounded-lg` chrome.
+            wide: bool,
         }
         let tooltip: Option<Tooltip> = if self.drag.is_some() {
             None
         } else {
             self.hover.and_then(|h| {
                 let card = &self.model.cards[h.card as usize];
+                let badge = Some((card.kind, card.kind_label));
                 match h.row {
                     Some(RowHit::Row(ri)) => {
                         let row = &card.rows[ri];
-                        let title = if row.right.is_empty() {
-                            format!("{}::{}", card.name, row.left)
-                        } else {
-                            format!("{}.{}: {}", card.name, row.left, row.right)
-                        };
                         let deprecation = row
                             .deprecation_reason
                             .clone()
                             .or_else(|| row.deprecated.then(|| "deprecated".to_string()));
                         (row.description.is_some() || deprecation.is_some()).then_some(Tooltip {
-                            title,
+                            badge,
+                            title: format!("{}.{}", card.name, row.left),
+                            type_text: (!row.right.is_empty()).then(|| row.right.clone()),
                             description: row.description.clone(),
                             deprecation,
                             expired: row.until_expired,
+                            wide: false,
                         })
                     }
                     Some(RowHit::Implements(b)) => Some(Tooltip {
+                        badge,
                         title: format!("implements {}", card.implements[b]),
+                        type_text: None,
                         description: None,
                         deprecation: None,
                         expired: false,
+                        wide: false,
                     }),
                     Some(RowHit::MemberOfUnion(b)) => Some(Tooltip {
+                        badge,
                         title: format!("member of union {}", card.member_of_unions[b]),
+                        type_text: None,
                         description: None,
                         deprecation: None,
                         expired: false,
+                        wide: false,
                     }),
-                    None => card.description.clone().map(|d| Tooltip {
-                        title: format!("{} {}", card.kind_label, card.name),
-                        description: Some(d),
-                        deprecation: None,
-                        expired: false,
+                    // Header hover: the web only shows this when the sprite is
+                    // no longer painting the name, or when it has a description.
+                    None => (card.description.is_some() || self.view.k < LOD_ROWS).then(|| {
+                        Tooltip {
+                            badge,
+                            title: card.name.to_string(),
+                            type_text: None,
+                            description: card.description.clone(),
+                            deprecation: None,
+                            expired: false,
+                            wide: false,
+                        }
                     }),
                 }
             })
         };
-        // Edge tooltip: source → target plus the bundled field labels.
+        // Edge tooltip: `Source → Target` with the bundled field labels.
         let tooltip = tooltip.or_else(|| {
             let ei = self.hovered_edge?;
             let e = self.model.edges.get(ei as usize)?;
-            let from = &self.model.cards[e.from as usize].name;
+            let from = &self.model.cards[e.from as usize];
             let to = &self.model.cards[e.to as usize].name;
             let shown: Vec<String> = e.labels.iter().take(10).map(|l| l.to_string()).collect();
             let more = e.labels.len().saturating_sub(10);
@@ -564,16 +589,15 @@ impl Render for GraphCanvas {
             if more > 0 {
                 desc.push_str(&format!(" … +{more}"));
             }
-            let bundle = if e.bundled > 1 {
-                format!("  ·  ×{}", e.bundled)
-            } else {
-                String::new()
-            };
             Some(Tooltip {
-                title: format!("{from} → {to}{bundle}"),
+                badge: Some((from.kind, from.kind_label)),
+                title: format!("{} → {}", from.name, to),
+                type_text: (e.bundled > 1)
+                    .then(|| gpui::SharedString::from(format!("{} fields", e.bundled))),
                 description: (!desc.is_empty()).then_some(desc),
                 deprecation: None,
                 expired: false,
+                wide: true,
             })
         });
         let hover_pos = self.hover_pos;
@@ -730,59 +754,80 @@ impl Render for GraphCanvas {
                     )
             })
             .when_some(tooltip.zip(hover_pos), |el, (tip, (hx, hy))| {
-                let tw = 340.0;
-                let pane_w = vw;
-                let left = if hx + 16.0 + tw > pane_w {
-                    (hx - tw - 12.0).max(4.0)
-                } else {
-                    hx + 16.0
-                };
-                let top = if hy + 160.0 > vh {
-                    (hy - 140.0).max(4.0)
-                } else {
-                    hy + 18.0
-                };
+                // Web placement (tooltip-pos.ts): 12px down-right of the
+                // cursor, flipping to a right anchor past the horizontal
+                // midpoint and to a bottom anchor within 80px of the bottom.
+                let tw = if tip.wide { 420.0 } else { 340.0 };
+                let flip_x = hx > vw / 2.0;
+                let flip_y = hy > vh - 80.0;
+                let left = if flip_x { (hx - tw - 12.0).max(4.0) } else { hx + 12.0 };
+                let top = if flip_y { (hy - 132.0).max(4.0) } else { hy + 12.0 };
+                let badge = tip.badge;
                 el.child(
                     div()
                         .absolute()
                         .left(px(left))
                         .top(px(top))
-                        .w(px(tw))
-                        .p_2()
-                        .rounded_md()
+                        .max_w(px(tw))
+                        .when(tip.wide, |el| el.rounded_lg().px_3().py_2())
+                        .when(!tip.wide, |el| el.rounded_md().px(px(10.0)).py(px(6.0)))
                         .border_1()
                         .border_color(th.card_border)
                         .bg(th.chrome_bg)
                         .shadow_lg()
                         .flex()
                         .flex_col()
-                        .gap_1()
+                        .gap(px(2.0))
                         .font_family("Menlo")
                         .child(
                             div()
-                                .text_xs()
-                                .text_color(th.text)
-                                .child(SharedString::from(tip.title)),
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .when_some(badge, |el, (kind, label)| {
+                                    el.child(
+                                        div()
+                                            .flex_none()
+                                            .rounded_md()
+                                            .px(px(4.0))
+                                            .text_size(px(9.0))
+                                            .bg(th.kind_color(kind))
+                                            .text_color(gpui::white())
+                                            .child(SharedString::from(label)),
+                                    )
+                                })
+                                .child(
+                                    div()
+                                        .text_size(px(12.5))
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(th.text)
+                                        .child(SharedString::from(tip.title)),
+                                )
+                                .when_some(tip.type_text, |el, t| {
+                                    el.child(
+                                        div()
+                                            .text_size(px(12.5))
+                                            .text_color(th.type_amber)
+                                            .child(t),
+                                    )
+                                }),
                         )
                         .when_some(tip.description, |el, d| {
                             el.child(
                                 div()
-                                    .text_xs()
+                                    .text_size(px(12.5))
                                     .text_color(th.text_muted)
+                                    .line_height(px(20.0))
                                     .max_h(px(120.0))
                                     .overflow_hidden()
                                     .child(SharedString::from(d)),
                             )
                         })
                         .when_some(tip.deprecation, |el, d| {
-                            let color: Hsla = if tip.expired {
-                                th.red
-                            } else {
-                                th.type_amber
-                            };
+                            let color: Hsla = if tip.expired { th.expired } else { th.type_amber };
                             el.child(
                                 div()
-                                    .text_xs()
+                                    .text_size(px(11.0))
                                     .text_color(color)
                                     .child(SharedString::from(format!("⚠ {d}"))),
                             )
