@@ -219,11 +219,20 @@ pub fn fit_text(s: &str, font_px: f32, max_w: f32) -> String {
     let ell = mono_w("…", font_px);
     let budget = (max_w - ell).max(0.0);
     let per = font_px * MONO_ADVANCE;
-    let n = (budget / per).floor() as usize;
-    if n == 0 {
+    // Take characters while their *cells* fit, so a wide glyph costs two.
+    let mut used = 0.0f32;
+    let mut cut = String::new();
+    for c in s.chars() {
+        let next = used + char_cells(c) * per;
+        if next > budget {
+            break;
+        }
+        used = next;
+        cut.push(c);
+    }
+    if cut.is_empty() {
         return "…".to_string();
     }
-    let cut: String = s.chars().take(n).collect();
     format!("{cut}…")
 }
 
@@ -499,8 +508,52 @@ pub fn slice_graph(full: &ParsedGraph, mode: Mode, root_override: Option<&str>) 
     }
 }
 
+/// Advances a character occupies in a monospace font.
+///
+/// A CJK glyph is two cells wide, not one. Counting characters instead of
+/// cells measures Korean, Japanese and Chinese text at half its real width,
+/// which is how a description ends up drawn past the right edge of the card
+/// that was sized for it — the text system lays it out correctly, only our
+/// estimate was wrong.
+fn char_cells(c: char) -> f32 {
+    let u = c as u32;
+    let wide = matches!(u,
+        0x1100..=0x115F        // Hangul Jamo
+        | 0x2E80..=0x303E      // CJK radicals, Kangxi, CJK symbols & punctuation
+        | 0x3041..=0x33FF      // kana, Hangul compatibility Jamo, CJK compat
+        | 0x3400..=0x4DBF      // CJK extension A
+        | 0x4E00..=0x9FFF      // CJK unified ideographs
+        | 0xA000..=0xA4CF      // Yi
+        | 0xAC00..=0xD7A3      // Hangul syllables
+        | 0xF900..=0xFAFF      // CJK compatibility ideographs
+        | 0xFE10..=0xFE19      // vertical forms
+        | 0xFE30..=0xFE6F      // CJK compatibility forms
+        | 0xFF00..=0xFF60      // fullwidth forms
+        | 0xFFE0..=0xFFE6      // fullwidth signs
+        | 0x1F300..=0x1F64F    // emoji
+        | 0x1F900..=0x1F9FF
+        | 0x20000..=0x3FFFD    // CJK extensions B and beyond
+    );
+    // Combining marks sit on the previous glyph and take no cell of their own.
+    let zero = matches!(u, 0x0300..=0x036F | 0x200B..=0x200F | 0xFE00..=0xFE0F);
+    if zero {
+        0.0
+    } else if wide {
+        2.0
+    } else {
+        1.0
+    }
+}
+
+/// Monospace cells `text` occupies — the same measure `mono_w` scales, for
+/// callers that work in columns rather than pixels.
+pub fn mono_cells(text: &str) -> f32 {
+    text.chars().map(char_cells).sum()
+}
+
+/// Width of `text` at `font_px` in the card's monospace face.
 pub fn mono_w(text: &str, font_px: f32) -> f32 {
-    text.chars().count() as f32 * font_px * MONO_ADVANCE
+    text.chars().map(char_cells).sum::<f32>() * font_px * MONO_ADVANCE
 }
 
 fn kind_label(kind: NodeKind) -> &'static str {
@@ -916,6 +969,37 @@ fn edge_group(e: &gompass_core::graph::GraphEdgeData) -> EdgeGroup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cjk_text_measures_two_cells_per_glyph() {
+        // A monospace face draws Hangul at double width; measuring it as one
+        // cell is what let a Korean description run past the card edge.
+        let ascii = mono_w("abcdefgh", 12.0);
+        let hangul = mono_w("한글이다", 12.0);
+        assert!((ascii - hangul).abs() < 0.01, "{ascii} vs {hangul}");
+        // Mixed runs add up per glyph, not per character.
+        assert!((mono_w("가A", 12.0) - mono_w("aaa", 12.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn fit_text_truncates_cjk_by_width_not_char_count() {
+        let full = "포인트 소비 유형";
+        let budget = mono_w("포인트", 12.0) + mono_w("…", 12.0);
+        let cut = fit_text(full, 12.0, budget);
+        assert!(cut.ends_with('…'));
+        assert!(
+            mono_w(&cut, 12.0) <= budget + 0.01,
+            "{cut:?} is {} wide, budget {budget}",
+            mono_w(&cut, 12.0)
+        );
+        // And a string that already fits is returned untouched.
+        assert_eq!(fit_text(full, 12.0, mono_w(full, 12.0) + 1.0), full);
+    }
+
+    #[test]
+    fn combining_marks_take_no_cell() {
+        assert!((mono_w("e\u{301}", 12.0) - mono_w("e", 12.0)).abs() < 0.01);
+    }
     use gompass_core::graph::{sdl_to_graph, SdlToGraphOptions};
 
     fn model_of(sdl: &str, opts: ModelOptions) -> Model {

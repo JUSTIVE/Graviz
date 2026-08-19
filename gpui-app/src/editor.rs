@@ -1,7 +1,9 @@
 //! Minimal multi-line text editor for the overlay dock.
 //!
-//! Deliberately small: ASCII-oriented (SDL identifiers), no IME composition,
-//! no undo stack. Covers typing, newline/tab, arrows with shift-selection,
+//! Deliberately small: no IME composition, no undo stack. Caret geometry is
+//! measured in monospace *cells*, so a description containing Hangul or CJK
+//! places its caret and selection correctly even though the glyphs are two
+//! columns wide. Covers typing, newline/tab, arrows with shift-selection,
 //! click/drag caret placement, ⌘A/C/X/V, and scrolling. ⌘↵ emits `Submitted`.
 
 use crate::theme::Theme;
@@ -212,6 +214,28 @@ impl TextArea {
         (line, line_start, col)
     }
 
+    /// Byte offset of the glyph nearest `cells` columns into `line`.
+    fn offset_for_line_cells(&self, line: usize, cells: f32) -> usize {
+        let mut start = 0usize;
+        for (i, l) in self.text.split('\n').enumerate() {
+            if i == line {
+                let mut off = start;
+                let mut acc = 0.0f32;
+                for c in l.chars() {
+                    let w = crate::model::mono_cells(&c.to_string());
+                    if acc + w / 2.0 >= cells {
+                        return off;
+                    }
+                    acc += w;
+                    off += c.len_utf8();
+                }
+                return off;
+            }
+            start += l.len() + 1;
+        }
+        self.text.len()
+    }
+
     fn offset_for_line_col(&self, line: usize, col: usize) -> usize {
         let mut start = 0usize;
         for (i, l) in self.text.split('\n').enumerate() {
@@ -262,8 +286,10 @@ impl TextArea {
         let y = f32::from(pos.y) - oy - PAD + self.scroll_y;
         let line = ((y / LINE_H).floor().max(0.0)) as usize;
         let line = line.min(self.line_count().saturating_sub(1));
-        let col = ((x / (FONT_PX * crate::model::MONO_ADVANCE)) + 0.5) as usize;
-        self.offset_for_line_col(line, col)
+        // Walk the line accumulating cell widths so a click lands on the
+        // glyph under the cursor, not `x / advance` characters along.
+        let want = x / (FONT_PX * crate::model::MONO_ADVANCE);
+        self.offset_for_line_cells(line, want)
     }
 
     fn on_key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -528,8 +554,12 @@ fn paint_editor(
                     let ls = s.max(byte);
                     let le = e.min(byte + line_len);
                     if ls < le || (s <= byte && e > byte + line_len) {
-                        let cols_before = text[byte..ls.max(byte)].chars().count() as f32;
-                        let cols_sel = text[ls.max(byte)..le.max(ls)].chars().count() as f32;
+                        // Cells, not characters: a Hangul or CJK glyph is two
+                        // columns wide, so counting characters puts the
+                        // selection box and the caret in the wrong place on
+                        // any line that is not pure ASCII.
+                        let cols_before = crate::model::mono_cells(&text[byte..ls.max(byte)]);
+                        let cols_sel = crate::model::mono_cells(&text[ls.max(byte)..le.max(ls)]);
                         let x0 = ox + cols_before * FONT_PX * crate::model::MONO_ADVANCE;
                         let w = (cols_sel * FONT_PX * crate::model::MONO_ADVANCE).max(4.0);
                         window.paint_quad(fill(
@@ -570,7 +600,7 @@ fn paint_editor(
                 }
                 // caret
                 if focused && cursor >= byte && cursor <= byte + line_len {
-                    let cols = text[byte..cursor].chars().count() as f32;
+                    let cols = crate::model::mono_cells(&text[byte..cursor]);
                     let x = ox + cols * FONT_PX * crate::model::MONO_ADVANCE;
                     window.paint_quad(fill(
                         Bounds {
@@ -589,6 +619,15 @@ fn paint_editor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_click_lands_on_the_glyph_under_it_in_a_cjk_line() {
+        // "가나다" is three glyphs but six columns. A click four columns in
+        // belongs on the third glyph, not the fifth character (there is none).
+        let cells = |s: &str| crate::model::mono_cells(s);
+        assert_eq!(cells("가나다"), 6.0);
+        assert_eq!(cells("abc"), 3.0);
+    }
 
     fn th() -> Theme {
         crate::theme::theme(gpui::WindowAppearance::Dark)
