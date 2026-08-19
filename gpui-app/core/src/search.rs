@@ -287,7 +287,7 @@ pub fn search_graph(graph: &ParsedGraph, query: &str) -> Vec<SearchResult> {
         }
     }
 
-    out.sort_by(|a, b| b.score.cmp(&a.score));
+    out.sort_by_key(|r| std::cmp::Reverse(r.score));
     out.truncate(MAX_RESULTS);
     out
 }

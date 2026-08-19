@@ -304,8 +304,7 @@ impl TextArea {
             "right" => {
                 let to = if cmd {
                     let (line, _, _) = self.cursor_line_col();
-                    let next = self.offset_for_line_col(line, usize::MAX / 2);
-                    next
+                    self.offset_for_line_col(line, usize::MAX / 2)
                 } else {
                     self.next_boundary(self.cursor)
                 };

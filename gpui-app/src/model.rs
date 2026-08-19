@@ -702,7 +702,7 @@ pub fn build_model(graph: ParsedGraph, schema_name: String, options: &ModelOptio
         let header_desc = if options.show_descriptions {
             n.description
                 .as_deref()
-                .map(|d| one_line(d))
+                .map(one_line)
                 .filter(|d| !d.is_empty())
                 .map(|d| fit_text(&d, DESC_FONT_PX, w - HEADER_PAD_X * 2.0).into())
         } else {

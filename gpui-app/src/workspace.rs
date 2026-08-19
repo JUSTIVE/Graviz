@@ -209,14 +209,13 @@ impl Workspace {
                     break;
                 };
                 let cur = loader::fingerprint(&schema);
-                if last != 0 && cur != last {
-                    if this
+                if last != 0 && cur != last
+                    && this
                         .update(cx, |this: &mut Self, cx| this.reload_from_disk(cx))
                         .is_err()
                     {
                         break;
                     }
-                }
                 last = cur;
             }
         })

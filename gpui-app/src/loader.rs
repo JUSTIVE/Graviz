@@ -40,14 +40,14 @@ pub fn load_sdl(
         hide_relay_boilerplate: hide_relay,
         ..Default::default()
     };
-    let mut graph = graph::sdl_to_graph(&sdl, &base_options);
+    let mut graph = graph::sdl_to_graph(sdl, &base_options);
     if let Some(err) = &graph.error {
         bail!("schema parse error: {err}");
     }
 
     let mut applied_diff = None;
     if let Some(overlay_sdl) = overlay_sdl.filter(|s| !s.trim().is_empty()) {
-        let prepared = graph::prepare_overlay(&sdl, overlay_sdl);
+        let prepared = graph::prepare_overlay(sdl, overlay_sdl);
         for w in &prepared.warnings {
             eprintln!("overlay warning: {w}");
         }

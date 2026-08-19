@@ -210,7 +210,7 @@ impl GraphCanvas {
     fn fit(&mut self, vw: f32, vh: f32) {
         let (gw, gh) = (self.model.world_w.max(1.0), self.model.world_h.max(1.0));
         let pad = 80.0;
-        let k = ((vw - pad) / gw).min((vh - pad) / gh).min(1.2).max(ZOOM_MIN);
+        let k = ((vw - pad) / gw).min((vh - pad) / gh).clamp(ZOOM_MIN, 1.2);
         // On huge graphs a full fit is an unreadable speck field — land on the
         // query root instead, zoomed in enough that text is legible.
         if k < 0.15 {
@@ -473,11 +473,68 @@ impl GraphCanvas {
         }
         if self.investigate {
             let (documented, total) = m.desc_coverage;
-            let pct = if total > 0 { documented * 100 / total } else { 100 };
+            let pct = (documented * 100).checked_div(total).unwrap_or(100);
             s.push_str(&format!(" · desc {pct}%"));
         }
         s
     }
+}
+
+/// Largest deviation, in screen pixels, we aim for between a flattened edge
+/// and the true curve. Below half a pixel the difference is not resolvable.
+const CURVE_TOL: f32 = 0.35;
+
+/// Line segments an edge layer may emit in one frame before the tolerance is
+/// relaxed to fit. Stroke tessellation measures at ~0.113µs per segment, so
+/// this is about 5.1ms — the share of a 120fps frame (8.3ms) that edges can
+/// have and still leave the ~2.1ms that cards and text cost at their worst.
+const SEG_BUDGET: usize = 45_000;
+
+/// Segments needed to keep one cubic within `tol` screen pixels of its chords.
+///
+/// Second differences bound the curve's second derivative, and a cubic split
+/// into n equal steps sits within max|B''| / (8n²) of its chords.
+fn cubic_steps(
+    p0: gompass_core::layout::Point,
+    c: &gompass_core::layout::CubicSeg,
+    k: f32,
+    tol: f32,
+) -> usize {
+    let d0x = (p0.x - 2.0 * c.c1.x + c.c2.x) * k;
+    let d0y = (p0.y - 2.0 * c.c1.y + c.c2.y) * k;
+    let d1x = (c.c1.x - 2.0 * c.c2.x + c.end.x) * k;
+    let d1y = (c.c1.y - 2.0 * c.c2.y + c.end.y) * k;
+    let m = (d0x * d0x + d0y * d0y).max(d1x * d1x + d1y * d1y).sqrt();
+    ((0.75 * m / tol).sqrt().ceil() as usize).clamp(1, 24)
+}
+
+/// Emit one cubic as line segments, choosing the segment count from how much
+/// the curve actually bends *on screen*.
+///
+/// Handing cubics to `PathBuilder::cubic_bezier_to` costs about five times
+/// more per edge than line segments, and the cost grows with on-screen size —
+/// it was 17ms of a 17.7ms frame at k=0.6. Flattening here instead spends
+/// segments only where there is curvature to resolve: a gentle edge collapses
+/// to one segment when zoomed out and still bends smoothly when zoomed in.
+fn flatten_cubic(
+    builder: &mut PathBuilder,
+    p0: gompass_core::layout::Point,
+    c: &gompass_core::layout::CubicSeg,
+    k: f32,
+    tol: f32,
+    to_screen: &impl Fn(f32, f32) -> gpui::Point<Pixels>,
+) -> usize {
+    let n = cubic_steps(p0, c, k, tol);
+    for i in 1..=n {
+        let t = i as f32 / n as f32;
+        let u = 1.0 - t;
+        let (a, b, cc, d) = (u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t);
+        builder.line_to(to_screen(
+            a * p0.x + b * c.c1.x + cc * c.c2.x + d * c.end.x,
+            a * p0.y + b * c.c1.y + cc * c.c2.y + d * c.end.y,
+        ));
+    }
+    n
 }
 
 fn edge_color(th: &Theme, group: EdgeGroup) -> Hsla {
@@ -878,6 +935,7 @@ impl Render for GraphCanvas {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint_scene(
     model: &Model,
     view: ViewTransform,
@@ -905,6 +963,33 @@ fn paint_scene(
 
     let to_screen = |x: f32, y: f32| point(px(ox + x * k), px(oy + y * k));
 
+    let t_probe = std::time::Instant::now();
+    // Frame budget: price the edges at the ideal tolerance first, and if the
+    // bill is too high, relax the tolerance just enough to fit. n scales with
+    // 1/sqrt(tol), so the correction is the square of the overrun. This is
+    // what keeps the frame inside 8.3ms when the whole schema is on screen;
+    // at any zoom where the edges already fit, the tolerance stays ideal and
+    // nothing is given up.
+    let curve_tol = {
+        let mut want = 0usize;
+        for e in &model.edges {
+            if e.bbox[2] < wx0 || e.bbox[0] > wx1 || e.bbox[3] < wy0 || e.bbox[1] > wy1 {
+                continue;
+            }
+            let mut p0 = e.start;
+            for c in &e.curves {
+                want += cubic_steps(p0, c, k, CURVE_TOL);
+                p0 = c.end;
+            }
+        }
+        if want > SEG_BUDGET {
+            CURVE_TOL * (want as f32 / SEG_BUDGET as f32).powi(2)
+        } else {
+            CURVE_TOL
+        }
+    };
+    let mut n_pts = 0usize;
+    
     // ---- edges, one stroked path per color group ----
     let groups = [
         EdgeGroup::FieldNonNull,
@@ -915,16 +1000,6 @@ fn paint_scene(
     ];
     let stroke_w = (1.5 * k).clamp(0.6, 2.5);
     let draw_arrows = k >= 0.3;
-    // Curvature only reads above a certain zoom; below it, stride-sample the
-    // pre-flattened polyline instead of tessellating every Bézier.
-    let smooth = k >= 0.45;
-    let stride: usize = if k < 0.12 {
-        3
-    } else if k < 0.3 {
-        2
-    } else {
-        1
-    };
     // Edges live in their own layer so cards (next layer) always draw above
     // them — within a single layer GPUI batches by primitive type, which
     // does not guarantee paths-under-quads.
@@ -990,27 +1065,12 @@ fn paint_scene(
                 continue;
             }
             builder.move_to(to_screen(e.start.x, e.start.y));
-            if smooth {
-                for c in &e.curves {
-                    builder.cubic_bezier_to(
-                        to_screen(c.end.x, c.end.y),
-                        to_screen(c.c1.x, c.c1.y),
-                        to_screen(c.c2.x, c.c2.y),
-                    );
-                }
-                segs += e.curves.len().max(1);
-            } else {
-                // Zoomed out the curvature is sub-pixel; the pre-flattened
-                // polyline tessellates far cheaper than adaptive Béziers.
-                let pts = &e.points;
-                let mut i = 2 * stride;
-                while i + 1 < pts.len() {
-                    builder.line_to(to_screen(pts[i], pts[i + 1]));
-                    i += 2 * stride;
-                }
-                let n = pts.len();
-                builder.line_to(to_screen(pts[n - 2], pts[n - 1]));
-                segs += pts.len() / (2 * stride).max(1) + 1;
+            let mut p0 = e.start;
+            for c in &e.curves {
+                let n = flatten_cubic(&mut builder, p0, c, k, curve_tol, &to_screen);
+                segs += n;
+                n_pts += n;
+                p0 = c.end;
             }
             any = true;
 
@@ -1054,12 +1114,10 @@ fn paint_scene(
         if let Some(e) = model.edges.get(ei as usize) {
             let mut builder = PathBuilder::stroke(px((stroke_w * 2.0).max(2.0)));
             builder.move_to(to_screen(e.start.x, e.start.y));
+            let mut p0 = e.start;
             for c in &e.curves {
-                builder.cubic_bezier_to(
-                    to_screen(c.end.x, c.end.y),
-                    to_screen(c.c1.x, c.c1.y),
-                    to_screen(c.c2.x, c.c2.y),
-                );
+                flatten_cubic(&mut builder, p0, c, k, curve_tol, &to_screen);
+                p0 = c.end;
             }
             if let Ok(path) = builder.build() {
                 window.paint_path(path, edge_color(&th, e.group).opacity(1.0));
@@ -1067,6 +1125,7 @@ fn paint_scene(
         }
     }
     });
+    let t_edges = t_probe.elapsed().as_secs_f32() * 1000.0;
 
     // ---- nodes (their own layer, above the edges) ----
     // Geometry, colors and draw order mirror the web renderer's
@@ -1084,7 +1143,6 @@ fn paint_scene(
     let mut text_errors = 0usize;
     // GOMPASS_PERF=1 reports what a frame actually costs.
     let probe = std::env::var("GOMPASS_PERF").is_ok();
-    let t_probe = std::time::Instant::now();
     let mut n_cards = 0usize;
     let mut n_rows = 0usize;
     SHAPES.with(|c| c.set(0));
@@ -1549,16 +1607,8 @@ fn paint_scene(
                 !(e.bbox[2] < wx0 || e.bbox[0] > wx1 || e.bbox[3] < wy0 || e.bbox[1] > wy1)
             })
             .count();
-        let pts: usize = model
-            .edges
-            .iter()
-            .filter(|e| {
-                !(e.bbox[2] < wx0 || e.bbox[0] > wx1 || e.bbox[3] < wy0 || e.bbox[1] > wy1)
-            })
-            .map(|e| e.points.len() / 2)
-            .sum();
         eprintln!(
-            "perf: k={k:.2} {:.2}ms cards={n_cards} rows={n_rows} shapes={} edges={n_edges} edge_pts={pts}",
+            "perf: k={k:.2} {:.2}ms (edges {t_edges:.2}) cards={n_cards} rows={n_rows} shapes={} edges={n_edges} emit={n_pts} tol={curve_tol:.2}",
             t_probe.elapsed().as_secs_f32() * 1000.0,
             SHAPES.with(|c| c.get())
         );
@@ -1621,4 +1671,33 @@ fn paint_baseline(
         cx,
     )
     .is_err() as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gompass_core::layout::{CubicSeg, Point};
+
+    #[test]
+    fn cubic_steps_scale_with_on_screen_curvature() {
+        let p0 = Point { x: 0.0, y: 0.0 };
+        // control points on the chord: no curvature to resolve
+        let straight = CubicSeg {
+            c1: Point { x: 100.0, y: 0.0 },
+            c2: Point { x: 200.0, y: 0.0 },
+            end: Point { x: 300.0, y: 0.0 },
+        };
+        assert_eq!(cubic_steps(p0, &straight, 1.0, CURVE_TOL), 1);
+
+        let bent = CubicSeg {
+            c1: Point { x: 100.0, y: 400.0 },
+            c2: Point { x: 200.0, y: -400.0 },
+            end: Point { x: 300.0, y: 0.0 },
+        };
+        let near = cubic_steps(p0, &bent, 1.0, CURVE_TOL);
+        let far = cubic_steps(p0, &bent, 0.05, CURVE_TOL);
+        assert!(near > far, "zoomed in must subdivide more: {near} vs {far}");
+        // relaxing the tolerance must never ask for more segments
+        assert!(cubic_steps(p0, &bent, 1.0, CURVE_TOL * 16.0) < near);
+    }
 }

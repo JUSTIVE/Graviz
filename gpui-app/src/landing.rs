@@ -86,6 +86,7 @@ pub struct LandingProps<'a> {
 /// Builds the landing body. Callbacks are wired by the caller through the
 /// returned element ids: `open-file`, `load-sample`, `visualize`,
 /// `toggle-recents`, `clear-recents`, `recent-{i}`, `recent-x-{i}`.
+#[allow(clippy::too_many_arguments)]
 pub fn view<T: 'static>(
     p: LandingProps<'_>,
     on_open: impl Fn(&mut T, &mut Window, &mut gpui::Context<T>) + 'static,
