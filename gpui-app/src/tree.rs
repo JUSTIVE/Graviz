@@ -111,7 +111,8 @@ impl TreePanel {
             union_members: Vec::new(),
             referenced_by: Vec::new(),
         };
-        // TEMP DEBUG
+        // Debug presets, matching GOMPASS_MODE / GOMPASS_VIEW: open the panel
+        // on a query or a selected type so selfshots can verify both states.
         if let Ok(q) = std::env::var("GOMPASS_TREE") {
             this.query = q;
             this.refresh();
