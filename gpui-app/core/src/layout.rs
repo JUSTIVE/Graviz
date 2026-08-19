@@ -99,12 +99,40 @@ impl Default for LayoutConfig {
     }
 }
 
+/// Simplex pivots per component. The optimum is normally reached in far
+/// fewer; the bound only stops a pathological graph from stalling the app.
+const SIMPLEX_PIVOTS: usize = 2048;
+
+struct XNode {
+    /// Some(local real index) or None for virtual.
+    real: Option<u32>,
+    rank: i32,
+    w: f32,
+    h: f32,
+}
+
+/// Middle value, or `None` for an empty slice. The L1 centre: the point that
+/// minimises the total distance to the inputs, which is what "put this node
+/// where its neighbours are" means when the cost is edge length.
+fn median(vals: &mut [f32]) -> Option<f32> {
+    if vals.is_empty() {
+        return None;
+    }
+    vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    Some(vals[vals.len() / 2])
+}
+
 const VIRTUAL_W: f32 = 8.0;
 /// Virtual nodes are lanes, not boxes: giving them height would inflate every
 /// rank they pass through (thousands of them on a dense schema).
 const VIRTUAL_H: f32 = 0.0;
 /// Vertical gap between two lanes sharing a rank.
 const VIRTUAL_SEP: f32 = 2.0;
+
+/// How much empty space a rank may keep between two neighbours, as a multiple
+/// of `node_sep`. Some slack keeps edges from kinking; too much is the air
+/// that made the drawing six times taller than its cards.
+const GAP_SLACK: f32 = 3.0;
 
 /// `roots` bias ranking so root types (Query/Mutation) start at rank 0.
 /// A parent type and the variants that should line up in the column directly
@@ -342,6 +370,16 @@ pub fn layout(
     }
 
     if std::env::var("GOMPASS_PERF").is_ok() {
+        let card_area: f32 = nodes.iter().map(|n| n.w * n.h).sum();
+        let mut dims: Vec<(f32, f32)> = comps.iter().map(|c| (c.w, c.h)).collect();
+        dims.sort_by(|a, b| (b.0 * b.1).partial_cmp(&(a.0 * a.1)).unwrap());
+        eprintln!(
+            "packing: {} comps (top {:?}), {} singletons, fill {:.1}%",
+            comps.len(),
+            dims.iter().take(3).map(|(w, h)| format!("{w:.0}x{h:.0}")).collect::<Vec<_>>(),
+            singleton_ids.len(),
+            100.0 * card_area / (packed_w * packed_h).max(1.0)
+        );
         let mut total_len = 0.0f32;
         let mut total_dx = 0.0f32;
         let mut total_dy = 0.0f32;
@@ -499,6 +537,82 @@ fn anchor_points(
     };
     (start, end)
 }
+
+/// The breadth-first tree: one parent edge per node, the edges that decide
+/// how deep the graph has to be.
+fn bfs_tree_edges(
+    m: usize,
+    succ: &[Vec<u32>],
+    pred: &[Vec<u32>],
+    comp: &[u32],
+    is_root: &[bool],
+) -> std::collections::HashSet<(u32, u32)> {
+    let mut seen = vec![false; m];
+    let mut tree = std::collections::HashSet::new();
+    let mut queue: std::collections::VecDeque<u32> = (0..m as u32)
+        .filter(|&v| is_root[comp[v as usize] as usize] || pred[v as usize].is_empty())
+        .collect();
+    for &v in &queue {
+        seen[v as usize] = true;
+    }
+    for seed in 0..m {
+        if !seen[seed] && queue.is_empty() {
+            seen[seed] = true;
+            queue.push_back(seed as u32);
+        }
+        while let Some(v) = queue.pop_front() {
+            for &w in &succ[v as usize] {
+                if !seen[w as usize] {
+                    seen[w as usize] = true;
+                    tree.insert((v, w));
+                    queue.push_back(w);
+                }
+            }
+        }
+    }
+    tree
+}
+
+/// Distance from the roots, the shallow-but-infeasible layering. Kept as a
+/// fallback: it halves the depth of a deep schema, at the price of leaving
+/// edges that point backwards.
+fn bfs_rank(
+    m: usize,
+    succ: &[Vec<u32>],
+    pred: &[Vec<u32>],
+    comp: &[u32],
+    is_root: &[bool],
+) -> Vec<i32> {
+    let mut rank = vec![-1i32; m];
+    let mut queue: std::collections::VecDeque<u32> = (0..m as u32)
+        .filter(|&v| is_root[comp[v as usize] as usize] || pred[v as usize].is_empty())
+        .collect();
+    for &v in &queue {
+        rank[v as usize] = 0;
+    }
+    for seed in 0..m {
+        if rank[seed] < 0 && queue.is_empty() {
+            rank[seed] = 0;
+            queue.push_back(seed as u32);
+        }
+        while let Some(v) = queue.pop_front() {
+            let d = rank[v as usize];
+            for &w in &succ[v as usize] {
+                if rank[w as usize] < 0 {
+                    rank[w as usize] = d + 1;
+                    queue.push_back(w);
+                }
+            }
+        }
+    }
+    for r in rank.iter_mut() {
+        if *r < 0 {
+            *r = 0;
+        }
+    }
+    rank
+}
+
 
 /// Relax the interior of a routed chain toward its neighbours.
 ///
@@ -719,14 +833,19 @@ fn layout_component(
     acyclic.sort_unstable_by_key(|&(p, _)| p);
     acyclic.dedup_by_key(|&mut (p, _)| p);
 
-    // ---- ranking: BFS depth from the roots, then tightened ----
-    // Longest-path ranking is monotone by construction, but it makes the DAG
-    // as deep as its longest chain — on this schema 70 columns — and every
-    // edge then spans a fifth of the picture. Ranking by distance from the
-    // roots halves the depth, which measurably halves both average edge
-    // length and the number of cards an edge cuts across; the minority of
-    // edges left pointing backwards are simply drawn as backward curves.
-    let mut rank = vec![-1i32; m];
+    // ---- ranking ----
+    // Every node's column is its rank, so the sum of edge spans *is* the
+    // horizontal half of total edge length — three quarters of it, measured.
+    // `ranking::network_simplex` minimises that sum exactly, and is available
+    // behind GOMPASS_SIMPLEX, but it is not the default: minimal *rank span*
+    // and minimal *pixel length* turn out to be different objectives once a
+    // rank's height is bounded. Requiring every edge to advance a column
+    // makes this schema 72 columns wide (avg length 8256 against BFS's 4600);
+    // relaxing non-tree edges to minlen 0 cuts the span from 24888 to 8785,
+    // but then whole ranks overflow and the height balancing spends the
+    // saving back. BFS depth is infeasible — a third of the edges come out
+    // backwards, and those are routed as such — but it is measurably the
+    // shorter drawing.
     let mut succ: Vec<Vec<u32>> = vec![Vec::new(); m];
     let mut pred: Vec<Vec<u32>> = vec![Vec::new(); m];
     for &((a, b), _) in &acyclic {
@@ -735,87 +854,28 @@ fn layout_component(
             pred[b as usize].push(a);
         }
     }
-    {
-        let mut queue: std::collections::VecDeque<u32> = (0..m as u32)
-            .filter(|&v| is_root[comp[v as usize] as usize] || pred[v as usize].is_empty())
+    let mut rank = if std::env::var("GOMPASS_SIMPLEX").is_err() {
+        bfs_rank(m, &succ, &pred, comp, is_root)
+    } else {
+        // Only the breadth-first tree has to spend a column: those edges set
+        // the depth, and the depth is what the picture's width costs. Every
+        // other edge is merely required to run forward — it may share a
+        // column with its source if that is shorter. Forcing *every* edge to
+        // advance is what makes a textbook layering 72 columns wide on this
+        // schema, and pixel length follows width, not rank span.
+        let tree = bfs_tree_edges(m, &succ, &pred, comp, is_root);
+        let redges: Vec<crate::ranking::RankEdge> = acyclic
+            .iter()
+            .filter(|((a, b), _)| a != b)
+            .map(|&((a, b), _)| crate::ranking::RankEdge {
+                from: a,
+                to: b,
+                weight: 1,
+                minlen: if tree.contains(&(a, b)) { 1 } else { 0 },
+            })
             .collect();
-        for &v in &queue {
-            rank[v as usize] = 0;
-        }
-        // Anything a root cannot reach starts a BFS of its own, so every node
-        // ends up with a sensible depth.
-        for seed in 0..m {
-            if rank[seed] < 0 && queue.is_empty() {
-                rank[seed] = 0;
-                queue.push_back(seed as u32);
-            }
-            while let Some(v) = queue.pop_front() {
-                let d = rank[v as usize];
-                for &w in &succ[v as usize] {
-                    if rank[w as usize] < 0 {
-                        rank[w as usize] = d + 1;
-                        queue.push_back(w);
-                    }
-                }
-            }
-        }
-    }
-    {
-        // Pull each node to the median of its neighbours, inside the slack its
-        // own edges allow. Only forward neighbours constrain that slack: with
-        // BFS ranks some edges legitimately point backwards.
-        let mut order: Vec<u32> = (0..m as u32).collect();
-        order.sort_by_key(|&v| rank[v as usize]);
-        let mut scratch: Vec<i32> = Vec::new();
-        for _ in 0..12 {
-            let mut moved = false;
-            for &v in &order {
-                let vi = v as usize;
-                if is_root[comp[vi] as usize] {
-                    continue;
-                }
-                if pred[vi].is_empty() && succ[vi].is_empty() {
-                    continue;
-                }
-                let lo = pred[vi]
-                    .iter()
-                    .map(|&p| rank[p as usize] + 1)
-                    .filter(|&r| r <= rank[vi])
-                    .max()
-                    .unwrap_or(0);
-                let hi = succ[vi]
-                    .iter()
-                    .map(|&sx| rank[sx as usize] - 1)
-                    .filter(|&r| r >= rank[vi])
-                    .min()
-                    .unwrap_or(i32::MAX);
-                if hi < lo {
-                    continue;
-                }
-                scratch.clear();
-                scratch.extend(pred[vi].iter().map(|&p| rank[p as usize] + 1));
-                scratch.extend(succ[vi].iter().map(|&sx| rank[sx as usize] - 1));
-                scratch.sort_unstable();
-                let target = scratch[scratch.len() / 2].clamp(lo, hi);
-                if target != rank[vi] {
-                    rank[vi] = target;
-                    moved = true;
-                }
-            }
-            if !moved {
-                break;
-            }
-        }
-        // Ranks may now have gaps; compact them so no empty column survives.
-        let mut used: Vec<i32> = rank.clone();
-        used.sort_unstable();
-        used.dedup();
-        let remap: HashMap<i32, i32> =
-            used.iter().enumerate().map(|(i, &r)| (r, i as i32)).collect();
-        for r in rank.iter_mut() {
-            *r = remap[r];
-        }
-    }
+        crate::ranking::network_simplex(m, &redges, SIMPLEX_PIVOTS)
+    };
 
     // ---- balance over-tall ranks into real ranks ----
     // BFS depth alone leaves one rank holding hundreds of nodes, which turns
@@ -829,6 +889,9 @@ fn layout_component(
         let total_h: f32 = (0..m).map(node_h).sum();
         let avg_w = (0..m).map(|v| nodes[comp[v] as usize].w).sum::<f32>() / m.max(1) as f32;
         // Cap chosen so the finished component lands near square.
+        // Near-square, which also measured as the edge-length optimum: a
+        // wider drawing lengthens every edge's horizontal run, a taller one
+        // its vertical run.
         let cap = (total_h * (avg_w + config.rank_sep)).sqrt().max(2000.0);
         // Each node's atomic unit: itself, or a shared id if it belongs to a
         // cluster that is now sitting in one column. Splitting a rank must
@@ -927,13 +990,6 @@ fn layout_component(
     // ---- virtual-node expansion ----
     // Every DAG pair spanning >1 rank gets a chain of virtual nodes, one per
     // intermediate rank. All nodes (real + virtual) participate in ordering.
-    struct XNode {
-        /// Some(local real index) or None for virtual.
-        real: Option<u32>,
-        rank: i32,
-        w: f32,
-        h: f32,
-    }
     let mut xnodes: Vec<XNode> = (0..m)
         .map(|i| XNode {
             real: Some(i as u32),
@@ -1036,14 +1092,6 @@ fn layout_component(
         }
     };
     assign_pos(&ranks, &mut pos_in_rank);
-
-    let median = |vals: &mut Vec<f32>| -> Option<f32> {
-        if vals.is_empty() {
-            return None;
-        }
-        vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        Some(vals[vals.len() / 2])
-    };
 
     // ---- barycenter/median ordering sweeps ----
     let nranks = ranks.len();
@@ -1283,7 +1331,89 @@ fn layout_component(
     // isotonic (PAVA) fit: minimum total movement under the ordering
     // constraint, instead of a forward push that made every rank drift
     // diagonally downward.
-    for iter in 0..6 {
+    // Six passes; the fit stops moving after about that many.
+    relax_y(&ranks, &xnodes, &xin, &xout, &sep_of, &mut y, 6);
+
+    // ---- close the gaps the relaxation opened ----
+    // The median pull drags nodes toward distant neighbours and the isotonic
+    // fit only enforces a *minimum* separation, so a rank ends up six times
+    // taller than the cards in it — 16% of the drawing is card, the rest is
+    // air, and every edge that crosses that air is longer for it. Squeeze any
+    // gap beyond `slack` out of each rank, keeping the order, then let the
+    // relaxation settle again against the tighter picture.
+    {
+        let slack = config.node_sep * GAP_SLACK;
+        for pass in 0..3 {
+            for bucket in ranks.iter() {
+                let mut shift = 0.0f32;
+                let mut prev_bottom: Option<f32> = None;
+                for &v in bucket {
+                    let vi = v as usize;
+                    let top = y[vi] - shift;
+                    if let Some(pb) = prev_bottom {
+                        let gap = top - pb;
+                        if gap > slack {
+                            shift += gap - slack;
+                        }
+                    }
+                    y[vi] -= shift;
+                    prev_bottom = Some(y[vi] + xnodes[vi].h + sep_of(&xnodes[vi]));
+                }
+            }
+            // Let the relaxation settle against the tighter picture, but not
+            // after the last squeeze — it would simply re-open the gaps.
+            if pass < 2 {
+                relax_y(&ranks, &xnodes, &xin, &xout, &sep_of, &mut y, 2);
+            }
+        }
+    }
+
+    // ---- normalize, write real positions, emit routes ----
+    let min_y = (0..xn).map(|i| y[i]).fold(f32::INFINITY, f32::min);
+    let mut comp_h = 0.0f32;
+    let mut xpos = vec![Point { x: 0.0, y: 0.0 }; xn];
+    for (i, x) in xnodes.iter().enumerate() {
+        let ri = xrank[i];
+        let p = Point {
+            x: rank_x[ri] + (rank_w[ri] - x.w) / 2.0,
+            y: y[i] - min_y,
+        };
+        comp_h = comp_h.max(p.y + x.h);
+        xpos[i] = p;
+        if let Some(real) = x.real {
+            positions[comp[real as usize] as usize] = p;
+        }
+    }
+    for ((la, lb), chain) in chains {
+        let waypoints: Vec<Point> = chain
+            .iter()
+            .map(|&id| {
+                let p = xpos[id as usize];
+                let x = &xnodes[id as usize];
+                Point { x: p.x + x.w / 2.0, y: p.y + x.h / 2.0 }
+            })
+            .collect();
+        emit_route((comp[la as usize], comp[lb as usize]), waypoints);
+    }
+    (comp_w.max(0.0), comp_h)
+}
+
+/// Pull every node toward the median of its neighbours, then resolve overlaps
+/// inside each rank as an isotonic fit — the least total movement that still
+/// respects the order, rather than a forward push that makes each rank drift
+/// diagonally downward.
+#[allow(clippy::too_many_arguments)]
+fn relax_y(
+    ranks: &[Vec<u32>],
+    xnodes: &[XNode],
+    xin: &[Vec<u32>],
+    xout: &[Vec<u32>],
+    sep_of: &impl Fn(&XNode) -> f32,
+    y: &mut [f32],
+    yiters: usize,
+) {
+    let nranks = ranks.len();
+    for iter in 0..yiters {
         let range: Vec<usize> = if iter % 2 == 0 {
             (0..nranks).collect()
         } else {
@@ -1348,35 +1478,6 @@ fn layout_component(
             }
         }
     }
-
-    // ---- normalize, write real positions, emit routes ----
-    let min_y = (0..xn).map(|i| y[i]).fold(f32::INFINITY, f32::min);
-    let mut comp_h = 0.0f32;
-    let mut xpos = vec![Point { x: 0.0, y: 0.0 }; xn];
-    for (i, x) in xnodes.iter().enumerate() {
-        let ri = xrank[i];
-        let p = Point {
-            x: rank_x[ri] + (rank_w[ri] - x.w) / 2.0,
-            y: y[i] - min_y,
-        };
-        comp_h = comp_h.max(p.y + x.h);
-        xpos[i] = p;
-        if let Some(real) = x.real {
-            positions[comp[real as usize] as usize] = p;
-        }
-    }
-    for ((la, lb), chain) in chains {
-        let waypoints: Vec<Point> = chain
-            .iter()
-            .map(|&id| {
-                let p = xpos[id as usize];
-                let x = &xnodes[id as usize];
-                Point { x: p.x + x.w / 2.0, y: p.y + x.h / 2.0 }
-            })
-            .collect();
-        emit_route((comp[la as usize], comp[lb as usize]), waypoints);
-    }
-    (comp_w.max(0.0), comp_h)
 }
 
 #[cfg(test)]
@@ -1465,6 +1566,45 @@ mod tests {
         ];
         simplify(&mut corner, 3.0);
         assert_eq!(corner.len(), 3, "a real corner must survive");
+    }
+
+    #[test]
+    fn compaction_closes_the_air_the_relaxation_opens() {
+        // A hub with many children pulls its neighbours' medians apart; the
+        // squeeze afterwards has to bring the column back together.
+        let mut nodes = vec![node(100.0, 40.0); 1];
+        let mut edges = Vec::new();
+        for i in 1..=12u32 {
+            nodes.push(node(100.0, 40.0));
+            edges.push(edge(0, i));
+        }
+        // A second column hanging off alternate children spreads them out.
+        for i in (1..=12u32).step_by(2) {
+            nodes.push(node(100.0, 40.0));
+            let t = (nodes.len() - 1) as u32;
+            edges.push(edge(i, t));
+        }
+        let r = layout(&nodes, &edges, &[0], &[], &LayoutConfig::default());
+        // Every gap between vertically adjacent cards in a column stays
+        // within the slack the compaction allows.
+        let cfg = LayoutConfig::default();
+        let mut by_col: std::collections::HashMap<i64, Vec<(f32, f32)>> = HashMap::new();
+        for (i, p) in r.positions.iter().enumerate() {
+            by_col
+                .entry((p.x + nodes[i].w / 2.0).round() as i64)
+                .or_default()
+                .push((p.y, p.y + nodes[i].h));
+        }
+        for spans in by_col.values_mut() {
+            spans.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            for w in spans.windows(2) {
+                let gap = w[1].0 - w[0].1;
+                assert!(
+                    gap <= cfg.node_sep * GAP_SLACK + cfg.node_sep + 1.0,
+                    "a {gap:.0}px hole survived the squeeze"
+                );
+            }
+        }
     }
 
     #[test]

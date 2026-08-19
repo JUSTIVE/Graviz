@@ -284,12 +284,14 @@ impl GraphCanvas {
         let (gw, gh) = (self.model.world_w.max(1.0), self.model.world_h.max(1.0));
         let pad = 80.0;
         let k = ((vw - pad) / gw).min((vh - pad) / gh).clamp(ZOOM_MIN, 1.2);
-        // On huge graphs a full fit is an unreadable speck field — land on the
-        // query root instead, zoomed in enough that text is legible.
+        // On huge graphs a full fit is an unreadable speck field — frame the
+        // query root instead, zoomed in enough that text is legible. Framing
+        // only: opening a schema is not the same as choosing a type, and
+        // starting with one already selected dims the whole rest of the graph
+        // against a choice the reader never made.
         if k < 0.15 {
             if let Some(&root) = self.model.roots.first() {
-                self.view.k = 0.8;
-                self.center_on(root, vw, vh);
+                self.frame_on(root, vw, vh, 0.8);
                 return;
             }
         }
@@ -400,6 +402,17 @@ impl GraphCanvas {
         }
     }
 
+    /// Put `card` in the middle of the viewport without selecting it.
+    fn frame_on(&mut self, card: u32, vw: f32, vh: f32, k: f32) {
+        let c = &self.model.cards[card as usize];
+        let p = self.model.positions[card as usize];
+        self.view = ViewTransform {
+            x: vw / 2.0 - (p.x + c.w / 2.0) * k,
+            y: vh / 2.0 - (p.y + c.h / 2.0) * k,
+            k,
+        };
+    }
+
     fn center_on(&mut self, card: u32, vw: f32, vh: f32) {
         if !self.suppress_push {
             if let Some(f) = self.focus {
@@ -412,14 +425,8 @@ impl GraphCanvas {
             }
         }
         self.suppress_push = false;
-        let c = &self.model.cards[card as usize];
-        let p = self.model.positions[card as usize];
         let k = self.view.k.max(0.9);
-        self.view = ViewTransform {
-            x: vw / 2.0 - (p.x + c.w / 2.0) * k,
-            y: vh / 2.0 - (p.y + c.h / 2.0) * k,
-            k,
-        };
+        self.frame_on(card, vw, vh, k);
         if self.focus != Some(card) {
             self.focus_changed_at = Some(std::time::Instant::now());
         }
