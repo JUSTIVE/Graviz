@@ -123,11 +123,11 @@ fn median(vals: &mut [f32]) -> Option<f32> {
 }
 
 /// Sifting refinement: how many passes, and how far a node may slide.
-/// Sifting refinement: how many passes, and how far a node may slide. A wider
-/// window keeps buying card crossings (3.65/edge at 160) but starts costing
-/// edge crossings and length, and edge crossings are the thing to minimise.
-const SIFT_PASSES: usize = 4;
-const SIFT_WINDOW: usize = 24;
+/// Passes of the block-level refinement after clusters are gathered. Two is
+/// where it stops finding anything: 2 and 16 land on the same drawing, and
+/// each extra pass costs ~2ms of a 35ms layout.
+const BLOCK_PASSES: usize = 2;
+
 
 const VIRTUAL_W: f32 = 8.0;
 /// Virtual nodes are lanes, not boxes: giving them height would inflate every
@@ -370,7 +370,10 @@ pub fn layout(
         });
     }
 
-    if std::env::var("GOMPASS_PERF").is_ok() {
+    // The quality metrics cost more than the layout they measure (the edge
+    // crossing count alone is a few million segment tests), so they sit
+    // behind their own switch — GOMPASS_PERF stays a timing signal.
+    if std::env::var("GOMPASS_METRICS").is_ok() {
         let card_area: f32 = nodes.iter().map(|n| n.w * n.h).sum();
         let mut dims: Vec<(f32, f32)> = comps.iter().map(|c| (c.w, c.h)).collect();
         dims.sort_by(|a, b| (b.0 * b.1).partial_cmp(&(a.0 * a.1)).unwrap());
@@ -958,6 +961,8 @@ fn layout_component(
     // because a leaf referenced from two distant columns has to sit after the
     // later one whatever the weight says. The structure, not the weight, is
     // what makes those edges long.
+    let t_stage = std::time::Instant::now();
+    let timing = std::env::var("GOMPASS_PERF").is_ok() && m > 100;
     let redges: Vec<crate::ranking::RankEdge> = acyclic
         .iter()
         .filter(|((a, b), _)| a != b)
@@ -965,6 +970,11 @@ fn layout_component(
         .collect();
     let mut rank = crate::ranking::network_simplex(m, &redges, SIMPLEX_PIVOTS);
 
+
+    if timing {
+        eprintln!("  stage rank      {:>6.1}ms", t_stage.elapsed().as_secs_f32() * 1000.0);
+    }
+    let t_stage = std::time::Instant::now();
 
     // ---- balance over-tall ranks into real ranks ----
     // BFS depth alone leaves one rank holding hundreds of nodes, which turns
@@ -1165,6 +1175,11 @@ fn layout_component(
     }
     let xn = xnodes.len();
 
+    if timing {
+        eprintln!("  stage expand    {:>6.1}ms", t_stage.elapsed().as_secs_f32() * 1000.0);
+    }
+    let t_stage = std::time::Instant::now();
+
     // ---- rank buckets ----
     let max_rank = xnodes.iter().map(|x| x.rank).max().unwrap_or(0);
     let mut ranks: Vec<Vec<u32>> = vec![Vec::new(); (max_rank + 1) as usize];
@@ -1195,6 +1210,11 @@ fn layout_component(
     // that sweep crosses more than the dead end was blocking.
     let nranks = ranks.len();
     order_ranks(&mut ranks, &mut pos_in_rank, &xin, &xout, nranks, config);
+
+    if timing {
+        eprintln!("  stage order     {:>6.1}ms", t_stage.elapsed().as_secs_f32() * 1000.0);
+    }
+    let t_stage = std::time::Instant::now();
 
     // ---- cluster contiguity ----
     // Union members carry no edge to one another, so crossing reduction has
@@ -1267,7 +1287,7 @@ fn layout_component(
         // they now cross. Re-run the adjacent-swap refinement over *blocks*
         // rather than nodes, so the groups keep their shape but are free to
         // slide to where they cost the fewest crossings.
-        for _ in 0..config.transpose_passes {
+        for _ in 0..BLOCK_PASSES {
             let mut improved = false;
             for bucket in ranks.iter_mut() {
                 // Segment the rank into blocks: a cluster's run, or a single
@@ -1336,6 +1356,11 @@ fn layout_component(
         }
     }
 
+    if timing {
+        eprintln!("  stage cluster   {:>6.1}ms", t_stage.elapsed().as_secs_f32() * 1000.0);
+    }
+    let t_stage = std::time::Instant::now();
+
     // ---- x per rank: cumulative max width ----
     let mut rank_x = vec![0.0f32; nranks];
     let mut rank_w = vec![0.0f32; nranks];
@@ -1372,6 +1397,11 @@ fn layout_component(
     // crossings first, length second.
     relax_y(&ranks, &xnodes, &xin, &xout, &sep_of, &mut y, 6);
 
+    if timing {
+        eprintln!("  stage coords    {:>6.1}ms", t_stage.elapsed().as_secs_f32() * 1000.0);
+    }
+    let t_stage = std::time::Instant::now();
+
     // ---- normalize, write real positions, emit routes ----
     let min_y = (0..xn).map(|i| y[i]).fold(f32::INFINITY, f32::min);
     let mut comp_h = 0.0f32;
@@ -1398,6 +1428,9 @@ fn layout_component(
             })
             .collect();
         emit_route((comp[la as usize], comp[lb as usize]), waypoints);
+    }
+    if timing {
+        eprintln!("  stage emit      {:>6.1}ms", t_stage.elapsed().as_secs_f32() * 1000.0);
     }
     (comp_w.max(0.0), comp_h)
 }
@@ -1491,57 +1524,10 @@ fn order_ranks(
         }
     }
 
-    // Sifting: adjacent swaps can only walk downhill one step at a time, so a
-    // node that belongs thirty slots away never gets there. Sifting slides one
-    // node across a window, tracking the running crossing delta, and drops it
-    // at the best position it saw. Restricted to a window because the cost is
-    // the window times the node's degree, and the gain is all in the first
-    // few dozen slots.
-    for _ in 0..SIFT_PASSES {
-        let mut improved = false;
-        for rank_nodes in ranks.iter_mut().take(nranks) {
-            let len = rank_nodes.len();
-            for start in 0..len {
-                let v = rank_nodes[start];
-                let lo = start.saturating_sub(SIFT_WINDOW);
-                let hi = (start + SIFT_WINDOW).min(len - 1);
-                // Walk left from `start`, then right, accumulating the change
-                // in crossings against each node passed.
-                let (mut best_delta, mut best_at) = (0i64, start);
-                let mut delta = 0i64;
-                for i in (lo..start).rev() {
-                    let u = rank_nodes[i];
-                    let (uv, vu) = crossings_between(u, v, pos_in_rank, xin, xout);
-                    delta += vu as i64 - uv as i64;
-                    if delta < best_delta {
-                        best_delta = delta;
-                        best_at = i;
-                    }
-                }
-                delta = 0;
-                for (i, &u) in rank_nodes.iter().enumerate().take(hi + 1).skip(start + 1) {
-                    let (vu, uv) = crossings_between(v, u, pos_in_rank, xin, xout);
-                    delta += uv as i64 - vu as i64;
-                    if delta < best_delta {
-                        best_delta = delta;
-                        best_at = i;
-                    }
-                }
-                if best_delta < 0 && best_at != start {
-                    let v = rank_nodes.remove(start);
-                    rank_nodes.insert(best_at, v);
-                    let (a, b) = (start.min(best_at), start.max(best_at));
-                    for (i, &w) in rank_nodes.iter().enumerate().take(b + 1).skip(a) {
-                        pos_in_rank[w as usize] = i as u32;
-                    }
-                    improved = true;
-                }
-            }
-        }
-        if !improved {
-            break;
-        }
-    }
+    // Sifting — sliding a node across a window to its best slot, rather than
+    // one adjacent swap at a time — was tried here and removed: it spends a
+    // quarter of the layout budget (11ms of 55) and changes nothing, card
+    // crossings 3.59 to 3.55 and edge crossings very slightly worse.
 }
 
 

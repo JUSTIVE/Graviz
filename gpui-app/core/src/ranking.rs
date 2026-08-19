@@ -228,9 +228,11 @@ impl Net {
         }
     }
 
-    /// A tree edge worth replacing.
+    /// A tree edge worth replacing. The lowest edge id among the candidates,
+    /// because hash order is not stable across runs and the same schema has
+    /// to lay out the same way every time.
     fn leave_edge(&self) -> Option<usize> {
-        self.cut.iter().find(|(_, &c)| c < 0).map(|(&i, _)| i)
+        self.cut.iter().filter(|(_, &c)| c < 0).map(|(&i, _)| i).min()
     }
 
     /// The cheapest non-tree edge that reconnects the halves `e` separates.

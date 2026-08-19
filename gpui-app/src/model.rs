@@ -335,6 +335,9 @@ pub struct ModelOptions {
     /// Names `drop_custom_scalars` removed, so the fields pointing at them
     /// can be hidden too — and counted.
     pub hidden_scalars: std::collections::HashSet<String>,
+    /// Build the cards but not the drawing. For the list panels, which never
+    /// read a position.
+    pub skip_layout: bool,
     /// Today as `YYYY-MM-DD`, for `[until]` expiry coloring.
     pub today: String,
 }
@@ -347,6 +350,7 @@ impl Default for ModelOptions {
             hide_primitive_fields: false,
             hide_custom_scalars: false,
             hidden_scalars: std::collections::HashSet::new(),
+            skip_layout: false,
             today: today_string(),
         }
     }
@@ -937,8 +941,19 @@ pub fn build_model(graph: ParsedGraph, schema_name: String, options: &ModelOptio
             (members.len() > 1).then_some(layout::Cluster { parent, members })
         })
         .collect();
-    let result =
-        layout::layout(&layout_nodes, &layout_edges, &roots, &unions, &LayoutConfig::default());
+    // The Orphaned and Deprecated panels are lists: they read cards and the
+    // graph, never a position. Laying the whole schema out for them doubled
+    // the cost of every toggle for nothing.
+    let result = if options.skip_layout {
+        layout::LayoutResult {
+            positions: vec![layout::Point { x: 0.0, y: 0.0 }; layout_nodes.len()],
+            edges: Vec::new(),
+            width: 0.0,
+            height: 0.0,
+        }
+    } else {
+        layout::layout(&layout_nodes, &layout_edges, &roots, &unions, &LayoutConfig::default())
+    };
 
     // ---- flatten edge paths ----
     let mut edges: Vec<EdgeVisual> = Vec::with_capacity(result.edges.len());

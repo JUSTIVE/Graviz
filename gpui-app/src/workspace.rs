@@ -200,11 +200,9 @@ impl Workspace {
         let tree = cx.new(|cx| TreePanel::new(model.clone(), cx));
         // The Orphaned / Deprecated tab bodies work off the FULL graph, since
         // their whole point is what the reachable slice leaves out.
-        let full_model = Rc::new(build_model(
-            loaded.graph.clone(),
-            loaded.name.clone(),
-            &options,
-        ));
+        let list_opts = ModelOptions { skip_layout: true, ..options.clone() };
+        let full_model =
+            Rc::new(build_model(loaded.graph.clone(), loaded.name.clone(), &list_opts));
         let orphan_panel = cx.new(|cx| OrphanPanel::new(full_model.clone(), cx));
         let until_panel = cx.new(|cx| UntilPanel::new(full_model, cx));
         let canvas = cx.new(|cx| {
@@ -347,10 +345,11 @@ impl Workspace {
         let model = Rc::new(build_model(sliced, self.schema_name.clone(), &self.options));
         self.model = model.clone();
         self.tree.update(cx, |tree, cx| tree.set_model(model.clone(), cx));
+        let list_opts = ModelOptions { skip_layout: true, ..self.options.clone() };
         let full_model = Rc::new(build_model(
             self.full_graph.clone(),
             self.schema_name.clone(),
-            &self.options,
+            &list_opts,
         ));
         self.orphan_panel
             .update(cx, |p, cx| p.set_model(full_model.clone(), cx));
