@@ -50,9 +50,9 @@ pub struct RecentEntry {
 fn dir() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     let base = if cfg!(target_os = "macos") {
-        PathBuf::from(home).join("Library/Application Support/GompassQL")
+        PathBuf::from(home).join("Library/Application Support/Graviz")
     } else {
-        PathBuf::from(home).join(".config/gompassql")
+        PathBuf::from(home).join(".config/graviz")
     };
     std::fs::create_dir_all(&base).ok()?;
     Some(base)

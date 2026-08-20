@@ -50,7 +50,7 @@
 
 ## 3. 사이드바 골격
 
-- 폭 기본 **340**(min 260 / max 720), 6px 리사이즈 핸들이 보더를 걸침, 더블클릭 340 복귀, `gompassql:sidebarWidth`/`Collapsed` 영속화.
+- 폭 기본 **340**(min 260 / max 720), 6px 리사이즈 핸들이 보더를 걸침, 더블클릭 340 복귀, `graviz:sidebarWidth`/`Collapsed` 영속화.
 - 배경 `--card/30%`, 우측 border(접히면 제거), 접힘은 300ms 그리드 애니메이션 + 내용 고정폭 클리핑.
 - 접힌 상태 확장 버튼: 좌상단 16/16, r10, popover/95, PanelLeftOpen 16px → 이때 캔버스 뷰컨트롤이 **+44px** 밀림.
 - 현재: 고정 300px, 리사이즈·영속화·확장 버튼 없음.
@@ -77,7 +77,7 @@
 ## 6. 오버레이 도크
 
 - **기본 접힘**: 27px 스트립 = Layers(emerald) + "Overlay" + 상태(에러 빨강 / 카운트 pill / 안내문) + ChevronUp.
-- 펼침: 높이 280(160–720, ≤70vh), 상단 6px 리사이즈 핸들, 더블클릭 280 복귀, `gompassql:overlayHeight`.
+- 펼침: 높이 280(160–720, ≤70vh), 상단 6px 리사이즈 핸들, 더블클릭 280 복귀, `graviz:overlayHeight`.
 - 헤더: Layers + "Overlay" + **카운트 pill** `+n`(emerald) `~n`(sky) `−n`(U+2212, red) + `Highlight` 토글(emerald, 비활성 시 α0.4) + `⌘↵` 힌트 + **Apply/Re-apply**(emerald 버튼, dirty 아니면 비활성) + Clear + 접기 chevron.
 - 에디터: CodeMirror(줄번호·폴딩·GraphQL 하이라이트) + 고정 플레이스홀더 예제.
 - 상태 스트립(도크 하단, ≤45%): 에러 블록(red/10) / 적용 블록(emerald/10, **추가 타입은 클릭 가능한 칩**, 추가·변경·제거 목록) / 경고 블록(amber/10).
@@ -89,7 +89,7 @@
 - 좌: 아이콘 16px + 워드마크 **"Graviz"**(600) / 내비 `New` `View`(스키마 있을 때만) `About` — 활성=secondary 배경.
 - 우: **테마 토글**(32px, outline, Sun/Moon/Monitor + Light/Dark/System, 클릭 순환).
 - 커밋 뱃지: **화면 하단 중앙 고정**, 10px mono, muted α0.4.
-- 현재: 중앙 "GompassQL" 타이틀 스트립만.
+- 현재: 중앙 "Graviz" 타이틀 스트립만.
 
 ## 9. 사이드바 내용 (TreePanel)
 

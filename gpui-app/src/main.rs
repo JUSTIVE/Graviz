@@ -21,7 +21,7 @@ use gpui::{
 };
 use root::Root;
 
-actions!(gompass, [Quit]);
+actions!(graviz, [Quit]);
 use std::path::PathBuf;
 
 fn main() {
@@ -32,7 +32,7 @@ fn main() {
         match arg.as_str() {
             "--overlay" => overlay_path = args.next().map(PathBuf::from),
             "--help" | "-h" => {
-                eprintln!("usage: gompassql [<schema.graphql>] [--overlay <overlay.graphql>]");
+                eprintln!("usage: graviz [<schema.graphql>] [--overlay <overlay.graphql>]");
                 std::process::exit(0);
             }
             _ => path = Some(PathBuf::from(arg)),
@@ -78,7 +78,7 @@ fn main() {
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(gpui::TitlebarOptions {
-                    title: Some("GompassQL".into()),
+                    title: Some("Graviz".into()),
                     appears_transparent: true,
                     traffic_light_position: Some(gpui::point(px(10.0), px(10.0))),
                 }),

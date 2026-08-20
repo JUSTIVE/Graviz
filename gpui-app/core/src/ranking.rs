@@ -349,7 +349,7 @@ pub fn network_simplex(n: usize, edges: &[RankEdge], max_iter: usize) -> Vec<i32
         net.exchange(leave, enter);
         pivots += 1;
     }
-    if std::env::var("GOMPASS_PERF").is_ok() {
+    if std::env::var("GRAVIZ_PERF").is_ok() {
         let span: i64 = net
             .edges
             .iter()

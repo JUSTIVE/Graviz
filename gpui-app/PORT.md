@@ -1,4 +1,4 @@
-# GompassQL → GPUI 포팅 현황
+# Graviz → GPUI 포팅 현황
 
 브랜치: `gpui-port`. 웹앱(React + PixiJS/WebGL + GraphViz-WASM)을 Rust + GPUI로 재작성.
 방침: **픽셀 동일 UI가 아니라 기능 동등성** (사용자 확인됨). 성능 기준: `schema.docs.graphql`(72k 라인, GitHub 스키마).
@@ -7,7 +7,7 @@
 
 ```
 gpui-app/
-  core/            # gompass-core — GPUI 무관 순수 로직 (cargo test -p gompass-core)
+  core/            # graviz-core — GPUI 무관 순수 로직 (cargo test -p graviz-core)
     src/graph.rs   # sdl-to-graph.ts 포팅: SDL → ParsedGraph (+ until/reachable/components)
     src/layout.rs  # 계층형(Sugiyama) 레이아웃 — GraphViz WASM + 청킹 오케스트레이터 대체
     src/ranking.rs # network simplex 레이어링(최소 총 스팬) — 옵트인, 아래 참조
@@ -33,7 +33,7 @@ gpui-app/
 
 ## 성능 목표: 모든 줌에서 120fps (프레임당 8.3ms)
 
-`GOMPASS_PERF=1`이 프레임 비용(`perf: k=…`)과 레이아웃 품질(`layout: …`)을 같이 찍는다.
+`GRAVIZ_PERF=1`이 프레임 비용(`perf: k=…`)과 레이아웃 품질(`layout: …`)을 같이 찍는다.
 GitHub 스키마(804 노드 / 3960 엣지) 기준, k=0.02~3.0 전 구간 **4.9~7.8ms**.
 
 프레임을 지배하던 것은 언제나 엣지였고, 세 가지로 잡았다.
@@ -52,8 +52,8 @@ GitHub 스키마(804 노드 / 3960 엣지) 기준, k=0.02~3.0 전 구간 **4.9~7
 
 ## 레이아웃 재계산 시간
 
-토글 하나마다 전체가 다시 계산되므로 이 시간이 곧 UI 반응성이다. `GOMPASS_PERF=1` 이
-단계별로 찍는다(품질 지표는 `GOMPASS_METRICS=1` 로 분리했다 — 교차 세는 데만 수백 ms 라
+토글 하나마다 전체가 다시 계산되므로 이 시간이 곧 UI 반응성이다. `GRAVIZ_PERF=1` 이
+단계별로 찍는다(품질 지표는 `GRAVIZ_METRICS=1` 로 분리했다 — 교차 세는 데만 수백 ms 라
 타이밍을 오염시켰다).
 
 GitHub 스키마 55ms → **35ms**, 품질 손실 없음:
@@ -238,14 +238,14 @@ GitHub 스키마 55ms → **35ms**, 품질 손실 없음:
 - [x] Show descriptions(⌘D) — 행 설명 줄 + 재레이아웃 (ROW_H 16→28)
 - [x] 엣지 번들링(⌘E, 기본 on) — 평행 필드 엣지 병합 (GitHub 스키마 3960→3121)
 - [x] Investigate 모드(⌘I) — 미문서화 타입 주황 윤곽/행 틱 + 커버리지 % 상태바.
-      `GOMPASS_INVESTIGATE=1`로 검증함. GitHub 스키마에서 아무 변화가 없어 보이는 건
+      `GRAVIZ_INVESTIGATE=1`로 검증함. GitHub 스키마에서 아무 변화가 없어 보이는 건
       그 스키마가 100% 문서화돼 있어서지 기능 문제가 아니다 (미문서화 스키마로 확인:
       주황 윤곽 + 행 스트라이프 + `desc 33%` 표시)
 - [x] deprecated/until — 만료 [until] 빨간 타입, Relay 필드 청록 마커
 - [x] kind 필터 칩, referencedBy 상세 패널, 포커스 히스토리 ⌘[ + 브레드크럼
 - [x] 파일 감시 핫 리로드(1s mtime 폴링) + ⌘O 파일 열기 — 웹 linked-file 대응
-- [x] GOMPASS_SELFSHOT=<png> 셀프 스크린샷 (자기 창 캡처, 권한 불필요 — 시각 검증용)
-- [x] 라이트/다크 테마 — 시스템 외관 연동 (GOMPASS_LIGHT/DARK 오버라이드)
+- [x] GRAVIZ_SELFSHOT=<png> 셀프 스크린샷 (자기 창 캡처, 권한 불필요 — 시각 검증용)
+- [x] 라이트/다크 테마 — 시스템 외관 연동 (GRAVIZ_LIGHT/DARK 오버라이드)
 - [x] 허브 페이딩 (degree ≥ 50) + 레이아웃 밀도 조정
 - [x] 랜딩 화면 — 최근 스키마 히스토리(recent.json) + ⌘O 열기
 - [x] 설정 영속화 — settings.json (Desc/Bundle/사이드바)

@@ -14,7 +14,7 @@ const CONTROLS_INSET: f32 = 78.0;
 const CONTROLS_INSET: f32 = 16.0;
 
 /// Short commit the build was made from, stamped bottom-center like the web.
-pub const COMMIT: Option<&str> = option_env!("GOMPASS_COMMIT");
+pub const COMMIT: Option<&str> = option_env!("GRAVIZ_COMMIT");
 
 /// Which route the shell highlights in its nav.
 #[derive(Clone, Copy, PartialEq, Eq)]

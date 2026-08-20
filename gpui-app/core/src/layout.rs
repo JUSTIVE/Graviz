@@ -372,8 +372,8 @@ pub fn layout(
 
     // The quality metrics cost more than the layout they measure (the edge
     // crossing count alone is a few million segment tests), so they sit
-    // behind their own switch — GOMPASS_PERF stays a timing signal.
-    if std::env::var("GOMPASS_METRICS").is_ok() {
+    // behind their own switch — GRAVIZ_PERF stays a timing signal.
+    if std::env::var("GRAVIZ_METRICS").is_ok() {
         let card_area: f32 = nodes.iter().map(|n| n.w * n.h).sum();
         let mut dims: Vec<(f32, f32)> = comps.iter().map(|c| (c.w, c.h)).collect();
         dims.sort_by(|a, b| (b.0 * b.1).partial_cmp(&(a.0 * a.1)).unwrap());
@@ -962,7 +962,7 @@ fn layout_component(
     // later one whatever the weight says. The structure, not the weight, is
     // what makes those edges long.
     let t_stage = std::time::Instant::now();
-    let timing = std::env::var("GOMPASS_PERF").is_ok() && m > 100;
+    let timing = std::env::var("GRAVIZ_PERF").is_ok() && m > 100;
     let redges: Vec<crate::ranking::RankEdge> = acyclic
         .iter()
         .filter(|((a, b), _)| a != b)

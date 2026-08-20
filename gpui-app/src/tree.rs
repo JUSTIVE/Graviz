@@ -7,14 +7,14 @@
 //! referenced by) and the `TypeDetail` pane.
 //!
 //! The search box is a minimal key-capture input (schema identifiers are
-//! ASCII); results come from `gompass_core::search::search_graph`.
+//! ASCII); results come from `graviz_core::search::search_graph`.
 
 use crate::icons::{icon, Icon};
 use crate::model::{Model, RowKind};
 use crate::theme::Theme;
 use crate::workspace::kind_badge;
-use gompass_core::graph::NodeKind;
-use gompass_core::search::{search_graph, SearchResult, SnippetKind};
+use graviz_core::graph::NodeKind;
+use graviz_core::search::{search_graph, SearchResult, SnippetKind};
 use gpui::{
     div, prelude::*, px, transparent_black, uniform_list, AnyElement, App, Context, EventEmitter,
     FocusHandle, Focusable, FontWeight, HighlightStyle, Hsla, KeyDownEvent, ScrollHandle,
@@ -111,13 +111,13 @@ impl TreePanel {
             union_members: Vec::new(),
             referenced_by: Vec::new(),
         };
-        // Debug presets, matching GOMPASS_MODE / GOMPASS_VIEW: open the panel
+        // Debug presets, matching GRAVIZ_MODE / GRAVIZ_VIEW: open the panel
         // on a query or a selected type so selfshots can verify both states.
-        if let Ok(q) = std::env::var("GOMPASS_TREE") {
+        if let Ok(q) = std::env::var("GRAVIZ_TREE") {
             this.query = q;
             this.refresh();
         }
-        if let Ok(name) = std::env::var("GOMPASS_TREE_SEL") {
+        if let Ok(name) = std::env::var("GRAVIZ_TREE_SEL") {
             if let Some(&c) = this.model.index_of.get(&name) {
                 this.selected = Some(c);
                 this.recompute_sections(c);

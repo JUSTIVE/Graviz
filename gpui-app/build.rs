@@ -9,7 +9,7 @@ fn main() {
         if out.status.success() {
             let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if !sha.is_empty() {
-                println!("cargo:rustc-env=GOMPASS_COMMIT={sha}");
+                println!("cargo:rustc-env=GRAVIZ_COMMIT={sha}");
             }
         }
     }

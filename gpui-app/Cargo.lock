@@ -1933,30 +1933,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gompass-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-graphql-parser",
- "async-graphql-value",
-]
-
-[[package]]
-name = "gompassql"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "core-foundation 0.10.1",
- "core-graphics 0.24.0",
- "gompass-core",
- "gpui",
- "gpui_platform",
- "image",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "gpu-allocator"
 version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2299,6 +2275,30 @@ dependencies = [
  "windows-core 0.61.2",
  "windows-numerics 0.2.0",
  "windows-registry",
+]
+
+[[package]]
+name = "graviz"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "core-foundation 0.10.1",
+ "core-graphics 0.24.0",
+ "gpui",
+ "gpui_platform",
+ "graviz-core",
+ "image",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "graviz-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-graphql-parser",
+ "async-graphql-value",
 ]
 
 [[package]]

@@ -1,7 +1,7 @@
 //! Schema loading: SDL file (+ optional overlay file) → marked ParsedGraph.
 
 use anyhow::{bail, Context, Result};
-use gompass_core::graph::{self, OverlayDiff, ParsedGraph, SdlToGraphOptions};
+use graviz_core::graph::{self, OverlayDiff, ParsedGraph, SdlToGraphOptions};
 use std::path::Path;
 
 pub struct LoadedSchema {

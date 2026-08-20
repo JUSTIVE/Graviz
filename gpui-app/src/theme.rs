@@ -1,6 +1,6 @@
 //! Dark/light palettes, resolved from the window's system appearance.
 
-use gompass_core::graph::NodeKind;
+use graviz_core::graph::NodeKind;
 use gpui::{rgb, rgba, Hsla, WindowAppearance};
 
 #[derive(Clone, Copy)]
@@ -183,10 +183,10 @@ pub fn theme_for(mode: ThemeMode, appearance: WindowAppearance) -> Theme {
 
 pub fn theme(appearance: WindowAppearance) -> Theme {
     // Debug overrides so automated selfshots can exercise both palettes.
-    if std::env::var("GOMPASS_LIGHT").is_ok() {
+    if std::env::var("GRAVIZ_LIGHT").is_ok() {
         return light();
     }
-    if std::env::var("GOMPASS_DARK").is_ok() {
+    if std::env::var("GRAVIZ_DARK").is_ok() {
         return dark();
     }
     match appearance {

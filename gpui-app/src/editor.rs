@@ -79,9 +79,9 @@ fn highlight(line: &str, th: Theme) -> Vec<(usize, gpui::Hsla)> {
             }
             let word = &line[i..j];
             let color = if KEYWORDS.contains(&word) {
-                th.kind_color(gompass_core::graph::NodeKind::Interface)
+                th.kind_color(graviz_core::graph::NodeKind::Interface)
             } else if word.starts_with(|c: char| c.is_ascii_uppercase()) {
-                th.kind_color(gompass_core::graph::NodeKind::Object)
+                th.kind_color(graviz_core::graph::NodeKind::Object)
             } else {
                 th.text
             };
@@ -657,9 +657,9 @@ mod tests {
     fn keywords_types_and_comments_get_distinct_colors() {
         let t = th();
         let runs = highlight("type User {", t);
-        assert_eq!(runs[0].1, t.kind_color(gompass_core::graph::NodeKind::Interface));
+        assert_eq!(runs[0].1, t.kind_color(graviz_core::graph::NodeKind::Interface));
         assert!(runs.iter().any(|(_, c)| *c
-            == t.kind_color(gompass_core::graph::NodeKind::Object)));
+            == t.kind_color(graviz_core::graph::NodeKind::Object)));
         let c = highlight("# note", t);
         assert_eq!(c, vec![(6, t.text_muted)]);
     }
