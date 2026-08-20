@@ -14,7 +14,7 @@
 
 use crate::model::{today_string, Model};
 use crate::theme::Theme;
-use gompass_core::graph::{
+use graviz_core::graph::{
     all_reachable_ids, default_root_ops, is_until_expired, parse_until, NodeKind,
 };
 use gpui::{
@@ -74,7 +74,7 @@ fn kind_badge(th: Theme, kind: NodeKind) -> impl IntoElement {
 
 /// Root operation names of `graph`, falling back to the conventional trio when
 /// the schema declares none (the web's `rootOps`).
-fn root_ops_of(graph: &gompass_core::graph::ParsedGraph) -> HashSet<String> {
+fn root_ops_of(graph: &graviz_core::graph::ParsedGraph) -> HashSet<String> {
     let rt = &graph.root_types;
     let set: HashSet<String> = [rt.query.clone(), rt.mutation.clone(), rt.subscription.clone()]
         .into_iter()
@@ -233,7 +233,7 @@ impl EventEmitter<PanelEvent> for OrphanPanel {}
 
 impl Render for OrphanPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let th = crate::theme::theme(window.appearance());
+        let th = crate::theme::current(cx, window.appearance());
         let base = div()
             .flex()
             .flex_col()
@@ -273,7 +273,7 @@ impl Render for OrphanPanel {
                 "orphan-items",
                 self.rows.len(),
                 cx.processor(|this, range: std::ops::Range<usize>, window, cx| {
-                    let th = crate::theme::theme(window.appearance());
+                    let th = crate::theme::current(cx, window.appearance());
                     range.map(|ix| this.render_row(ix, th, cx)).collect::<Vec<_>>()
                 }),
             )
@@ -753,7 +753,7 @@ impl EventEmitter<PanelEvent> for UntilPanel {}
 
 impl Render for UntilPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let th = crate::theme::theme(window.appearance());
+        let th = crate::theme::current(cx, window.appearance());
         div()
             .flex()
             .flex_col()
@@ -766,7 +766,7 @@ impl Render for UntilPanel {
                     "until-items",
                     self.rows.len(),
                     cx.processor(|this, range: std::ops::Range<usize>, window, cx| {
-                        let th = crate::theme::theme(window.appearance());
+                        let th = crate::theme::current(cx, window.appearance());
                         range.map(|ix| this.render_row(ix, th, cx)).collect::<Vec<_>>()
                     }),
                 )
