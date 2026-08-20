@@ -13,17 +13,22 @@ use crate::panels::{OrphanPanel, PanelEvent, UntilPanel};
 use crate::icons::{icon, Icon};
 use crate::theme::Theme;
 use crate::tree::{TreeEvent, TreePanel};
-use gompass_core::graph::{OverlayDiff, ParsedGraph};
+use graviz_core::graph::{OverlayDiff, ParsedGraph};
 use gpui::{
-    actions, div, prelude::*, px, App, Context, Entity, FocusHandle, Focusable, KeyBinding,
-    PathPromptOptions, SharedString, Window,
+    actions, div, prelude::*, px, AnimationExt, App, Context, Entity, FocusHandle, Focusable,
+    KeyBinding, PathPromptOptions, SharedString, SpringAnimation, SpringConfig, StyleRefinement,
+    Window,
 };
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
+/// Shared spring for every panel-size / fade transition in the workspace —
+/// slightly overdamped so widths and heights settle without overshoot.
+const UI_SPRING: SpringConfig = SpringConfig::new(300.0, 40.0, 1.0);
+
 actions!(
-    gompass,
+    graviz,
     [
         FocusSearch,
         ToggleSidebar,
@@ -120,6 +125,10 @@ pub struct Workspace {
     focused_once: bool,
     sidebar_open: bool,
     sidebar_width: f32,
+    /// When `sidebar_open` last flipped — the expand button and the view
+    /// controls' +44px shift wait out the 300ms collapse before appearing,
+    /// so they don't pop in on top of the panel while it is still closing.
+    sidebar_toggled_at: Option<std::time::Instant>,
     /// Which splitter is being dragged, if any.
     resizing: Option<Splitter>,
     /// Latest built model, for name→card navigation from the overlay dock.
@@ -135,6 +144,28 @@ pub struct Workspace {
     highlight_overlay: bool,
     orphan_count: usize,
     deprecated_count: usize,
+    /// Hover state of the three floating canvas-overlay cards, each faded to
+    /// 0.4 opacity at rest and animated to 1.0 on hover.
+    controls_hovered: bool,
+    investigate_hovered: bool,
+    recent_hovered: bool,
+}
+
+/// Web's "0.4 opacity at rest, 1.0 on hover" fade, shared by the three
+/// floating canvas-overlay cards (view controls / investigate / recent).
+fn hover_fade<E: IntoElement + gpui::Styled + 'static>(
+    el: E,
+    id: &'static str,
+    hovered: bool,
+) -> impl IntoElement {
+    el.with_spring(
+        id,
+        SpringAnimation::new(UI_SPRING).to(hovered),
+        move |el, phase: gpui::AnimationPhase| {
+            let t = phase.0.clamp(0.0, 1.0);
+            el.opacity(0.4 + 0.6 * t)
+        },
+    )
 }
 
 /// Types no root operation can reach, and deprecated members — the two tab
@@ -159,9 +190,9 @@ impl Workspace {
         initial_overlay: Option<String>,
         cx: &mut Context<Self>,
     ) -> Self {
-        // Debug: GOMPASS_MODE=orphaned|deprecated opens on that tab so
+        // Debug: GRAVIZ_MODE=orphaned|deprecated opens on that tab so
         // selfshots can verify each sidebar body.
-        let mode = match std::env::var("GOMPASS_MODE").as_deref() {
+        let mode = match std::env::var("GRAVIZ_MODE").as_deref() {
             Ok("orphaned") => Mode::Orphaned,
             Ok("deprecated") => Mode::Deprecated,
             _ => Mode::Reachable,
@@ -179,17 +210,17 @@ impl Workspace {
             settings.sidebar_width.clamp(config::SIDEBAR_MIN_W, config::SIDEBAR_MAX_W);
         let dock_height = settings.dock_height.clamp(config::DOCK_MIN_H, config::DOCK_MAX_H);
         // Debug presets so automated selfshots can exercise toggle states.
-        if std::env::var("GOMPASS_DESC").is_ok() {
+        if std::env::var("GRAVIZ_DESC").is_ok() {
             options.show_descriptions = true;
         }
-        let investigate = std::env::var("GOMPASS_INVESTIGATE").is_ok();
+        let investigate = std::env::var("GRAVIZ_INVESTIGATE").is_ok();
         let t_layout = std::time::Instant::now();
         let mut sliced = slice_graph(&loaded.graph, mode, None);
         if options.hide_custom_scalars {
-            options.hidden_scalars = crate::model::drop_custom_scalars(&mut sliced);
+            crate::model::drop_custom_scalars(&mut sliced);
         }
         let model = Rc::new(build_model(sliced, loaded.name.clone(), &options));
-        if std::env::var("GOMPASS_PERF").is_ok() {
+        if std::env::var("GRAVIZ_PERF").is_ok() {
             eprintln!(
                 "perf: layout+model {}ms — {} cards, {} edges",
                 t_layout.elapsed().as_millis(),
@@ -292,17 +323,21 @@ impl Workspace {
             focused_once: false,
             sidebar_open,
             sidebar_width,
+            sidebar_toggled_at: None,
             resizing: None,
             model,
             overlay_text: initial_overlay,
             overlay_diff: loaded.diff,
             overlay_error: None,
-            dock_open: std::env::var("GOMPASS_DOCK").is_ok(),
+            dock_open: std::env::var("GRAVIZ_DOCK").is_ok(),
             history_open: false,
             dock_height,
             highlight_overlay: false,
             orphan_count: counts.0,
             deprecated_count: counts.1,
+            controls_hovered: false,
+            investigate_hovered: false,
+            recent_hovered: false,
         }
     }
 
@@ -337,11 +372,9 @@ impl Workspace {
         // Only the canvas slice loses its scalars; the Orphaned and Deprecated
         // tabs work off the full graph and should still list them.
         let mut sliced = slice_graph(&self.full_graph, self.mode, self.root_override.as_deref());
-        self.options.hidden_scalars = if self.options.hide_custom_scalars {
-            crate::model::drop_custom_scalars(&mut sliced)
-        } else {
-            Default::default()
-        };
+        if self.options.hide_custom_scalars {
+            crate::model::drop_custom_scalars(&mut sliced);
+        }
         let model = Rc::new(build_model(sliced, self.schema_name.clone(), &self.options));
         self.model = model.clone();
         self.tree.update(cx, |tree, cx| tree.set_model(model.clone(), cx));
@@ -494,29 +527,43 @@ impl Workspace {
             .when(!active, |el| el.text_color(th.text_muted))
             .when(active, |el| el.text_color(tone))
             .child(icon(icon_name, px(16.0), tone.opacity(if active { 1.0 } else { 0.7 })))
-            .when(active, |el| {
-                el.child(
-                    div()
-                        .ml(px(6.0))
-                        .flex()
-                        .items_center()
-                        .whitespace_nowrap()
-                        .child(SharedString::from(mode.label()))
-                        .when_some(count.filter(|c| *c > 0), |el, c| {
-                            el.child(
-                                div()
-                                    .ml(px(6.0))
-                                    .rounded_full()
-                                    .px(px(6.0))
-                                    .py(px(1.0))
-                                    .text_size(px(10.0))
-                                    .bg(tone.opacity(0.15))
-                                    .text_color(tone)
-                                    .child(SharedString::from(c.to_string())),
-                            )
-                        }),
-                )
-            })
+            .child(
+                // Web: label max-width 0↔200px + opacity, 300ms. The label
+                // stays mounted at all times so the transition can run in
+                // both directions instead of the child just popping in/out.
+                div()
+                    .flex()
+                    .items_center()
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .child(SharedString::from(mode.label()))
+                    .when_some(count.filter(|c| *c > 0), |el, c| {
+                        el.child(
+                            div()
+                                .ml(px(6.0))
+                                .rounded_full()
+                                .px(px(6.0))
+                                .py(px(1.0))
+                                .text_size(px(10.0))
+                                .bg(tone.opacity(0.15))
+                                .text_color(tone)
+                                .child(SharedString::from(c.to_string())),
+                        )
+                    })
+                    .with_spring(
+                        mode.label(),
+                        SpringAnimation::new(UI_SPRING).to(active),
+                        move |el, phase: gpui::AnimationPhase| {
+                            let o = phase.0.clamp(0.0, 1.0);
+                            // Web's max-width 0↔200px cap, not a fixed width:
+                            // the cap clears the label's real (usually much
+                            // narrower) content well before the spring
+                            // settles, so it lands there smoothly instead of
+                            // snapping once the animation completes.
+                            el.opacity(o).ml(px(6.0 * o)).max_w(px(200.0 * o))
+                        },
+                    ),
+            )
             .when(!disabled, |el| {
                 el.on_click(cx.listener(move |this, _, _, cx| this.set_mode(mode, cx)))
             })
@@ -559,7 +606,7 @@ impl Workspace {
 }
 
 /// Solid kind badge used in list rows (web `KIND_STYLES[kind].badge`).
-pub fn kind_badge(th: Theme, kind: gompass_core::graph::NodeKind, label: &'static str) -> gpui::Div {
+pub fn kind_badge(th: Theme, kind: graviz_core::graph::NodeKind, label: &'static str) -> gpui::Div {
     div()
         .flex_none()
         .rounded_md()
@@ -594,7 +641,7 @@ impl Render for Workspace {
                 th,
                 Mode::Reachable,
                 Icon::Waypoints,
-                th.kind_color(gompass_core::graph::NodeKind::Object),
+                th.kind_color(graviz_core::graph::NodeKind::Object),
                 None,
                 cx,
             ))
@@ -631,6 +678,7 @@ impl Render for Workspace {
                     .hover(|el| el.bg(th.hover_bg).text_color(th.text))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.sidebar_open = false;
+                        this.sidebar_toggled_at = Some(std::time::Instant::now());
                         this.canvas
                             .update(cx, |canvas, cx| canvas.set_pane_offset(0.0, cx));
                         this.save_settings(cx);
@@ -640,8 +688,17 @@ impl Render for Workspace {
             );
 
         // ---- canvas overlay: floating "View controls" card (left 16 / top 16)
-        let inset = if self.sidebar_open { 0.0 } else { 44.0 };
-        let controls = div()
+        // The sidebar itself takes ~350ms to visually collapse (see the
+        // width spring below); anything that assumes it is already gone —
+        // the expand button, the controls shift — waits for that instead of
+        // popping in on top of the still-closing panel.
+        let sidebar_settled = self
+            .sidebar_toggled_at
+            .is_none_or(|t| t.elapsed() >= Duration::from_millis(350));
+        let inset = if !self.sidebar_open && sidebar_settled { 44.0 } else { 0.0 };
+        let controls_hovered = self.controls_hovered;
+        let controls = hover_fade(div()
+            .id("view-controls")
             .absolute()
             .top(px(16.0 + inset))
             .left(px(16.0))
@@ -655,8 +712,10 @@ impl Render for Workspace {
             .px_2()
             .py(px(6.0))
             .shadow_lg()
-            .opacity(0.4)
-            .hover(|el| el.opacity(1.0))
+            .on_hover(cx.listener(|this, hovered, _, cx| {
+                this.controls_hovered = *hovered;
+                cx.notify();
+            }))
             .child(self.chip(
                 th,
                 "hide-primitives",
@@ -716,19 +775,21 @@ impl Render for Workspace {
                     this.save_settings(cx);
                 },
                 cx,
-            ));
+            )), "controls", controls_hovered);
 
         // ---- canvas overlay: Investigate card (left 16 / top 56) ----
         let (documented, total) = self.model.desc_coverage;
         let coverage = if total > 0 { documented as f32 / total as f32 } else { 1.0 };
         let cov_color = if coverage >= 0.9 {
-            th.kind_color(gompass_core::graph::NodeKind::Enum)
+            th.kind_color(graviz_core::graph::NodeKind::Enum)
         } else if coverage >= 0.5 {
             th.type_amber
         } else {
-            th.kind_color(gompass_core::graph::NodeKind::Scalar)
+            th.kind_color(graviz_core::graph::NodeKind::Scalar)
         };
-        let investigate_card = div()
+        let investigate_hovered = self.investigate_hovered;
+        let investigate_card = hover_fade(div()
+            .id("investigate-card")
             .absolute()
             .top(px(56.0 + inset))
             .left(px(16.0))
@@ -742,8 +803,10 @@ impl Render for Workspace {
             .px_2()
             .py(px(6.0))
             .shadow_lg()
-            .opacity(0.4)
-            .hover(|el| el.opacity(1.0))
+            .on_hover(cx.listener(|this, hovered, _, cx| {
+                this.investigate_hovered = *hovered;
+                cx.notify();
+            }))
             .child(
                 div()
                     .flex()
@@ -800,7 +863,7 @@ impl Render for Workspace {
                                 (coverage * 100.0).round() as i32
                             ))),
                     ),
-            );
+            ), "investigate", investigate_hovered);
 
         // ---- overlay dock (web: collapsed strip by default) ----
         let counts = self.overlay_diff.as_ref().map(|d| {
@@ -855,6 +918,14 @@ impl Render for Workspace {
             row
         };
 
+        // Web: the dock's collapsed strip vs. expanded editor is a height
+        // spring, not a hard swap — a shared "dock-height" id lets it carry
+        // the same in-flight height (and velocity) across the toggle even
+        // though the two sides are otherwise unrelated element trees.
+        let dock_open = self.dock_open;
+        let dock_height = self.dock_height;
+        let dock_collapsed_h = 34.0_f32;
+        let dock_target_h = if dock_open { dock_height } else { dock_collapsed_h };
         let dock: gpui::AnyElement = if !self.dock_open {
             // Collapsed: a single one-line strip.
             let status: gpui::AnyElement = match (&self.overlay_error, applied) {
@@ -904,12 +975,18 @@ impl Render for Workspace {
                 )
                 .child(status)
                 .child(icon(Icon::ChevronUp, px(14.0), th.text_muted))
+                .overflow_hidden()
+                .with_spring(
+                    "dock-height",
+                    SpringAnimation::new(UI_SPRING).to(dock_target_h),
+                    move |el, h: f32| el.h(px(h)),
+                )
                 .into_any_element()
         } else {
             let apply_enabled = dirty || !applied;
             div()
                 .flex_none()
-                .h(px(self.dock_height))
+                .overflow_hidden()
                 .relative()
                 .flex()
                 .flex_col()
@@ -1046,7 +1123,13 @@ impl Render for Workspace {
                         ),
                 )
                 // editor
-                .child(div().flex_1().min_h_0().p_2().child(self.overlay_editor.clone()))
+                .child(
+                    div().flex_1().min_h_0().p_2().child(
+                        self.overlay_editor
+                            .clone()
+                            .cached(StyleRefinement::default().size_full()),
+                    ),
+                )
                 // status strip
                 .when_some(self.overlay_error.clone(), |el, e| {
                     el.child(
@@ -1180,16 +1263,23 @@ impl Render for Workspace {
                             }),
                     )
                 })
+                .with_spring(
+                    "dock-height",
+                    SpringAnimation::new(UI_SPRING).to(dock_target_h),
+                    move |el, h: f32| el.h(px(h)),
+                )
                 .into_any_element()
         };
 
         // ---- canvas overlay: click-history "Recent" panel (right 16 / top 16)
+        let recent_hovered = self.recent_hovered;
         let recent = {
             let entries = self.canvas.read(cx).history_entries();
             let open = self.history_open;
             (!entries.is_empty()).then(|| {
                 let count = entries.len();
-                div()
+                hover_fade(div()
+                    .id("recent-panel")
                     .absolute()
                     .top(px(16.0))
                     .right(px(16.0))
@@ -1201,8 +1291,10 @@ impl Render for Workspace {
                     .shadow_lg()
                     .flex()
                     .flex_col()
-                    .opacity(0.4)
-                    .hover(|el| el.opacity(1.0))
+                    .on_hover(cx.listener(|this, hovered, _, cx| {
+                        this.recent_hovered = *hovered;
+                        cx.notify();
+                    }))
                     .child(
                         div()
                             .flex()
@@ -1333,16 +1425,16 @@ impl Render for Workspace {
                                     },
                                 )),
                         )
-                    })
+                    }), "recent", recent_hovered)
             })
         };
 
         if !self.focused_once {
             self.focused_once = true;
             window.focus(&self.focus, cx);
-            // Debug: GOMPASS_FOCUS=<TypeName> opens with that card focused, so
+            // Debug: GRAVIZ_FOCUS=<TypeName> opens with that card focused, so
             // a selfshot can reproduce the focused state.
-            if let Ok(name) = std::env::var("GOMPASS_FOCUS") {
+            if let Ok(name) = std::env::var("GRAVIZ_FOCUS") {
                 cx.defer_in(window, move |this: &mut Self, _, cx| {
                     this.navigate_to_type(&name, cx)
                 });
@@ -1384,12 +1476,14 @@ impl Render for Workspace {
             )
             .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
                 this.sidebar_open = true;
+                this.sidebar_toggled_at = Some(std::time::Instant::now());
                 let handle = this.tree.read(cx).focus_handle();
                 window.focus(&handle, cx);
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
                 this.sidebar_open = !this.sidebar_open;
+                this.sidebar_toggled_at = Some(std::time::Instant::now());
                 let offset = if this.sidebar_open { this.sidebar_width } else { 0.0 };
                 this.canvas
                     .update(cx, |canvas, cx| canvas.set_pane_offset(offset, cx));
@@ -1440,25 +1534,54 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &ClearSelection, _, cx| {
                 this.canvas.update(cx, |canvas, cx| canvas.clear_focused_edge(cx));
             }))
+            .child({
+                // Web: sidebar collapse is a 300ms width animation, not a
+                // hard show/hide — the panel always mounts, clipping its
+                // fixed-width (unreflowed) content as the outer box narrows.
+                let open = self.sidebar_open;
+                let width = self.sidebar_width;
+                let target_w = if open { width } else { 0.0 };
+                div()
+                    .h_full()
+                    .flex_none()
+                    .overflow_hidden()
+                    .bg(th.panel)
+                    .border_r_1()
+                    .border_color(th.panel_border)
+                    .child(
+                        div()
+                            .w(px(width))
+                            .h_full()
+                            .flex_none()
+                            .flex()
+                            .flex_col()
+                            .child(tab_row)
+                            .child(div().flex_1().min_h_0().child(match self.mode {
+                                Mode::Reachable => self
+                                    .tree
+                                    .clone()
+                                    .cached(StyleRefinement::default().size_full())
+                                    .into_any_element(),
+                                Mode::Orphaned => self
+                                    .orphan_panel
+                                    .clone()
+                                    .cached(StyleRefinement::default().size_full())
+                                    .into_any_element(),
+                                Mode::Deprecated => self
+                                    .until_panel
+                                    .clone()
+                                    .cached(StyleRefinement::default().size_full())
+                                    .into_any_element(),
+                            })),
+                    )
+                    .with_spring(
+                        "sidebar-width",
+                        SpringAnimation::new(UI_SPRING).to(target_w),
+                        move |el, w: f32| el.w(px(w)),
+                    )
+            })
             .when(self.sidebar_open, |el| {
-                el.child(
-                    div()
-                        .w(px(self.sidebar_width))
-                        .h_full()
-                        .flex_none()
-                        .flex()
-                        .flex_col()
-                        .bg(th.panel)
-                        .border_r_1()
-                        .border_color(th.panel_border)
-                        .child(tab_row)
-                        .child(div().flex_1().min_h_0().child(match self.mode {
-                            Mode::Reachable => self.tree.clone().into_any_element(),
-                            Mode::Orphaned => self.orphan_panel.clone().into_any_element(),
-                            Mode::Deprecated => self.until_panel.clone().into_any_element(),
-                        })),
-                )
-                .child(splitter(
+                el.child(splitter(
                     "sidebar-splitter",
                     Splitter::Sidebar,
                     th,
@@ -1478,11 +1601,18 @@ impl Render for Workspace {
                             .flex_1()
                             .min_h_0()
                             .relative()
-                            .child(self.canvas.clone())
+                            // Cached: sidebar/dock/tab/hover animations here
+                            // are otherwise enough to re-render the whole
+                            // Workspace every frame, which would force a full
+                            // canvas repaint even though nothing in it
+                            // changed. This reuses last frame's paint unless
+                            // the canvas itself was notified or its bounds
+                            // (pane width/height) actually moved.
+                            .child(self.canvas.clone().cached(StyleRefinement::default().size_full()))
                             .child(controls)
                             .child(investigate_card)
                             .when_some(recent, |el, r| el.child(r))
-                            .when(!self.sidebar_open, |el| {
+                            .when(!self.sidebar_open && sidebar_settled, |el| {
                                 el.child(
                                     div()
                                         .id("expand-sidebar")
@@ -1499,6 +1629,7 @@ impl Render for Workspace {
                                         .hover(|el| el.bg(th.hover_bg))
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.sidebar_open = true;
+                                            this.sidebar_toggled_at = Some(std::time::Instant::now());
                                             this.canvas.update(cx, |canvas, cx| {
                                                 canvas.set_pane_offset(this.sidebar_width, cx)
                                             });

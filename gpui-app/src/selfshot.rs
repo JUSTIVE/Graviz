@@ -1,5 +1,5 @@
 //! Debug self-screenshot: capturing an app's OWN windows does not require the
-//! Screen Recording permission, so `GOMPASS_SELFSHOT=/path.png` lets an
+//! Screen Recording permission, so `GRAVIZ_SELFSHOT=/path.png` lets an
 //! agent (or CI) see what the window actually rendered.
 
 #![cfg(target_os = "macos")]
@@ -113,13 +113,17 @@ pub fn capture_to(path: &str) -> Result<()> {
     Ok(())
 }
 
-/// When `GOMPASS_SELFSHOT` is set, capture the window after a delay and exit.
+/// When `GRAVIZ_SELFSHOT` is set, capture the window after a delay and exit.
 pub fn arm_if_requested() {
-    let Ok(path) = std::env::var("GOMPASS_SELFSHOT") else {
+    let Ok(path) = std::env::var("GRAVIZ_SELFSHOT") else {
         return;
     };
+    let delay_ms: u64 = std::env::var("GRAVIZ_SELFSHOT_DELAY_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4000);
     std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_secs(4));
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
         for attempt in 0..3 {
             match capture_to(&path) {
                 Ok(()) => std::process::exit(0),

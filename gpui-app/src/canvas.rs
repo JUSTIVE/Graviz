@@ -10,12 +10,12 @@ use crate::model::{
     mono_w, EdgeGroup, Model, RowHit, RowKind, TypeColor, BAND_FONT_PX, CARD_PAD_X,
     DESC_FONT_PX, HEADER_PAD_X, KIND_FONT_PX, NAME_FONT_PX, ROW_FONT_PX, TIGHT_ROW_H,
 };
-use gompass_core::graph::NodeKind;
+use graviz_core::graph::NodeKind;
 use gpui::{
-    canvas, div, fill, point, prelude::*, px, quad, size, App, BorderStyle, Bounds,
+    canvas, div, fill, point, prelude::*, px, quad, size, AnimationExt, App, BorderStyle, Bounds,
     Context, Corners, Edges, Font, FontWeight, Hsla, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, PathBuilder, Pixels, Point, ScrollDelta, ScrollWheelEvent, SharedString,
-    TextAlign, TextRun, Window,
+    SpringAnimation, SpringConfig, TextAlign, TextRun, Window,
 };
 use std::cell::Cell;
 use std::rc::Rc;
@@ -51,6 +51,14 @@ struct Drag {
     start: Point<Pixels>,
     orig: ViewTransform,
     moved: bool,
+}
+
+/// Right-click menu, anchored at the click's canvas-local position.
+#[derive(Clone, Copy)]
+struct ContextMenu {
+    card: u32,
+    x: f32,
+    y: f32,
 }
 
 pub struct GraphCanvas {
@@ -98,6 +106,8 @@ pub struct GraphCanvas {
     /// Horizontal window-space offset of the canvas pane (sidebar width),
     /// set by the workspace so fit/center math uses the pane, not the window.
     pane_offset_x: f32,
+    /// Right-click menu on a card, if one is open.
+    context_menu: Option<ContextMenu>,
 }
 
 /// One stop in the navigation history: a type card, or an edge between two.
@@ -110,16 +120,16 @@ pub enum HistoryItem {
 /// A rendered Recent-list row.
 pub struct RecentEntry {
     pub item: HistoryItem,
-    pub kind: gompass_core::graph::NodeKind,
+    pub kind: graviz_core::graph::NodeKind,
     pub kind_label: &'static str,
     pub label: SharedString,
 }
 
 impl GraphCanvas {
     pub fn new(model: Rc<Model>) -> Self {
-        // Debug: GOMPASS_VIEW="x,y,k" presets the transform (skips auto-fit)
+        // Debug: GRAVIZ_VIEW="x,y,k" presets the transform (skips auto-fit)
         // so selfshots can reproduce specific view states.
-        let preset = std::env::var("GOMPASS_VIEW").ok().and_then(|s| {
+        let preset = std::env::var("GRAVIZ_VIEW").ok().and_then(|s| {
             let mut it = s.split(',').map(|v| v.trim().parse::<f32>());
             match (it.next(), it.next(), it.next()) {
                 (Some(Ok(x)), Some(Ok(y)), Some(Ok(k))) => {
@@ -129,7 +139,7 @@ impl GraphCanvas {
             }
         });
         let debug_edge: Option<u32> =
-            std::env::var("GOMPASS_EDGE").ok().and_then(|v| v.parse().ok());
+            std::env::var("GRAVIZ_EDGE").ok().and_then(|v| v.parse().ok());
         Self {
             model,
             view: preset.unwrap_or(ViewTransform { x: 40.0, y: 40.0, k: 1.0 }),
@@ -151,14 +161,15 @@ impl GraphCanvas {
             investigate: false,
             highlight_overlay: false,
             hovered_edge: None,
-            // Debug: GOMPASS_EDGE=<index> opens with that edge pinned, so a
+            // Debug: GRAVIZ_EDGE=<index> opens with that edge pinned, so a
             // selfshot can reproduce the focused-edge state. Combined with
-            // GOMPASS_VIEW it pins without re-framing, which is how the dim
+            // GRAVIZ_VIEW it pins without re-framing, which is how the dim
             // is checked against a known camera.
             focused_edge: preset.is_some().then_some(debug_edge).flatten(),
             pending_edge: preset.is_none().then_some(debug_edge).flatten(),
             focus_changed_at: None,
             pane_offset_x: 340.0,
+            context_menu: None,
         }
     }
 
@@ -266,6 +277,7 @@ impl GraphCanvas {
         self.pending_edge = None;
         self.history.clear();
         self.suppress_push = false;
+        self.context_menu = None;
         cx.notify();
     }
 
@@ -300,6 +312,15 @@ impl GraphCanvas {
             y: (vh - gh * k) / 2.0,
             k,
         };
+    }
+
+    /// True once panning/zooming has carried the whole graph's screen bounds
+    /// clear of the viewport, with no part left to click or scroll back to.
+    fn offscreen(&self, vw: f32, vh: f32) -> bool {
+        let (gw, gh) = (self.model.world_w, self.model.world_h);
+        let max_x = self.view.x + gw * self.view.k;
+        let max_y = self.view.y + gh * self.view.k;
+        max_x < 0.0 || max_y < 0.0 || self.view.x > vw || self.view.y > vh
     }
 
     fn screen_to_world(&self, p: Point<Pixels>) -> (f32, f32) {
@@ -463,6 +484,21 @@ impl GraphCanvas {
 
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.drag = Some(Drag { start: ev.position, orig: self.view, moved: false });
+        self.context_menu = None;
+        cx.notify();
+    }
+
+    fn on_right_click(&mut self, ev: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let (ox, oy) = self.canvas_origin.get();
+        let (x, y) = (f32::from(ev.position.x) - ox, f32::from(ev.position.y) - oy);
+        self.context_menu = self.hit_test(ev.position).map(|hit| ContextMenu { card: hit.card, x, y });
+        cx.notify();
+    }
+
+    fn copy_type_name(&mut self, card: u32, cx: &mut Context<Self>) {
+        let name = self.model.cards[card as usize].name.to_string();
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(name));
+        self.context_menu = None;
         cx.notify();
     }
 
@@ -663,8 +699,8 @@ const SEG_BUDGET: usize = 38_000;
 /// Second differences bound the curve's second derivative, and a cubic split
 /// into n equal steps sits within max|B''| / (8n²) of its chords.
 fn cubic_steps(
-    p0: gompass_core::layout::Point,
-    c: &gompass_core::layout::CubicSeg,
+    p0: graviz_core::layout::Point,
+    c: &graviz_core::layout::CubicSeg,
     k: f32,
     tol: f32,
 ) -> usize {
@@ -686,8 +722,8 @@ fn cubic_steps(
 /// to one segment when zoomed out and still bends smoothly when zoomed in.
 fn flatten_cubic(
     builder: &mut PathBuilder,
-    p0: gompass_core::layout::Point,
-    c: &gompass_core::layout::CubicSeg,
+    p0: graviz_core::layout::Point,
+    c: &graviz_core::layout::CubicSeg,
     k: f32,
     tol: f32,
     to_screen: &impl Fn(f32, f32) -> gpui::Point<Pixels>,
@@ -752,6 +788,7 @@ impl Render for GraphCanvas {
         if let Some(ei) = self.pending_edge.take() {
             self.focus_edge(ei, vw, vh);
         }
+        let offscreen = vw > 0.0 && self.offscreen(vw, vh);
 
         // Ripple phase, or None once the pulse has run its course. Decorative
         // motion, so it yields to the system's reduce-motion setting.
@@ -779,7 +816,7 @@ impl Render for GraphCanvas {
         /// Mirrors the web's three tooltip shapes (field / header / edge).
         struct Tooltip {
             /// Kind badge shown before the name, when the hover has a type.
-            badge: Option<(gompass_core::graph::NodeKind, &'static str)>,
+            badge: Option<(graviz_core::graph::NodeKind, &'static str)>,
             title: String,
             /// Right-hand return type, painted amber like the web.
             type_text: Option<gpui::SharedString>,
@@ -896,6 +933,10 @@ impl Render for GraphCanvas {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, ev, window, cx| this.on_mouse_down(ev, window, cx)),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, ev, window, cx| this.on_right_click(ev, window, cx)),
             )
             .on_mouse_move(cx.listener(|this, ev, window, cx| this.on_mouse_move(ev, window, cx)))
             .on_mouse_up(
@@ -1063,6 +1104,7 @@ impl Render for GraphCanvas {
                         .child(
                             div()
                                 .flex()
+                                .flex_wrap()
                                 .items_center()
                                 .gap(px(6.0))
                                 .when_some(badge, |el, (kind, label)| {
@@ -1112,7 +1154,14 @@ impl Render for GraphCanvas {
                                     .text_color(color)
                                     .child(SharedString::from(format!("⚠ {d}"))),
                             )
-                        }),
+                        })
+                        .with_spring(
+                            "tooltip-fade",
+                            SpringAnimation::new(SpringConfig::new(400.0, 45.0, 1.0))
+                                .to(1.0_f32)
+                                .from(0.0),
+                            |el, o: f32| el.opacity(o.clamp(0.0, 1.0)),
+                        ),
                 )
             })
             .when_some(
@@ -1216,6 +1265,71 @@ impl Render for GraphCanvas {
                     )
                 },
             )
+            .when(offscreen, |el| {
+                el.child(
+                    div()
+                        .id("back-to-graph")
+                        .absolute()
+                        .top(px(16.0))
+                        .right(px(16.0))
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(th.card_border)
+                        .bg(th.chrome_bg)
+                        .shadow_lg()
+                        .px_3()
+                        .py_2()
+                        .text_xs()
+                        .text_color(th.text)
+                        .cursor_pointer()
+                        .hover(|el| el.bg(th.hover_bg))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            let vw = f32::from(window.viewport_size().width) - this.pane_offset_x;
+                            let vh = f32::from(window.viewport_size().height);
+                            this.fit(vw, vh);
+                            cx.notify();
+                        }))
+                        .child("Back to graph"),
+                )
+            })
+            .when_some(self.context_menu, |el, menu| {
+                el.child(
+                    div()
+                        .absolute()
+                        .left(px(menu.x))
+                        .top(px(menu.y))
+                        .min_w(px(180.0))
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(th.card_border)
+                        .bg(th.chrome_bg)
+                        .shadow_lg()
+                        .py_1()
+                        .font_family("Menlo")
+                        .text_size(px(12.0))
+                        .text_color(th.text)
+                        // Without this, a click on a menu item also bubbles
+                        // down to the canvas's own mouse handlers underneath
+                        // (they share the same root), which cleared
+                        // `context_menu` and ate the click before it reached
+                        // the item's `on_click`.
+                        .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
+                        .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_mouse_up(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                        .child(
+                            div()
+                                .id("ctx-copy-type-name")
+                                .px_3()
+                                .py(px(6.0))
+                                .cursor_pointer()
+                                .hover(|el| el.bg(th.hover_bg))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.copy_type_name(menu.card, cx);
+                                }))
+                                .child("Copy type name"),
+                        ),
+                )
+            })
     }
 }
 
@@ -1492,8 +1606,8 @@ fn paint_scene(
     // re-shaping every visible glyph run each frame.
     let kt = 2f32.powf((k.log2() * 8.0).round() / 8.0);
     let mut text_errors = 0usize;
-    // GOMPASS_PERF=1 reports what a frame actually costs.
-    let probe = std::env::var("GOMPASS_PERF").is_ok();
+    // GRAVIZ_PERF=1 reports what a frame actually costs.
+    let probe = std::env::var("GRAVIZ_PERF").is_ok();
     let mut n_cards = 0usize;
     let mut n_rows = 0usize;
     SHAPES.with(|c| c.set(0));
@@ -2012,7 +2126,7 @@ fn paint_scene(
 }
 
 thread_local! {
-    /// Shaped-line count for the GOMPASS_PERF probe.
+    /// Shaped-line count for the GRAVIZ_PERF probe.
     static SHAPES: Cell<usize> = const { Cell::new(0) };
 }
 
@@ -2072,7 +2186,7 @@ fn paint_baseline(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gompass_core::layout::{CubicSeg, Point};
+    use graviz_core::layout::{CubicSeg, Point};
 
 
     #[test]

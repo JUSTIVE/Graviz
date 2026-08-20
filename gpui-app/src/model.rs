@@ -4,11 +4,11 @@
 //! trailingSectionGeom, hitTestField) and drifted. Here `Card::row_y` /
 //! `Card::row_at` are the single source of truth.
 
-use gompass_core::graph::{
+use graviz_core::graph::{
     all_reachable_ids, default_root_ops, is_until_expired, reachable_from, EdgeKind, NodeKind,
     ParsedGraph,
 };
-use gompass_core::layout::{self, LayoutConfig, LayoutEdge, LayoutNode};
+use graviz_core::layout::{self, LayoutConfig, LayoutEdge, LayoutNode};
 use std::collections::{HashMap, HashSet};
 
 // Card geometry — mirrors the web renderer's node-style.ts constants exactly
@@ -330,11 +330,10 @@ pub struct ModelOptions {
     pub bundle_edges: bool,
     /// Hide fields whose return type is a builtin scalar (String/Int/…).
     pub hide_primitive_fields: bool,
-    /// Drop declared scalars and the fields that reference them.
+    /// Drop declared-scalar nodes from the graph (and the edges to them).
+    /// Fields that return one still show — just as a plain type, with
+    /// nothing to navigate to.
     pub hide_custom_scalars: bool,
-    /// Names `drop_custom_scalars` removed, so the fields pointing at them
-    /// can be hidden too — and counted.
-    pub hidden_scalars: std::collections::HashSet<String>,
     /// Build the cards but not the drawing. For the list panels, which never
     /// read a position.
     pub skip_layout: bool,
@@ -349,7 +348,6 @@ impl Default for ModelOptions {
             bundle_edges: true,
             hide_primitive_fields: false,
             hide_custom_scalars: false,
-            hidden_scalars: std::collections::HashSet::new(),
             skip_layout: false,
             today: today_string(),
         }
@@ -488,7 +486,7 @@ pub fn slice_graph(full: &ParsedGraph, mode: Mode, root_override: Option<&str>) 
                 .filter(|n| keep.contains(&n.id))
                 .cloned()
                 .collect();
-            let by_id: HashMap<&str, &gompass_core::graph::GraphNodeData> =
+            let by_id: HashMap<&str, &graviz_core::graph::GraphNodeData> =
                 full.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
             let edges = full
                 .edges
@@ -578,14 +576,18 @@ fn kind_label(kind: NodeKind) -> &'static str {
     }
 }
 
-/// Remove every declared scalar and the fields that reference it.
+/// Remove every declared scalar *node* (and the edges to it) from the graph.
 ///
 /// A custom scalar is a leaf — `DateTime`, `URI`, `HTML` — with nothing
 /// inside it, but a schema mentions the same handful hundreds of times, so
 /// they contribute a large share of the edges and almost none of the
 /// structure. Built-in scalars never become nodes at all, so this only
 /// touches the ones the schema declared.
-pub fn drop_custom_scalars(g: &mut ParsedGraph) -> std::collections::HashSet<String> {
+///
+/// The fields that reference a dropped scalar are left alone — they still
+/// show on their card, just as a plain type with no node to point to. This
+/// only declutters the graph's edges, not a type's own field list.
+pub fn drop_custom_scalars(g: &mut ParsedGraph) {
     let scalars: std::collections::HashSet<String> = g
         .nodes
         .iter()
@@ -593,13 +595,10 @@ pub fn drop_custom_scalars(g: &mut ParsedGraph) -> std::collections::HashSet<Str
         .map(|n| n.id.clone())
         .collect();
     if scalars.is_empty() {
-        return scalars;
+        return;
     }
     g.nodes.retain(|n| !scalars.contains(&n.id));
     g.edges.retain(|e| !scalars.contains(&e.source) && !scalars.contains(&e.target));
-    // The fields that referenced them stay in the graph and are hidden while
-    // the card is built, so the card can say how many it is not showing.
-    scalars
 }
 
 pub fn build_model(graph: ParsedGraph, schema_name: String, options: &ModelOptions) -> Model {
@@ -635,9 +634,8 @@ pub fn build_model(graph: ParsedGraph, schema_name: String, options: &ModelOptio
         let mut row_map: Vec<Option<u32>> = Vec::new();
         let mut hidden_rows = 0usize;
         for f in n.fields.as_deref().unwrap_or(&[]) {
-            let hidden = (options.hide_primitive_fields
-                && BUILTIN_SCALARS.contains(&f.type_name.as_str()))
-                || options.hidden_scalars.contains(&f.type_name);
+            let hidden =
+                options.hide_primitive_fields && BUILTIN_SCALARS.contains(&f.type_name.as_str());
             if hidden {
                 hidden_rows += 1;
                 row_map.push(None);
@@ -1002,8 +1000,8 @@ pub fn build_model(graph: ParsedGraph, schema_name: String, options: &ModelOptio
     }
 }
 
-fn edge_group(e: &gompass_core::graph::GraphEdgeData) -> EdgeGroup {
-    use gompass_core::graph::EdgeKind;
+fn edge_group(e: &graviz_core::graph::GraphEdgeData) -> EdgeGroup {
+    use graviz_core::graph::EdgeKind;
     match e.kind {
         EdgeKind::Field => {
             if e.nullable.unwrap_or(false) {
@@ -1052,7 +1050,7 @@ mod tests {
     fn combining_marks_take_no_cell() {
         assert!((mono_w("e\u{301}", 12.0) - mono_w("e", 12.0)).abs() < 0.01);
     }
-    use gompass_core::graph::{sdl_to_graph, SdlToGraphOptions};
+    use graviz_core::graph::{sdl_to_graph, SdlToGraphOptions};
 
     fn model_of(sdl: &str, opts: ModelOptions) -> Model {
         let g = sdl_to_graph(
@@ -1175,5 +1173,34 @@ mod tests {
         assert_eq!(c.rows.len(), 1, "String field hidden");
         assert_eq!(c.display_row(0), None, "hidden field maps to nothing");
         assert_eq!(c.display_row(1), Some(0), "second field moved up");
+    }
+
+    /// "Hide custom scalars" declutters the graph's edges by dropping the
+    /// scalar's own node — it must not also delete the fields on other
+    /// cards that happen to return one.
+    #[test]
+    fn drop_custom_scalars_keeps_the_fields_that_return_one() {
+        let mut g = graviz_core::graph::sdl_to_graph(
+            "scalar DateTime
+             type Query { createdAt: DateTime, name: String }",
+            &SdlToGraphOptions { hide_relay_boilerplate: false, ..Default::default() },
+        );
+        assert!(g.error.is_none(), "{:?}", g.error);
+        drop_custom_scalars(&mut g);
+        assert!(
+            !g.nodes.iter().any(|n| n.id == "DateTime"),
+            "the scalar's own node should be gone"
+        );
+
+        let m = build_model(
+            g,
+            "t".into(),
+            &ModelOptions { today: "2020-01-01".into(), ..Default::default() },
+        );
+        let c = &m.cards[m.index_of["Query"] as usize];
+        assert_eq!(c.rows.len(), 2, "createdAt must not be hidden along with DateTime's node");
+        assert_eq!(c.rows[0].left.to_string(), "createdAt");
+        assert_eq!(c.rows[0].right.to_string(), "DateTime");
+        assert_eq!(c.rows[0].target, None, "no node left for it to navigate to");
     }
 }
