@@ -298,6 +298,14 @@ impl TreePanel {
 
     fn on_key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
+        if ks.modifiers.platform && ks.key == "v" {
+            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                self.query.push_str(&text);
+                self.refresh();
+                cx.notify();
+            }
+            return;
+        }
         if ks.modifiers.platform || ks.modifiers.control {
             return;
         }
