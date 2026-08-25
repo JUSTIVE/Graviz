@@ -15,6 +15,9 @@ graviz-core = { path = "core" }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Update check only — one blocking GET to the GitHub API on startup, so a
+# small synchronous client beats pulling in an async HTTP stack.
+ureq = { version = "2", features = ["json"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = "0.24"

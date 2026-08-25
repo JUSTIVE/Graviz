@@ -13,6 +13,7 @@ mod shell;
 mod selfshot;
 mod theme;
 mod tree;
+mod update_check;
 mod workspace;
 
 use gpui::{
