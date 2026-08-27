@@ -17,8 +17,8 @@ use graviz_core::graph::NodeKind;
 use graviz_core::search::{search_graph, SearchResult, SnippetKind};
 use gpui::{
     div, prelude::*, px, transparent_black, uniform_list, AnyElement, App, Context, EventEmitter,
-    FocusHandle, Focusable, FontWeight, HighlightStyle, Hsla, KeyDownEvent, ScrollHandle,
-    SharedString, StyledText, Window,
+    FocusHandle, Focusable, FontWeight, HighlightStyle, Hsla, KeyDownEvent, MouseButton,
+    ScrollHandle, SharedString, StyledText, Window,
 };
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -85,6 +85,8 @@ pub struct TreePanel {
     union_members: Vec<(u32, Vec<SharedString>)>,
     /// `(card, ".field" names pointing at the selection)`.
     referenced_by: Vec<(u32, Vec<SharedString>)>,
+    /// `(card, display row)` of the field whose right-click menu is open.
+    context_menu_field: Option<(u32, usize)>,
 }
 
 impl TreePanel {
@@ -110,6 +112,7 @@ impl TreePanel {
             implementers: Vec::new(),
             union_members: Vec::new(),
             referenced_by: Vec::new(),
+            context_menu_field: None,
         };
         // Debug presets, matching GRAVIZ_MODE / GRAVIZ_VIEW: open the panel
         // on a query or a selected type so selfshots can verify both states.
@@ -143,6 +146,7 @@ impl TreePanel {
         self.implementers.clear();
         self.union_members.clear();
         self.referenced_by.clear();
+        self.context_menu_field = None;
         self.refresh();
         cx.notify();
     }
@@ -265,6 +269,15 @@ impl TreePanel {
             .map(|d| (card, d));
         self.recompute_sections(card);
         cx.emit(TreeEvent::Select { node_index: card as usize, row });
+        cx.notify();
+    }
+
+    /// `"Type.field"` — the row's own name, not whatever it targets.
+    fn copy_field_path(&mut self, card: u32, dix: usize, cx: &mut Context<Self>) {
+        let c = &self.model.cards[card as usize];
+        let path = format!("{}.{}", c.name, c.rows[dix].left);
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(path));
+        self.context_menu_field = None;
         cx.notify();
     }
 
@@ -1222,8 +1235,47 @@ impl TreePanel {
                 .child(SharedString::from(d))
         });
 
+        let field_path = format!("{}.{}", c.name, row.left);
+        let menu_open = self.context_menu_field == Some((card, dix));
+        let field_menu = menu_open.then(|| {
+            div()
+                .id(("field-ctx-menu", dix))
+                .absolute()
+                .top(px(28.0))
+                .right(px(4.0))
+                .min_w(px(180.0))
+                .rounded_lg()
+                .border_1()
+                .border_color(th.card_border)
+                .bg(th.chrome_bg)
+                .shadow_lg()
+                .py_1()
+                .font_family("Menlo")
+                .text_size(px(12.0))
+                .text_color(th.text)
+                // See the same trick in canvas.rs's node context menu: without
+                // this a click on the item also bubbles down to the row's own
+                // `on_click` underneath and navigates instead of copying.
+                .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
+                .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_mouse_up(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                .child(
+                    div()
+                        .id("ctx-copy-field-path")
+                        .px_3()
+                        .py(px(6.0))
+                        .cursor_pointer()
+                        .hover(|el| el.bg(th.hover_bg))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.copy_field_path(card, dix, cx);
+                        }))
+                        .child(SharedString::from(format!("Copy \"{field_path}\""))),
+                )
+        });
+
         div()
             .id(("field", dix))
+            .relative()
             .flex()
             .flex_col()
             .gap(px(2.0))
@@ -1248,9 +1300,17 @@ impl TreePanel {
                     this.select_card(card, graph_row, cx);
                 }
             }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, _, _, cx| {
+                    this.context_menu_field = Some((card, dix));
+                    cx.notify();
+                }),
+            )
             .child(line1)
             .children(note)
             .children(desc)
+            .children(field_menu)
             .into_any_element()
     }
 }
@@ -1323,6 +1383,14 @@ impl Render for TreePanel {
             .border_color(th.panel_border)
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key_down))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.context_menu_field.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
             .child(self.render_search(th, focused, cx));
 
         if show_history {

@@ -57,6 +57,7 @@ struct Drag {
 #[derive(Clone, Copy)]
 struct ContextMenu {
     card: u32,
+    row: Option<RowHit>,
     x: f32,
     y: f32,
 }
@@ -491,13 +492,23 @@ impl GraphCanvas {
     fn on_right_click(&mut self, ev: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         let (ox, oy) = self.canvas_origin.get();
         let (x, y) = (f32::from(ev.position.x) - ox, f32::from(ev.position.y) - oy);
-        self.context_menu = self.hit_test(ev.position).map(|hit| ContextMenu { card: hit.card, x, y });
+        self.context_menu =
+            self.hit_test(ev.position).map(|hit| ContextMenu { card: hit.card, row: hit.row, x, y });
         cx.notify();
     }
 
     fn copy_type_name(&mut self, card: u32, cx: &mut Context<Self>) {
         let name = self.model.cards[card as usize].name.to_string();
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(name));
+        self.context_menu = None;
+        cx.notify();
+    }
+
+    /// `"Type.field"` — the row's own name, not whatever it's targeting.
+    fn copy_field_path(&mut self, card: u32, row: usize, cx: &mut Context<Self>) {
+        let c = &self.model.cards[card as usize];
+        let path = format!("{}.{}", c.name, c.rows[row].left);
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(path));
         self.context_menu = None;
         cx.notify();
     }
@@ -1316,6 +1327,31 @@ impl Render for GraphCanvas {
                         .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
                         .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_mouse_up(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                        .when_some(
+                            match menu.row {
+                                Some(RowHit::Row(row)) => Some(row),
+                                _ => None,
+                            },
+                            |el, row: usize| {
+                                let field_path = format!(
+                                    "{}.{}",
+                                    self.model.cards[menu.card as usize].name,
+                                    self.model.cards[menu.card as usize].rows[row].left
+                                );
+                                el.child(
+                                    div()
+                                        .id("ctx-copy-field-path")
+                                        .px_3()
+                                        .py(px(6.0))
+                                        .cursor_pointer()
+                                        .hover(|el| el.bg(th.hover_bg))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.copy_field_path(menu.card, row, cx);
+                                        }))
+                                        .child(SharedString::from(format!("Copy \"{field_path}\""))),
+                                )
+                            },
+                        )
                         .child(
                             div()
                                 .id("ctx-copy-type-name")
