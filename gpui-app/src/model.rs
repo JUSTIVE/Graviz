@@ -1203,4 +1203,34 @@ mod tests {
         assert_eq!(c.rows[0].right.to_string(), "DateTime");
         assert_eq!(c.rows[0].target, None, "no node left for it to navigate to");
     }
+
+    /// The root picker re-slices by name. Each root must bring up its own
+    /// subgraph, and `root_types` must survive so the picker can keep
+    /// listing every root the schema declared (not just the sliced one).
+    #[test]
+    fn slice_graph_honors_the_root_override() {
+        let g = sdl_to_graph(
+            "type Query { post: Post }
+             type Mutation { createPost: Post }
+             type Subscription { postCreated: Post }
+             type Post { id: ID! }",
+            &SdlToGraphOptions { hide_relay_boilerplate: false, ..Default::default() },
+        );
+        assert!(g.error.is_none(), "{:?}", g.error);
+
+        let sliced_names = |root: Option<&str>| {
+            let s = slice_graph(&g, Mode::Reachable, root);
+            let mut names: Vec<String> = s.nodes.iter().map(|n| n.id.clone()).collect();
+            names.sort();
+            names
+        };
+        assert_eq!(sliced_names(None), ["Post", "Query"], "defaults to Query");
+        assert_eq!(sliced_names(Some("Mutation")), ["Mutation", "Post"]);
+        assert_eq!(sliced_names(Some("Subscription")), ["Post", "Subscription"]);
+
+        let s = slice_graph(&g, Mode::Reachable, Some("Mutation"));
+        assert_eq!(s.root_types.query.as_deref(), Some("Query"));
+        assert_eq!(s.root_types.mutation.as_deref(), Some("Mutation"));
+        assert_eq!(s.root_types.subscription.as_deref(), Some("Subscription"));
+    }
 }
