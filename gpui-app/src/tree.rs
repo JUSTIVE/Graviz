@@ -736,8 +736,16 @@ impl TreePanel {
         } else {
             self.model.schema_name.clone().into()
         };
-        let buttons = self.model.roots.iter().enumerate().map(|(i, &card)| {
-            let name = self.model.cards[card as usize].name.clone();
+        // Every root the schema declares, not just the ones that survived
+        // the current Reachable slice — that slice only ever keeps *one*
+        // root's subgraph, so `model.roots` (card indices present in this
+        // model) would silently drop the others from the picker.
+        let rt = &self.model.graph.root_types;
+        let root_names: Vec<SharedString> = [&rt.query, &rt.mutation, &rt.subscription]
+            .into_iter()
+            .filter_map(|n| n.clone().map(SharedString::from))
+            .collect();
+        let buttons = root_names.into_iter().enumerate().map(|(i, name)| {
             let active = self.root_pick.as_ref() == Some(&name);
             let pick = name.clone();
             div()
@@ -1354,7 +1362,12 @@ fn sorted_cards(model: &Model) -> Vec<u32> {
 }
 
 fn first_root(model: &Model) -> Option<SharedString> {
-    model.roots.first().map(|&r| model.cards[r as usize].name.clone())
+    let rt = &model.graph.root_types;
+    rt.query
+        .clone()
+        .or_else(|| rt.mutation.clone())
+        .or_else(|| rt.subscription.clone())
+        .map(SharedString::from)
 }
 
 impl EventEmitter<TreeEvent> for TreePanel {}
