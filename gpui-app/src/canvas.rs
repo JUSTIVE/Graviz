@@ -1277,30 +1277,44 @@ impl Render for GraphCanvas {
                 },
             )
             .when(offscreen, |el| {
+                // Centred in the canvas. Safe to sit dead centre: this only
+                // appears once the whole graph has left the viewport, so
+                // there is nothing behind it to cover. The centring wrapper
+                // carries no interactivity, so GPUI gives it no hitbox
+                // (`should_insert_hitbox`) and pan/zoom still reach the
+                // canvas everywhere except the button itself.
                 el.child(
                     div()
-                        .id("back-to-graph")
                         .absolute()
-                        .top(px(16.0))
-                        .right(px(16.0))
-                        .rounded_lg()
-                        .border_1()
-                        .border_color(th.card_border)
-                        .bg(th.chrome_bg)
-                        .shadow_lg()
-                        .px_3()
-                        .py_2()
-                        .text_xs()
-                        .text_color(th.text)
-                        .cursor_pointer()
-                        .hover(|el| el.bg(th.hover_bg))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            let vw = f32::from(window.viewport_size().width) - this.pane_offset_x;
-                            let vh = f32::from(window.viewport_size().height);
-                            this.fit(vw, vh);
-                            cx.notify();
-                        }))
-                        .child("Back to graph"),
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .id("back-to-graph")
+                                .rounded_lg()
+                                .border_1()
+                                .border_color(th.card_border)
+                                .bg(th.chrome_bg)
+                                .shadow_lg()
+                                .px_3()
+                                .py_2()
+                                .text_xs()
+                                .text_color(th.text)
+                                .cursor_pointer()
+                                .hover(|el| el.bg(th.hover_bg))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    let vw = f32::from(window.viewport_size().width)
+                                        - this.pane_offset_x;
+                                    let vh = f32::from(window.viewport_size().height);
+                                    this.fit(vw, vh);
+                                    cx.notify();
+                                }))
+                                .child("Back to graph"),
+                        ),
                 )
             })
             .when_some(self.context_menu, |el, menu| {
