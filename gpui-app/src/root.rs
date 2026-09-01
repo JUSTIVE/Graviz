@@ -8,7 +8,7 @@ use crate::landing;
 use crate::loader;
 use crate::workspace::{OpenSchema, Workspace};
 use gpui::{
-    div, prelude::*, App, Context, Entity, ExternalPaths, FocusHandle, Focusable,
+    div, prelude::*, px, App, Context, Entity, ExternalPaths, FocusHandle, Focusable,
     PathPromptOptions, Window,
 };
 use std::path::PathBuf;
@@ -29,6 +29,8 @@ pub struct Root {
     /// shortcuts (⌘O) would have nowhere to dispatch.
     focus: FocusHandle,
     focused_once: bool,
+    /// Set once the background GitHub-releases check finds a newer tag.
+    update_available: Option<crate::update_check::UpdateInfo>,
 }
 
 impl Root {
@@ -45,6 +47,20 @@ impl Root {
             e.placeholder = "# Paste your GraphQL SDL here…";
             e
         });
+        cx.spawn(async move |this, cx| {
+            let info = cx
+                .background_executor()
+                .spawn(async { crate::update_check::check_for_update() })
+                .await;
+            if let Some(info) = info {
+                this.update(cx, |root, cx| {
+                    root.update_available = Some(info);
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
         Self {
             workspace,
             recents: config::recents(),
@@ -60,6 +76,7 @@ impl Root {
             schema_name: None,
             focus: cx.focus_handle(),
             focused_once: false,
+            update_available: None,
         }
     }
 
@@ -144,11 +161,34 @@ impl Render for Root {
         } else {
             crate::shell::Route::View
         };
+        let update_badge = self.update_available.as_ref().map(|info| {
+            let url = info.url.clone();
+            div()
+                .id("update-available")
+                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .h(px(32.0))
+                .flex()
+                .items_center()
+                .gap_2()
+                .rounded_md()
+                .border_1()
+                .border_color(th.investigate)
+                .px(px(10.0))
+                .text_sm()
+                .text_color(th.investigate)
+                .cursor_pointer()
+                .hover(|el| el.bg(th.investigate.opacity(0.1)))
+                .on_click(move |_, _, cx| cx.open_url(&url))
+                .child(crate::icons::icon(crate::icons::Icon::Sparkles, px(16.0), th.investigate))
+                .child(gpui::SharedString::from(format!("v{} available", info.version)))
+                .into_any_element()
+        });
         let header = crate::shell::header(
             th,
             route,
             has_schema,
             crate::theme::mode(cx),
+            update_badge,
             |this: &mut Self, route, _window, cx| {
                 this.show_about = route == crate::shell::Route::About;
                 this.show_landing = route == crate::shell::Route::New;

@@ -17,8 +17,8 @@ use graviz_core::graph::NodeKind;
 use graviz_core::search::{search_graph, SearchResult, SnippetKind};
 use gpui::{
     div, prelude::*, px, transparent_black, uniform_list, AnyElement, App, Context, EventEmitter,
-    FocusHandle, Focusable, FontWeight, HighlightStyle, Hsla, KeyDownEvent, ScrollHandle,
-    SharedString, StyledText, Window,
+    FocusHandle, Focusable, FontWeight, HighlightStyle, Hsla, KeyDownEvent, MouseButton,
+    ScrollHandle, SharedString, StyledText, Window,
 };
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -71,6 +71,10 @@ pub struct TreePanel {
     /// Index into `filtered` for keyboard navigation.
     active: usize,
     focus: FocusHandle,
+    /// Focus of the search input itself. Separate from `focus` (the panel
+    /// root) so that clicking a tree row does not read as "the user is
+    /// searching" and swap the tree for the recent-search list.
+    search_focus: FocusHandle,
     results_scroll: ScrollHandle,
     search_history: Vec<String>,
     /// Card index of the type shown in `TypeDetail`.
@@ -85,6 +89,8 @@ pub struct TreePanel {
     union_members: Vec<(u32, Vec<SharedString>)>,
     /// `(card, ".field" names pointing at the selection)`.
     referenced_by: Vec<(u32, Vec<SharedString>)>,
+    /// `(card, display row)` of the field whose right-click menu is open.
+    context_menu_field: Option<(u32, usize)>,
 }
 
 impl TreePanel {
@@ -101,6 +107,7 @@ impl TreePanel {
             all_sorted,
             active: 0,
             focus: cx.focus_handle(),
+            search_focus: cx.focus_handle(),
             results_scroll: ScrollHandle::new(),
             search_history: crate::config::search_history(),
             selected: None,
@@ -110,6 +117,7 @@ impl TreePanel {
             implementers: Vec::new(),
             union_members: Vec::new(),
             referenced_by: Vec::new(),
+            context_menu_field: None,
         };
         // Debug presets, matching GRAVIZ_MODE / GRAVIZ_VIEW: open the panel
         // on a query or a selected type so selfshots can verify both states.
@@ -127,14 +135,24 @@ impl TreePanel {
         this
     }
 
+    /// What ⌘K focuses — the search input, so the recent-search list opens
+    /// with it. Keys still reach `on_key_down` on the panel root, which is an
+    /// ancestor of the input in the focus dispatch path.
     pub fn focus_handle(&self) -> FocusHandle {
-        self.focus.clone()
+        self.search_focus.clone()
     }
 
     /// Swap in a different slice of the schema (mode change).
     pub fn set_model(&mut self, model: Rc<Model>, cx: &mut Context<Self>) {
         self.all_sorted = sorted_cards(&model);
-        self.root_pick = first_root(&model);
+        // Keep the picked root. Picking one funnels back through here (
+        // `RootPicked` → `Workspace::rebuild` → `set_model`), so recomputing
+        // it would snap the highlight straight back to the default and leave
+        // the button looking dead while the canvas showed the new root. Only
+        // fall back when the name is gone — a different schema was loaded.
+        if !declares_root(&model, self.root_pick.as_deref()) {
+            self.root_pick = first_root(&model);
+        }
         self.model = model;
         self.query.clear();
         self.kind_filter.clear();
@@ -143,6 +161,7 @@ impl TreePanel {
         self.implementers.clear();
         self.union_members.clear();
         self.referenced_by.clear();
+        self.context_menu_field = None;
         self.refresh();
         cx.notify();
     }
@@ -268,6 +287,15 @@ impl TreePanel {
         cx.notify();
     }
 
+    /// `"Type.field"` — the row's own name, not whatever it targets.
+    fn copy_field_path(&mut self, card: u32, dix: usize, cx: &mut Context<Self>) {
+        let c = &self.model.cards[card as usize];
+        let path = format!("{}.{}", c.name, c.rows[dix].left);
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(path));
+        self.context_menu_field = None;
+        cx.notify();
+    }
+
     /// Commit search result `ix` (an index into `filtered`) — the web's
     /// `jumpToAndClose`: remember the query, jump, then empty the box.
     fn select_result(&mut self, ix: usize, cx: &mut Context<Self>) {
@@ -370,6 +398,11 @@ impl TreePanel {
                     .px(px(8.0))
                     .rounded(px(4.0))
                     .border_1()
+                    // The input owns the focus that drives the recent-search
+                    // list. `track_focus` auto-focuses on mouse down, so
+                    // hanging that off the panel root instead would make
+                    // *any* sidebar click open the list.
+                    .track_focus(&self.search_focus)
                     .border_color(if focused { th.accent } else { th.panel_border })
                     .bg(th.bg)
                     .child(icon(Icon::Search, px(12.0), th.text_muted))
@@ -723,8 +756,7 @@ impl TreePanel {
         } else {
             self.model.schema_name.clone().into()
         };
-        let buttons = self.model.roots.iter().enumerate().map(|(i, &card)| {
-            let name = self.model.cards[card as usize].name.clone();
+        let buttons = root_names(&self.model).into_iter().enumerate().map(|(i, name)| {
             let active = self.root_pick.as_ref() == Some(&name);
             let pick = name.clone();
             div()
@@ -1222,8 +1254,47 @@ impl TreePanel {
                 .child(SharedString::from(d))
         });
 
+        let field_path = format!("{}.{}", c.name, row.left);
+        let menu_open = self.context_menu_field == Some((card, dix));
+        let field_menu = menu_open.then(|| {
+            div()
+                .id(("field-ctx-menu", dix))
+                .absolute()
+                .top(px(28.0))
+                .right(px(4.0))
+                .min_w(px(180.0))
+                .rounded_lg()
+                .border_1()
+                .border_color(th.card_border)
+                .bg(th.chrome_bg)
+                .shadow_lg()
+                .py_1()
+                .font_family("Menlo")
+                .text_size(px(12.0))
+                .text_color(th.text)
+                // See the same trick in canvas.rs's node context menu: without
+                // this a click on the item also bubbles down to the row's own
+                // `on_click` underneath and navigates instead of copying.
+                .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
+                .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_mouse_up(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                .child(
+                    div()
+                        .id("ctx-copy-field-path")
+                        .px_3()
+                        .py(px(6.0))
+                        .cursor_pointer()
+                        .hover(|el| el.bg(th.hover_bg))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.copy_field_path(card, dix, cx);
+                        }))
+                        .child(SharedString::from(format!("Copy \"{field_path}\""))),
+                )
+        });
+
         div()
             .id(("field", dix))
+            .relative()
             .flex()
             .flex_col()
             .gap(px(2.0))
@@ -1248,9 +1319,17 @@ impl TreePanel {
                     this.select_card(card, graph_row, cx);
                 }
             }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, _, _, cx| {
+                    this.context_menu_field = Some((card, dix));
+                    cx.notify();
+                }),
+            )
             .child(line1)
             .children(note)
             .children(desc)
+            .children(field_menu)
             .into_any_element()
     }
 }
@@ -1293,8 +1372,27 @@ fn sorted_cards(model: &Model) -> Vec<u32> {
     all
 }
 
+/// Every root operation the schema *declares*, in Query → Mutation →
+/// Subscription order.
+///
+/// Read from `root_types` rather than the model's cards on purpose: the
+/// Reachable slice only ever keeps one root's subgraph, so the other roots
+/// have no card to find and would drop out of the picker entirely.
+fn root_names(model: &Model) -> Vec<SharedString> {
+    let rt = &model.graph.root_types;
+    [&rt.query, &rt.mutation, &rt.subscription]
+        .into_iter()
+        .filter_map(|n| n.clone().map(SharedString::from))
+        .collect()
+}
+
 fn first_root(model: &Model) -> Option<SharedString> {
-    model.roots.first().map(|&r| model.cards[r as usize].name.clone())
+    root_names(model).into_iter().next()
+}
+
+/// Whether `name` is still one of this schema's declared roots.
+fn declares_root(model: &Model, name: Option<&str>) -> bool {
+    name.is_some_and(|name| root_names(model).iter().any(|r| r.as_ref() == name))
 }
 
 impl EventEmitter<TreeEvent> for TreePanel {}
@@ -1308,9 +1406,12 @@ impl Focusable for TreePanel {
 impl Render for TreePanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let th = crate::theme::current(cx, window.appearance());
-        let focused = self.focus.is_focused(window);
+        let focused = self.search_focus.is_focused(window);
         let query_empty = self.query.trim().is_empty();
-        // The web hides the tree while the recent list is showing.
+        // The web hides the tree while the recent list is showing. Keyed on
+        // the *input's* focus: keyed on the panel's, every click in the
+        // sidebar would swap the tree out from under the cursor and the
+        // press would never land on the row it was aimed at.
         let show_history = focused && query_empty && !self.search_history.is_empty();
 
         let mut root = div()
@@ -1323,6 +1424,14 @@ impl Render for TreePanel {
             .border_color(th.panel_border)
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key_down))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.context_menu_field.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
             .child(self.render_search(th, focused, cx));
 
         if show_history {
@@ -1337,5 +1446,63 @@ impl Render for TreePanel {
                 .child(self.render_detail(th, cx));
         }
         root
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{build_model, slice_graph, Mode, ModelOptions};
+    use graviz_core::graph::{sdl_to_graph, SdlToGraphOptions};
+
+    const THREE_ROOTS: &str = "type Query { post: Post }
+         type Mutation { createPost: Post }
+         type Subscription { postCreated: Post }
+         type Post { id: ID! }";
+
+    fn model_of(sdl: &str, root: Option<&str>) -> Model {
+        let g = sdl_to_graph(
+            sdl,
+            &SdlToGraphOptions { hide_relay_boilerplate: false, ..Default::default() },
+        );
+        assert!(g.error.is_none(), "{:?}", g.error);
+        build_model(
+            slice_graph(&g, Mode::Reachable, root),
+            "t".into(),
+            &ModelOptions { today: "2020-01-01".into(), ..Default::default() },
+        )
+    }
+
+    /// The picker must list every root the schema declares. The Reachable
+    /// slice only keeps one root's subgraph, so deriving the list from the
+    /// model's own cards showed just that one.
+    #[test]
+    fn root_names_survive_a_single_root_slice() {
+        let m = model_of(THREE_ROOTS, Some("Mutation"));
+        assert_eq!(m.roots.len(), 1, "the slice really does keep only one root card");
+        let names: Vec<String> = root_names(&m).iter().map(|n| n.to_string()).collect();
+        assert_eq!(names, ["Query", "Mutation", "Subscription"]);
+    }
+
+    /// Picking a root re-slices and lands back in `set_model`, which must
+    /// keep the pick — recomputing it snapped the highlight back to Query
+    /// while the canvas showed the newly picked root.
+    #[test]
+    fn a_picked_root_is_still_recognized_after_reslicing() {
+        let m = model_of(THREE_ROOTS, Some("Mutation"));
+        assert!(declares_root(&m, Some("Mutation")));
+        assert!(declares_root(&m, Some("Subscription")));
+        assert!(!declares_root(&m, Some("Post")), "not a root operation");
+        assert!(!declares_root(&m, None));
+        assert_eq!(first_root(&m).map(|s| s.to_string()), Some("Query".into()));
+    }
+
+    /// A schema whose roots are gone (a different file was opened) has to
+    /// fall back rather than keep highlighting a name that is not there.
+    #[test]
+    fn declares_root_rejects_names_from_another_schema() {
+        let m = model_of("type Query { a: String }", None);
+        assert!(declares_root(&m, Some("Query")));
+        assert!(!declares_root(&m, Some("Mutation")));
     }
 }

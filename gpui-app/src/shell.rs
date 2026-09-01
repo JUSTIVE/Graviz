@@ -44,11 +44,13 @@ fn nav_link(th: Theme, id: &'static str, label: &'static str, active: bool) -> S
 
 /// The sticky app header. `on_nav` fires with the clicked route, `on_theme`
 /// cycles light → dark → system like the web's single-button toggle.
+#[allow(clippy::too_many_arguments)]
 pub fn header<T: 'static>(
     th: Theme,
     route: Route,
     has_schema: bool,
     theme_mode: ThemeMode,
+    update_badge: Option<gpui::AnyElement>,
     on_nav: impl Fn(&mut T, Route, &mut Window, &mut gpui::Context<T>) + 'static + Clone,
     on_theme: impl Fn(&mut T, &mut Window, &mut gpui::Context<T>) + 'static,
     cx: &mut gpui::Context<T>,
@@ -132,23 +134,30 @@ pub fn header<T: 'static>(
         )
         .child(
             div()
-                .id("theme-toggle")
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .h(px(32.0))
                 .flex()
                 .items_center()
-                .gap_2()
-                .rounded_md()
-                .border_1()
-                .border_color(th.card_border)
-                .px(px(10.0))
-                .text_sm()
-                .text_color(th.text)
-                .cursor_pointer()
-                .hover(|el| el.bg(th.hover_bg))
-                .on_click(cx.listener(move |this, _, window, cx| on_theme(this, window, cx)))
-                .child(icon(theme_icon, px(16.0), th.text))
-                .child(SharedString::from(theme_label)),
+                .gap_3()
+                .when_some(update_badge, |el, b| el.child(b))
+                .child(
+                    div()
+                        .id("theme-toggle")
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .h(px(32.0))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(th.card_border)
+                        .px(px(10.0))
+                        .text_sm()
+                        .text_color(th.text)
+                        .cursor_pointer()
+                        .hover(|el| el.bg(th.hover_bg))
+                        .on_click(cx.listener(move |this, _, window, cx| on_theme(this, window, cx)))
+                        .child(icon(theme_icon, px(16.0), th.text))
+                        .child(SharedString::from(theme_label)),
+                ),
         )
 }
 
