@@ -16,9 +16,9 @@ use crate::workspace::kind_badge;
 use graviz_core::graph::NodeKind;
 use graviz_core::search::{search_graph, SearchResult, SnippetKind};
 use gpui::{
-    div, prelude::*, px, transparent_black, uniform_list, AnyElement, App, Context, EventEmitter,
-    FocusHandle, Focusable, FontWeight, HighlightStyle, Hsla, KeyDownEvent, MouseButton,
-    ScrollHandle, SharedString, StyledText, Window,
+    div, prelude::*, px, transparent_black, uniform_list, AnyElement, App, ClipboardItem, Context,
+    EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle, Hsla, KeyDownEvent,
+    MouseButton, ScrollHandle, SharedString, StyledText, Window,
 };
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -91,6 +91,9 @@ pub struct TreePanel {
     referenced_by: Vec<(u32, Vec<SharedString>)>,
     /// `(card, display row)` of the field whose right-click menu is open.
     context_menu_field: Option<(u32, usize)>,
+    /// ⌘A on the search box. The box has no caret, so the whole query is the
+    /// only selection it can express; the next keystroke replaces it.
+    select_all: bool,
 }
 
 impl TreePanel {
@@ -118,6 +121,7 @@ impl TreePanel {
             union_members: Vec::new(),
             referenced_by: Vec::new(),
             context_menu_field: None,
+            select_all: false,
         };
         // Debug presets, matching GRAVIZ_MODE / GRAVIZ_VIEW: open the panel
         // on a query or a selected type so selfshots can verify both states.
@@ -167,6 +171,9 @@ impl TreePanel {
     }
 
     fn refresh(&mut self) {
+        // Every path that edits the query lands here, so the selection can be
+        // dropped in one place instead of at each caller.
+        self.select_all = false;
         self.results = if self.query.trim().is_empty() {
             Vec::new()
         } else {
@@ -326,20 +333,48 @@ impl TreePanel {
 
     fn on_key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
-        if ks.modifiers.platform && ks.key == "v" {
-            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                self.query.push_str(&text);
-                self.refresh();
-                cx.notify();
+        // ⌘-chords. This is a key-capture box, not a real text field: there
+        // is no caret, so "selection" can only ever be the whole query —
+        // enough for the ⌘A → retype / copy / delete the user expects.
+        if ks.modifiers.platform {
+            match ks.key.as_str() {
+                "a" => self.select_all = !self.query.is_empty(),
+                "c" => {
+                    if self.select_all {
+                        cx.write_to_clipboard(ClipboardItem::new_string(self.query.clone()));
+                    }
+                    return;
+                }
+                "x" => {
+                    if !self.select_all {
+                        return;
+                    }
+                    cx.write_to_clipboard(ClipboardItem::new_string(self.query.clone()));
+                    self.query.clear();
+                    self.select_all = false;
+                    self.refresh();
+                }
+                "v" => {
+                    let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+                        return;
+                    };
+                    insert_text(&mut self.query, self.select_all, &text);
+                    self.refresh();
+                }
+                _ => return,
             }
+            cx.notify();
             return;
         }
-        if ks.modifiers.platform || ks.modifiers.control {
+        if ks.modifiers.control {
             return;
         }
+        // Any plain keystroke past here collapses the selection, the way a
+        // caret would land somewhere and drop it.
+        let selected = std::mem::take(&mut self.select_all);
         match ks.key.as_str() {
             "backspace" => {
-                self.query.pop();
+                delete_back(&mut self.query, selected);
                 self.refresh();
             }
             "escape" => {
@@ -362,7 +397,7 @@ impl TreePanel {
             _ => {
                 if let Some(ch) = ks.key_char.as_deref() {
                     if !ch.chars().any(|c| c.is_control()) {
-                        self.query.push_str(ch);
+                        insert_text(&mut self.query, selected, ch);
                         self.refresh();
                     }
                 } else {
@@ -410,11 +445,25 @@ impl TreePanel {
                         div()
                             .flex_1()
                             .min_w_0()
+                            .flex()
+                            .items_center()
                             .text_size(px(12.0))
                             .whitespace_nowrap()
                             .overflow_hidden()
                             .text_color(if empty { th.text_muted } else { th.text })
-                            .child(text),
+                            // The highlight hugs the text rather than the
+                            // whole row, so ⌘A reads as a selection instead
+                            // of the field just changing colour.
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .whitespace_nowrap()
+                                    .overflow_hidden()
+                                    .when(self.select_all, |el| {
+                                        el.rounded(px(2.0)).bg(th.accent.opacity(0.35))
+                                    })
+                                    .child(text),
+                            ),
                     )
                     .child(if empty {
                         div()
@@ -1372,6 +1421,25 @@ fn sorted_cards(model: &Model) -> Vec<u32> {
     all
 }
 
+/// Insert into the search query, honouring a whole-query selection: with one
+/// live the insertion replaces the query instead of appending to it. That
+/// replace-on-type is the whole point of ⌘A in a box with no caret.
+fn insert_text(query: &mut String, selected: bool, text: &str) {
+    if selected {
+        query.clear();
+    }
+    query.push_str(text);
+}
+
+/// Backspace: deletes the selection whole, else the last character.
+fn delete_back(query: &mut String, selected: bool) {
+    if selected {
+        query.clear();
+    } else {
+        query.pop();
+    }
+}
+
 /// Every root operation the schema *declares*, in Query → Mutation →
 /// Subscription order.
 ///
@@ -1495,6 +1563,45 @@ mod tests {
         assert!(!declares_root(&m, Some("Post")), "not a root operation");
         assert!(!declares_root(&m, None));
         assert_eq!(first_root(&m).map(|s| s.to_string()), Some("Query".into()));
+    }
+
+    /// ⌘A then typing must replace the query, not extend it — the search box
+    /// has no caret, so this is the only selection it can express.
+    #[test]
+    fn typing_over_a_selection_replaces_the_query() {
+        let mut q = String::from("user");
+        insert_text(&mut q, true, "p");
+        assert_eq!(q, "p");
+        insert_text(&mut q, false, "ost");
+        assert_eq!(q, "post", "without a selection it keeps appending");
+    }
+
+    /// Same for paste, which shares the insertion path.
+    #[test]
+    fn pasting_over_a_selection_replaces_the_query() {
+        let mut q = String::from("user");
+        insert_text(&mut q, true, "Post.title");
+        assert_eq!(q, "Post.title");
+    }
+
+    #[test]
+    fn backspace_deletes_the_selection_whole_else_one_char() {
+        let mut q = String::from("user");
+        delete_back(&mut q, true);
+        assert_eq!(q, "");
+
+        let mut q = String::from("user");
+        delete_back(&mut q, false);
+        assert_eq!(q, "use");
+
+        // Whole characters, not bytes — a half-deleted glyph would panic.
+        let mut q = String::from("한글");
+        delete_back(&mut q, false);
+        assert_eq!(q, "한");
+
+        let mut q = String::new();
+        delete_back(&mut q, false);
+        assert_eq!(q, "", "backspace on an empty query is a no-op");
     }
 
     /// A schema whose roots are gone (a different file was opened) has to
