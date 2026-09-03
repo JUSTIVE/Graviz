@@ -6,11 +6,13 @@
 //! collapsible "All types", the context sections (implemented by / members /
 //! referenced by) and the `TypeDetail` pane.
 //!
-//! The search box is a minimal key-capture input (schema identifiers are
-//! ASCII); results come from `graviz_core::search::search_graph`.
+//! The search box is a key-capture input over a [`TextEdit`] buffer — it has
+//! a real caret and selection, but no IME; results come from
+//! `graviz_core::search::search_graph`.
 
 use crate::icons::{icon, Icon};
-use crate::model::{Model, RowKind};
+use crate::model::{mono_w, Model, RowKind};
+use crate::textedit::TextEdit;
 use crate::theme::Theme;
 use crate::workspace::kind_badge;
 use graviz_core::graph::NodeKind;
@@ -20,6 +22,7 @@ use gpui::{
     EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle, Hsla, KeyDownEvent,
     MouseButton, ScrollHandle, SharedString, StyledText, Window,
 };
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
@@ -43,6 +46,11 @@ const LIST_MAX_H: f32 = 192.0;
 
 const MONO: &str = "Menlo";
 
+/// The search box is monospaced so the caret can be placed by measuring the
+/// text to its left rather than round-tripping through the text system.
+const SEARCH_FONT_PX: f32 = 12.0;
+const SEARCH_LINE_H: f32 = 18.0;
+
 fn kind_label(kind: NodeKind) -> &'static str {
     KIND_ORDER
         .iter()
@@ -59,7 +67,8 @@ pub enum TreeEvent {
 
 pub struct TreePanel {
     model: Rc<Model>,
-    query: String,
+    /// The search box's buffer: text plus caret and selection.
+    search: TextEdit,
     /// Unfiltered hits — the kind chips count over these.
     results: Vec<SearchResult>,
     /// Indices into `results` surviving `kind_filter`.
@@ -91,9 +100,9 @@ pub struct TreePanel {
     referenced_by: Vec<(u32, Vec<SharedString>)>,
     /// `(card, display row)` of the field whose right-click menu is open.
     context_menu_field: Option<(u32, usize)>,
-    /// ⌘A on the search box. The box has no caret, so the whole query is the
-    /// only selection it can express; the next keystroke replaces it.
-    select_all: bool,
+    /// Left edge of the search text, recorded at paint time so a click can be
+    /// mapped to a caret offset.
+    search_origin: Rc<Cell<f32>>,
 }
 
 impl TreePanel {
@@ -102,7 +111,7 @@ impl TreePanel {
         let root_pick = first_root(&model);
         let mut this = Self {
             model,
-            query: String::new(),
+            search: TextEdit::default(),
             results: Vec::new(),
             filtered: Vec::new(),
             kind_counts: HashMap::new(),
@@ -121,12 +130,12 @@ impl TreePanel {
             union_members: Vec::new(),
             referenced_by: Vec::new(),
             context_menu_field: None,
-            select_all: false,
+            search_origin: Rc::new(Cell::new(0.0)),
         };
         // Debug presets, matching GRAVIZ_MODE / GRAVIZ_VIEW: open the panel
         // on a query or a selected type so selfshots can verify both states.
         if let Ok(q) = std::env::var("GRAVIZ_TREE") {
-            this.query = q;
+            this.search.set_text(q);
             this.refresh();
         }
         if let Ok(name) = std::env::var("GRAVIZ_TREE_SEL") {
@@ -158,7 +167,7 @@ impl TreePanel {
             self.root_pick = first_root(&model);
         }
         self.model = model;
-        self.query.clear();
+        self.search.clear();
         self.kind_filter.clear();
         self.selected = None;
         self.pinned = None;
@@ -171,13 +180,10 @@ impl TreePanel {
     }
 
     fn refresh(&mut self) {
-        // Every path that edits the query lands here, so the selection can be
-        // dropped in one place instead of at each caller.
-        self.select_all = false;
-        self.results = if self.query.trim().is_empty() {
+        self.results = if self.search.text.trim().is_empty() {
             Vec::new()
         } else {
-            search_graph(&self.model.graph, &self.query)
+            search_graph(&self.model.graph, &self.search.text)
         };
         self.kind_counts.clear();
         for r in &self.results {
@@ -195,7 +201,7 @@ impl TreePanel {
     }
 
     fn set_query(&mut self, q: String, cx: &mut Context<Self>) {
-        self.query = q;
+        self.search.set_text(q);
         self.refresh();
         cx.notify();
     }
@@ -311,13 +317,13 @@ impl TreePanel {
             let r = &self.results[ri];
             (r.node_index as u32, r.row_index)
         };
-        if !self.query.trim().is_empty() {
-            crate::config::push_search(&self.query);
+        if !self.search.text.trim().is_empty() {
+            crate::config::push_search(&self.search.text);
             self.search_history = crate::config::search_history();
         }
         self.active = ix;
         self.select_card(card, row, cx);
-        self.query.clear();
+        self.search.clear();
         self.refresh();
     }
 
@@ -333,34 +339,35 @@ impl TreePanel {
 
     fn on_key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
-        // ⌘-chords. This is a key-capture box, not a real text field: there
-        // is no caret, so "selection" can only ever be the whole query —
-        // enough for the ⌘A → retype / copy / delete the user expects.
+        let shift = ks.modifiers.shift;
+        // ⌘-chords. ⌘←/⌘→ are line start/end, the way they are in every other
+        // single-line field on this platform.
         if ks.modifiers.platform {
             match ks.key.as_str() {
-                "a" => self.select_all = !self.query.is_empty(),
+                "a" => self.search.select_all(),
                 "c" => {
-                    if self.select_all {
-                        cx.write_to_clipboard(ClipboardItem::new_string(self.query.clone()));
+                    if let Some(sel) = self.search.selected_text() {
+                        cx.write_to_clipboard(ClipboardItem::new_string(sel.to_string()));
                     }
                     return;
                 }
                 "x" => {
-                    if !self.select_all {
+                    let Some(sel) = self.search.selected_text().map(str::to_string) else {
                         return;
-                    }
-                    cx.write_to_clipboard(ClipboardItem::new_string(self.query.clone()));
-                    self.query.clear();
-                    self.select_all = false;
+                    };
+                    cx.write_to_clipboard(ClipboardItem::new_string(sel));
+                    self.search.delete_selection();
                     self.refresh();
                 }
                 "v" => {
                     let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
                         return;
                     };
-                    insert_text(&mut self.query, self.select_all, &text);
+                    self.search.insert(&text);
                     self.refresh();
                 }
+                "left" => self.search.move_cursor(0, shift),
+                "right" => self.search.move_cursor(self.search.text.len(), shift),
                 _ => return,
             }
             cx.notify();
@@ -369,19 +376,32 @@ impl TreePanel {
         if ks.modifiers.control {
             return;
         }
-        // Any plain keystroke past here collapses the selection, the way a
-        // caret would land somewhere and drop it.
-        let selected = std::mem::take(&mut self.select_all);
         match ks.key.as_str() {
             "backspace" => {
-                delete_back(&mut self.query, selected);
+                self.search.backspace();
                 self.refresh();
             }
+            "delete" => {
+                self.search.delete_forward();
+                self.refresh();
+            }
+            "left" => {
+                let to = self.search.prev_boundary(self.search.cursor);
+                self.search.move_cursor(to, shift);
+            }
+            "right" => {
+                let to = self.search.next_boundary(self.search.cursor);
+                self.search.move_cursor(to, shift);
+            }
+            "home" => self.search.move_cursor(0, shift),
+            "end" => self.search.move_cursor(self.search.text.len(), shift),
             "escape" => {
-                self.query.clear();
+                self.search.clear();
                 self.refresh();
                 window.blur();
             }
+            // Up/down/enter drive the result list, not the text — there is
+            // only ever one line to move within.
             "up" => {
                 self.active = self.active.saturating_sub(1);
                 self.results_scroll.scroll_to_item(self.active);
@@ -397,7 +417,7 @@ impl TreePanel {
             _ => {
                 if let Some(ch) = ks.key_char.as_deref() {
                     if !ch.chars().any(|c| c.is_control()) {
-                        insert_text(&mut self.query, selected, ch);
+                        self.search.insert(ch);
                         self.refresh();
                     }
                 } else {
@@ -411,12 +431,20 @@ impl TreePanel {
     // ---- 1. search input -------------------------------------------------
 
     fn render_search(&self, th: Theme, focused: bool, cx: &mut Context<Self>) -> AnyElement {
-        let empty = self.query.is_empty();
+        let query = self.search.text.clone();
+        let empty = query.is_empty();
         let text: SharedString = if empty {
             "Search types & fields…".into()
         } else {
-            self.query.clone().into()
+            query.clone().into()
         };
+        // The caret and the selection band are placed by measuring the text
+        // to their left, which is exact because the box is monospaced.
+        let caret_x = mono_w(&query[..self.search.cursor], SEARCH_FONT_PX);
+        let selection = self.search.selection().map(|(s, e)| {
+            (mono_w(&query[..s], SEARCH_FONT_PX), mono_w(&query[s..e], SEARCH_FONT_PX))
+        });
+        let origin = self.search_origin.clone();
         div()
             .flex_none()
             .px_3()
@@ -443,27 +471,66 @@ impl TreePanel {
                     .child(icon(Icon::Search, px(12.0), th.text_muted))
                     .child(
                         div()
+                            .id("search-text")
                             .flex_1()
                             .min_w_0()
+                            .relative()
+                            .h(px(SEARCH_LINE_H))
                             .flex()
                             .items_center()
-                            .text_size(px(12.0))
+                            .font_family(MONO)
+                            .text_size(px(SEARCH_FONT_PX))
                             .whitespace_nowrap()
                             .overflow_hidden()
                             .text_color(if empty { th.text_muted } else { th.text })
-                            // The highlight hugs the text rather than the
-                            // whole row, so ⌘A reads as a selection instead
-                            // of the field just changing colour.
+                            // Records where the text starts so a click can be
+                            // turned back into a caret offset.
                             .child(
-                                div()
-                                    .min_w_0()
-                                    .whitespace_nowrap()
-                                    .overflow_hidden()
-                                    .when(self.select_all, |el| {
-                                        el.rounded(px(2.0)).bg(th.accent.opacity(0.35))
-                                    })
-                                    .child(text),
-                            ),
+                                gpui::canvas(
+                                    |_, _, _| (),
+                                    move |bounds, _, _, _| {
+                                        origin.set(f32::from(bounds.origin.x))
+                                    },
+                                )
+                                .absolute()
+                                .size_full(),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, ev: &gpui::MouseDownEvent, _, cx| {
+                                    let x = f32::from(ev.position.x) - this.search_origin.get();
+                                    let to = offset_for_x(&this.search.text, x);
+                                    this.search.move_cursor(to, false);
+                                    cx.notify();
+                                }),
+                            )
+                            // Painted before the glyphs so it sits behind them.
+                            .when_some(selection, |el, (x, w)| {
+                                el.child(
+                                    div()
+                                        .absolute()
+                                        .left(px(x))
+                                        .top_0()
+                                        .bottom_0()
+                                        .w(px(w))
+                                        .rounded(px(2.0))
+                                        .bg(th.accent.opacity(0.35)),
+                                )
+                            })
+                            .child(text)
+                            // No caret while a selection is up, matching the
+                            // platform's own fields.
+                            .when(focused && selection.is_none(), |el| {
+                                el.child(
+                                    div()
+                                        .absolute()
+                                        .left(px(caret_x))
+                                        .top(px(2.0))
+                                        .bottom(px(2.0))
+                                        .w(px(1.5))
+                                        .bg(th.accent),
+                                )
+                            }),
                     )
                     .child(if empty {
                         div()
@@ -1421,23 +1488,19 @@ fn sorted_cards(model: &Model) -> Vec<u32> {
     all
 }
 
-/// Insert into the search query, honouring a whole-query selection: with one
-/// live the insertion replaces the query instead of appending to it. That
-/// replace-on-type is the whole point of ⌘A in a box with no caret.
-fn insert_text(query: &mut String, selected: bool, text: &str) {
-    if selected {
-        query.clear();
-    }
-    query.push_str(text);
-}
-
-/// Backspace: deletes the selection whole, else the last character.
-fn delete_back(query: &mut String, selected: bool) {
-    if selected {
-        query.clear();
-    } else {
-        query.pop();
-    }
+/// Byte offset whose caret position sits closest to `x`, measured in pixels
+/// from the start of the text. Only char boundaries are candidates, so the
+/// caret can never land inside a multi-byte glyph.
+fn offset_for_x(text: &str, x: f32) -> usize {
+    text.char_indices()
+        .map(|(i, _)| i)
+        .chain(std::iter::once(text.len()))
+        .min_by(|&a, &b| {
+            let da = (mono_w(&text[..a], SEARCH_FONT_PX) - x).abs();
+            let db = (mono_w(&text[..b], SEARCH_FONT_PX) - x).abs();
+            da.total_cmp(&db)
+        })
+        .unwrap_or(0)
 }
 
 /// Every root operation the schema *declares*, in Query → Mutation →
@@ -1475,7 +1538,7 @@ impl Render for TreePanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let th = crate::theme::current(cx, window.appearance());
         let focused = self.search_focus.is_focused(window);
-        let query_empty = self.query.trim().is_empty();
+        let query_empty = self.search.text.trim().is_empty();
         // The web hides the tree while the recent list is showing. Keyed on
         // the *input's* focus: keyed on the panel's, every click in the
         // sidebar would swap the tree out from under the cursor and the
@@ -1565,43 +1628,29 @@ mod tests {
         assert_eq!(first_root(&m).map(|s| s.to_string()), Some("Query".into()));
     }
 
-    /// ⌘A then typing must replace the query, not extend it — the search box
-    /// has no caret, so this is the only selection it can express.
+    /// Clicking maps an x offset back to a caret position, snapping to the
+    /// nearer boundary so the caret lands where the pointer looks.
     #[test]
-    fn typing_over_a_selection_replaces_the_query() {
-        let mut q = String::from("user");
-        insert_text(&mut q, true, "p");
-        assert_eq!(q, "p");
-        insert_text(&mut q, false, "ost");
-        assert_eq!(q, "post", "without a selection it keeps appending");
+    fn click_maps_x_to_the_nearest_caret_offset() {
+        let w = |s: &str| mono_w(s, SEARCH_FONT_PX);
+        assert_eq!(offset_for_x("user", 0.0), 0);
+        assert_eq!(offset_for_x("user", w("user")), 4, "past the end clamps to the end");
+        assert_eq!(offset_for_x("user", w("user") + 999.0), 4);
+        assert_eq!(offset_for_x("user", w("us")), 2);
+        // Just past a glyph's midpoint rounds on to the next boundary.
+        assert_eq!(offset_for_x("user", w("us") + w("e") * 0.6), 3);
+        assert_eq!(offset_for_x("", 42.0), 0, "empty text has only offset 0");
     }
 
-    /// Same for paste, which shares the insertion path.
+    /// Byte offsets again: a click inside a multi-byte glyph has to resolve
+    /// to one of its edges, never into the middle.
     #[test]
-    fn pasting_over_a_selection_replaces_the_query() {
-        let mut q = String::from("user");
-        insert_text(&mut q, true, "Post.title");
-        assert_eq!(q, "Post.title");
-    }
-
-    #[test]
-    fn backspace_deletes_the_selection_whole_else_one_char() {
-        let mut q = String::from("user");
-        delete_back(&mut q, true);
-        assert_eq!(q, "");
-
-        let mut q = String::from("user");
-        delete_back(&mut q, false);
-        assert_eq!(q, "use");
-
-        // Whole characters, not bytes — a half-deleted glyph would panic.
-        let mut q = String::from("한글");
-        delete_back(&mut q, false);
-        assert_eq!(q, "한");
-
-        let mut q = String::new();
-        delete_back(&mut q, false);
-        assert_eq!(q, "", "backspace on an empty query is a no-op");
+    fn click_never_lands_inside_a_multibyte_glyph() {
+        let text = "한글";
+        for step in 0..40 {
+            let off = offset_for_x(text, step as f32 * 2.0);
+            assert!(text.is_char_boundary(off), "offset {off} splits a glyph");
+        }
     }
 
     /// A schema whose roots are gone (a different file was opened) has to
