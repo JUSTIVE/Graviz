@@ -11,6 +11,7 @@ mod root;
 mod shell;
 #[cfg(target_os = "macos")]
 mod selfshot;
+mod textedit;
 mod theme;
 mod tree;
 mod update_check;
