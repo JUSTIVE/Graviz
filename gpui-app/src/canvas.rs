@@ -192,10 +192,11 @@ impl GraphCanvas {
     pub fn set_investigate(&mut self, on: bool, cx: &mut Context<Self>) {
         if self.investigate != on {
             self.investigate = on;
-            // An edge hovered when the mode came on would otherwise stay lit
-            // and keep its tooltip until the cursor next moves.
+            // An edge hovered or pinned when the mode came on would otherwise
+            // stay lit, tooltip and all, against a mode that dims every edge.
             if on {
                 self.hovered_edge = None;
+                self.focused_edge = None;
             }
             cx.notify();
         }
@@ -352,6 +353,15 @@ impl GraphCanvas {
             }
         }
         None
+    }
+
+    /// Nearest edge the cursor can actually act on.
+    ///
+    /// Investigate dims every edge and highlights none, so there an edge is
+    /// scenery: hover, tooltip and click-to-pin all fall through to the
+    /// canvas underneath.
+    fn hit_test_edge_interactive(&self, p: Point<Pixels>) -> Option<u32> {
+        (!self.investigate).then(|| self.hit_test_edge(p)).flatten()
     }
 
     /// Nearest edge within ~6 screen px of the cursor.
@@ -535,11 +545,8 @@ impl GraphCanvas {
             // the cursor pixel-by-pixel would repaint the whole canvas on
             // every mouse event — the tooltip re-anchors on the next paint.
             let hover = self.hit_test(ev.position);
-            // Investigate dims every edge on purpose. Letting one light up
-            // under the cursor, with a tooltip on top of the cards the mode
-            // is asking the reader to scan, works against it.
-            let hovered_edge = if hover.is_none() && !self.investigate {
-                self.hit_test_edge(ev.position)
+            let hovered_edge = if hover.is_none() {
+                self.hit_test_edge_interactive(ev.position)
             } else {
                 None
             };
@@ -558,7 +565,9 @@ impl GraphCanvas {
         self.drag = None;
         if was_click {
             // Web: clicking empty canvas clears focus + pin.
-            if self.hit_test(ev.position).is_none() && self.hit_test_edge(ev.position).is_none() {
+            if self.hit_test(ev.position).is_none()
+                && self.hit_test_edge_interactive(ev.position).is_none()
+            {
                 self.focus = None;
                 self.pinned = None;
                 self.hovered_edge = None;
@@ -567,7 +576,7 @@ impl GraphCanvas {
             let vw = f32::from(window.viewport_size().width) - self.pane_offset_x;
             let vh = f32::from(window.viewport_size().height);
             if self.hit_test(ev.position).is_none() {
-                if let Some(ei) = self.hit_test_edge(ev.position) {
+                if let Some(ei) = self.hit_test_edge_interactive(ev.position) {
                     self.focus_edge(ei, vw, vh);
                 }
             }
