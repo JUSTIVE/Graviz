@@ -659,7 +659,7 @@ fn edge_is_dimmed(
 fn card_is_documented(card: &crate::model::Card) -> bool {
     card.description.is_some()
         && !card.rows.iter().any(|r| {
-            matches!(r.kind, RowKind::Field | RowKind::EnumValue) && r.description.is_none()
+            matches!(r.kind, RowKind::Field | RowKind::EnumValue) && !r.is_documented()
         })
 }
 
@@ -2046,7 +2046,7 @@ fn paint_scene(
             if k >= LOD_ROWS {
                 for (ri, row) in card.rows.iter().enumerate() {
                     if matches!(row.kind, RowKind::Field | RowKind::EnumValue)
-                        && row.description.is_none()
+                        && !row.is_documented()
                     {
                         window.paint_quad(fill(
                             rect(4.0, card.row_y(ri), card.w - 8.0, pitch),
