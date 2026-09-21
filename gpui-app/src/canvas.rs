@@ -2042,16 +2042,19 @@ fn paint_scene(
                     BorderStyle::Solid,
                 ));
             }
-            if k >= LOD_ROWS {
-                for (ri, row) in card.rows.iter().enumerate() {
-                    if matches!(row.kind, RowKind::Field | RowKind::EnumValue)
-                        && !row.is_documented()
-                    {
-                        window.paint_quad(fill(
-                            rect(4.0, card.row_y(ri), card.w - 8.0, pitch),
-                            th.investigate.opacity(0.22),
-                        ));
-                    }
+            // No LOD gate on the stripes. The mode is most useful zoomed
+            // out, where a card's own outline says nothing about which of
+            // its fields are bare, and the row text this zoom drops is not
+            // what the stripe is made of. The web draws them at every scale.
+            let (r_lo, r_hi) = visible_rows(card, pos.y, wy0, wy1);
+            for (ri, row) in card.rows.iter().enumerate().take(r_hi).skip(r_lo) {
+                if matches!(row.kind, RowKind::Field | RowKind::EnumValue)
+                    && !row.is_documented()
+                {
+                    window.paint_quad(fill(
+                        rect(4.0, card.row_y(ri), card.w - 8.0, pitch),
+                        th.investigate.opacity(0.22),
+                    ));
                 }
             }
         }
