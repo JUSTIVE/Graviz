@@ -1565,13 +1565,12 @@ fn paint_scene(
             // hub-star edges dim (the web app's hub fading).
             let mut dimmed =
                 edge_is_dimmed(ei as u32, e.from, e.to, e.hub_faded, focused_edge, focus);
-            // In investigate mode an edge is only interesting if it touches
-            // something undocumented; the rest recede with their cards.
-            if investigate && !dimmed {
-                let touches_gap = [e.from, e.to].iter().any(|&c| {
-                    model.cards.get(c as usize).is_some_and(|c| !card_is_documented(c))
-                });
-                dimmed = !touches_gap;
+            // Investigate highlights types and rows, never edges. An edge
+            // into an undocumented type says nothing about the edge itself,
+            // and lighting it up drags the eye away from the card that
+            // actually needs the prose. The web dims every edge here too.
+            if investigate {
+                dimmed = true;
             }
             if dimmed != dim_pass {
                 continue;
