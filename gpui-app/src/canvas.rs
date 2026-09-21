@@ -192,6 +192,11 @@ impl GraphCanvas {
     pub fn set_investigate(&mut self, on: bool, cx: &mut Context<Self>) {
         if self.investigate != on {
             self.investigate = on;
+            // An edge hovered when the mode came on would otherwise stay lit
+            // and keep its tooltip until the cursor next moves.
+            if on {
+                self.hovered_edge = None;
+            }
             cx.notify();
         }
     }
@@ -530,7 +535,10 @@ impl GraphCanvas {
             // the cursor pixel-by-pixel would repaint the whole canvas on
             // every mouse event — the tooltip re-anchors on the next paint.
             let hover = self.hit_test(ev.position);
-            let hovered_edge = if hover.is_none() {
+            // Investigate dims every edge on purpose. Letting one light up
+            // under the cursor, with a tooltip on top of the cards the mode
+            // is asking the reader to scan, works against it.
+            let hovered_edge = if hover.is_none() && !self.investigate {
                 self.hit_test_edge(ev.position)
             } else {
                 None
