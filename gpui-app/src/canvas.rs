@@ -192,6 +192,12 @@ impl GraphCanvas {
     pub fn set_investigate(&mut self, on: bool, cx: &mut Context<Self>) {
         if self.investigate != on {
             self.investigate = on;
+            // An edge hovered or pinned when the mode came on would otherwise
+            // stay lit, tooltip and all, against a mode that dims every edge.
+            if on {
+                self.hovered_edge = None;
+                self.focused_edge = None;
+            }
             cx.notify();
         }
     }
@@ -347,6 +353,15 @@ impl GraphCanvas {
             }
         }
         None
+    }
+
+    /// Nearest edge the cursor can actually act on.
+    ///
+    /// Investigate dims every edge and highlights none, so there an edge is
+    /// scenery: hover, tooltip and click-to-pin all fall through to the
+    /// canvas underneath.
+    fn hit_test_edge_interactive(&self, p: Point<Pixels>) -> Option<u32> {
+        (!self.investigate).then(|| self.hit_test_edge(p)).flatten()
     }
 
     /// Nearest edge within ~6 screen px of the cursor.
@@ -531,7 +546,7 @@ impl GraphCanvas {
             // every mouse event — the tooltip re-anchors on the next paint.
             let hover = self.hit_test(ev.position);
             let hovered_edge = if hover.is_none() {
-                self.hit_test_edge(ev.position)
+                self.hit_test_edge_interactive(ev.position)
             } else {
                 None
             };
@@ -550,7 +565,9 @@ impl GraphCanvas {
         self.drag = None;
         if was_click {
             // Web: clicking empty canvas clears focus + pin.
-            if self.hit_test(ev.position).is_none() && self.hit_test_edge(ev.position).is_none() {
+            if self.hit_test(ev.position).is_none()
+                && self.hit_test_edge_interactive(ev.position).is_none()
+            {
                 self.focus = None;
                 self.pinned = None;
                 self.hovered_edge = None;
@@ -559,7 +576,7 @@ impl GraphCanvas {
             let vw = f32::from(window.viewport_size().width) - self.pane_offset_x;
             let vh = f32::from(window.viewport_size().height);
             if self.hit_test(ev.position).is_none() {
-                if let Some(ei) = self.hit_test_edge(ev.position) {
+                if let Some(ei) = self.hit_test_edge_interactive(ev.position) {
                     self.focus_edge(ei, vw, vh);
                 }
             }
@@ -659,7 +676,7 @@ fn edge_is_dimmed(
 fn card_is_documented(card: &crate::model::Card) -> bool {
     card.description.is_some()
         && !card.rows.iter().any(|r| {
-            matches!(r.kind, RowKind::Field | RowKind::EnumValue) && r.description.is_none()
+            matches!(r.kind, RowKind::Field | RowKind::EnumValue) && !r.is_documented()
         })
 }
 
@@ -1277,30 +1294,44 @@ impl Render for GraphCanvas {
                 },
             )
             .when(offscreen, |el| {
+                // Centred in the canvas. Safe to sit dead centre: this only
+                // appears once the whole graph has left the viewport, so
+                // there is nothing behind it to cover. The centring wrapper
+                // carries no interactivity, so GPUI gives it no hitbox
+                // (`should_insert_hitbox`) and pan/zoom still reach the
+                // canvas everywhere except the button itself.
                 el.child(
                     div()
-                        .id("back-to-graph")
                         .absolute()
-                        .top(px(16.0))
-                        .right(px(16.0))
-                        .rounded_lg()
-                        .border_1()
-                        .border_color(th.card_border)
-                        .bg(th.chrome_bg)
-                        .shadow_lg()
-                        .px_3()
-                        .py_2()
-                        .text_xs()
-                        .text_color(th.text)
-                        .cursor_pointer()
-                        .hover(|el| el.bg(th.hover_bg))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            let vw = f32::from(window.viewport_size().width) - this.pane_offset_x;
-                            let vh = f32::from(window.viewport_size().height);
-                            this.fit(vw, vh);
-                            cx.notify();
-                        }))
-                        .child("Back to graph"),
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .id("back-to-graph")
+                                .rounded_lg()
+                                .border_1()
+                                .border_color(th.card_border)
+                                .bg(th.chrome_bg)
+                                .shadow_lg()
+                                .px_3()
+                                .py_2()
+                                .text_xs()
+                                .text_color(th.text)
+                                .cursor_pointer()
+                                .hover(|el| el.bg(th.hover_bg))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    let vw = f32::from(window.viewport_size().width)
+                                        - this.pane_offset_x;
+                                    let vh = f32::from(window.viewport_size().height);
+                                    this.fit(vw, vh);
+                                    cx.notify();
+                                }))
+                                .child("Back to graph"),
+                        ),
                 )
             })
             .when_some(self.context_menu, |el, menu| {
@@ -1551,13 +1582,12 @@ fn paint_scene(
             // hub-star edges dim (the web app's hub fading).
             let mut dimmed =
                 edge_is_dimmed(ei as u32, e.from, e.to, e.hub_faded, focused_edge, focus);
-            // In investigate mode an edge is only interesting if it touches
-            // something undocumented; the rest recede with their cards.
-            if investigate && !dimmed {
-                let touches_gap = [e.from, e.to].iter().any(|&c| {
-                    model.cards.get(c as usize).is_some_and(|c| !card_is_documented(c))
-                });
-                dimmed = !touches_gap;
+            // Investigate highlights types and rows, never edges. An edge
+            // into an undocumented type says nothing about the edge itself,
+            // and lighting it up drags the eye away from the card that
+            // actually needs the prose. The web dims every edge here too.
+            if investigate {
+                dimmed = true;
             }
             if dimmed != dim_pass {
                 continue;
@@ -2029,16 +2059,19 @@ fn paint_scene(
                     BorderStyle::Solid,
                 ));
             }
-            if k >= LOD_ROWS {
-                for (ri, row) in card.rows.iter().enumerate() {
-                    if matches!(row.kind, RowKind::Field | RowKind::EnumValue)
-                        && row.description.is_none()
-                    {
-                        window.paint_quad(fill(
-                            rect(4.0, card.row_y(ri), card.w - 8.0, pitch),
-                            th.investigate.opacity(0.22),
-                        ));
-                    }
+            // No LOD gate on the stripes. The mode is most useful zoomed
+            // out, where a card's own outline says nothing about which of
+            // its fields are bare, and the row text this zoom drops is not
+            // what the stripe is made of. The web draws them at every scale.
+            let (r_lo, r_hi) = visible_rows(card, pos.y, wy0, wy1);
+            for (ri, row) in card.rows.iter().enumerate().take(r_hi).skip(r_lo) {
+                if matches!(row.kind, RowKind::Field | RowKind::EnumValue)
+                    && !row.is_documented()
+                {
+                    window.paint_quad(fill(
+                        rect(4.0, card.row_y(ri), card.w - 8.0, pitch),
+                        th.investigate.opacity(0.22),
+                    ));
                 }
             }
         }

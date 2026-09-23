@@ -4,6 +4,7 @@
 use crate::icons::{icon, Icon};
 use crate::theme::{Theme, ThemeMode};
 use gpui::{div, img, prelude::*, px, MouseButton, SharedString, Stateful, Window};
+use std::path::Path;
 
 /// Left inset that keeps the header's contents clear of the window controls.
 /// The titlebar is transparent and the traffic lights are drawn by the system
@@ -15,6 +16,31 @@ const CONTROLS_INSET: f32 = 16.0;
 
 /// Short commit the build was made from, stamped bottom-center like the web.
 pub const COMMIT: Option<&str> = option_env!("GRAVIZ_COMMIT");
+
+/// Splits a schema path into what the titlebar shows: the file name, and the
+/// directory holding it with `$HOME` collapsed to `~`.
+///
+/// `home` is passed in rather than read here so the split is testable without
+/// a real environment. A pasted schema has no directory, and neither does a
+/// bare relative name.
+pub fn file_label(path: &Path, home: Option<&str>) -> (SharedString, Option<SharedString>) {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+    let dir = path
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .filter(|d| !d.is_empty())
+        .map(|d| match home {
+            Some(h) if !h.is_empty() && d == h => "~".to_string(),
+            Some(h) if !h.is_empty() && d.starts_with(&format!("{h}/")) => {
+                format!("~{}", &d[h.len()..])
+            }
+            _ => d,
+        });
+    (name.into(), dir.map(SharedString::from))
+}
 
 /// Which route the shell highlights in its nav.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -49,6 +75,8 @@ pub fn header<T: 'static>(
     th: Theme,
     route: Route,
     has_schema: bool,
+    // Open schema as `(file name, directory)`, from `file_label`.
+    file: Option<(SharedString, Option<SharedString>)>,
     theme_mode: ThemeMode,
     update_badge: Option<gpui::AnyElement>,
     on_nav: impl Fn(&mut T, Route, &mut Window, &mut gpui::Context<T>) + 'static + Clone,
@@ -91,6 +119,7 @@ pub fn header<T: 'static>(
         .child(
             div()
                 .flex()
+                .flex_none()
                 .items_center()
                 .gap_6()
                 .child(
@@ -133,8 +162,48 @@ pub fn header<T: 'static>(
                 ),
         )
         .child(
+            // Centred document label, the way a native titlebar names the file
+            // that is open. It sits in the one column that can shrink, so a
+            // long path gives way to the nav and the toggle instead of pushing
+            // them off the strip.
             div()
                 .flex()
+                .flex_1()
+                .min_w(px(0.0))
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .px_4()
+                .when_some(file, |el, (name, dir)| {
+                    el.child(
+                        div()
+                            .flex_none()
+                            .max_w(px(280.0))
+                            .truncate()
+                            .text_sm()
+                            .text_color(th.text)
+                            .child(name),
+                    )
+                    .when_some(dir, |el, dir| {
+                        el.child(
+                            div()
+                                .min_w(px(0.0))
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                // A path is identified by its tail, so the head
+                                // is what gives way.
+                                .text_ellipsis_start()
+                                .text_xs()
+                                .text_color(th.text_muted)
+                                .child(dir),
+                        )
+                    })
+                }),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_none()
                 .items_center()
                 .gap_3()
                 .when_some(update_badge, |el, b| el.child(b))
@@ -179,4 +248,31 @@ pub fn commit_badge(th: Theme) -> Option<impl IntoElement> {
                     .child(SharedString::from(c)),
             )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_label_splits_the_name_from_its_directory() {
+        let (name, dir) = file_label(Path::new("/Users/b/git/crepe/schema.graphql"), Some("/Users/b"));
+        assert_eq!(&*name, "schema.graphql");
+        assert_eq!(dir.as_deref(), Some("~/git/crepe"));
+    }
+
+    #[test]
+    fn file_label_leaves_a_pasted_schema_without_a_directory() {
+        let (name, dir) = file_label(Path::new("(pasted)"), Some("/Users/b"));
+        assert_eq!(&*name, "(pasted)");
+        assert_eq!(dir, None, "a pasted schema is not a file on disk");
+    }
+
+    #[test]
+    fn file_label_collapses_home_but_not_a_lookalike_sibling() {
+        let (_, dir) = file_label(Path::new("/Users/b/a.graphql"), Some("/Users/b"));
+        assert_eq!(dir.as_deref(), Some("~"), "home itself");
+        let (_, dir) = file_label(Path::new("/Users/bison/a.graphql"), Some("/Users/b"));
+        assert_eq!(dir.as_deref(), Some("/Users/bison"), "shares a prefix, not a parent");
+    }
 }

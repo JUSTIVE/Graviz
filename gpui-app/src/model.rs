@@ -105,6 +105,25 @@ pub struct Row {
     pub required_args: usize,
 }
 
+/// Blank prose is no prose — the web reads every description through
+/// `?.trim()`, so `@deprecated(reason: "")` must not pass for documentation.
+fn has_prose(s: Option<&str>) -> bool {
+    s.is_some_and(|s| !s.trim().is_empty())
+}
+
+impl Row {
+    /// Does this row count as documented, for Investigate mode and the
+    /// coverage figure?
+    ///
+    /// A deprecated row with a reason counts. The reason already says what the
+    /// field was for and what replaces it, so flagging it as undocumented only
+    /// asks the author to write the same prose twice.
+    pub fn is_documented(&self) -> bool {
+        has_prose(self.description.as_deref())
+            || (self.deprecated && has_prose(self.deprecation_reason.as_deref()))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Card {
     /// Index into `ParsedGraph::nodes` / `Model::cards`.
@@ -853,7 +872,7 @@ pub fn build_model(graph: ParsedGraph, schema_name: String, options: &ModelOptio
         for r in &c.rows {
             if matches!(r.kind, RowKind::Field | RowKind::EnumValue) {
                 desc_total += 1;
-                desc_documented += r.description.is_some() as usize;
+                desc_documented += r.is_documented() as usize;
             }
         }
     }
@@ -1095,6 +1114,26 @@ mod tests {
         // hit-testing is the exact inverse of the painter
         assert_eq!(c.hit_row(20.0, c.row_y(1) + 1.0), Some(RowHit::Row(1)));
         assert_eq!(c.hit_row(20.0, 10.0), None, "header is not a row");
+    }
+
+    #[test]
+    fn a_deprecation_reason_counts_as_documentation() {
+        let m = model_of(
+            r#"type Query {
+                 "doc" a: String
+                 b: String @deprecated(reason: "use a")
+                 c: String @deprecated
+                 d: String
+               }"#,
+            ModelOptions { today: "2020-01-01".into(), ..Default::default() },
+        );
+        let c = &m.cards[m.index_of["Query"] as usize];
+        assert!(c.rows[0].is_documented(), "a description documents a row");
+        assert!(c.rows[1].is_documented(), "so does a deprecation reason");
+        assert!(!c.rows[2].is_documented(), "@deprecated with no reason does not");
+        assert!(!c.rows[3].is_documented(), "a bare field is undocumented");
+        // The type itself has no description, so 2 of 5 items are covered.
+        assert_eq!(m.desc_coverage, (2, 5));
     }
 
     #[test]
