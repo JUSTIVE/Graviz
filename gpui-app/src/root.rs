@@ -183,10 +183,16 @@ impl Render for Root {
                 .child(gpui::SharedString::from(format!("v{} available", info.version)))
                 .into_any_element()
         });
+        let home = std::env::var("HOME").ok();
+        let file = self
+            .workspace
+            .as_ref()
+            .map(|w| crate::shell::file_label(w.read(cx).schema_path(), home.as_deref()));
         let header = crate::shell::header(
             th,
             route,
             has_schema,
+            file,
             crate::theme::mode(cx),
             update_badge,
             |this: &mut Self, route, _window, cx| {

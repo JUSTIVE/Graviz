@@ -394,6 +394,11 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Path of the schema this workspace has open, for the titlebar.
+    pub fn schema_path(&self) -> &std::path::Path {
+        &self.schema_path
+    }
+
     fn reload_from_disk(&mut self, cx: &mut Context<Self>) {
         match loader::load(
             &self.schema_path,
