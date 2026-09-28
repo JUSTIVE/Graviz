@@ -71,6 +71,7 @@ define_icons! {
     CircleAlert => "circle-alert",
     LoaderCircle => "loader-circle",
     Settings => "settings",
+    Info => "info",
 }
 
 /// Asset path of the app wordmark's logo — the compass the web app uses as

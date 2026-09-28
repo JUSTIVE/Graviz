@@ -193,12 +193,11 @@ impl Render for Root {
             .workspace
             .as_ref()
             .map(|w| crate::shell::file_label(w.read(cx).schema_path(), home.as_deref()));
-        let header = crate::shell::header(
+        let header = crate::shell::header(th, file, update_badge);
+        let rail = crate::shell::rail(
             th,
             route,
             has_schema,
-            file,
-            update_badge,
             |this: &mut Self, route, _window, cx| {
                 this.show_about = route == crate::shell::Route::About;
                 this.show_settings = route == crate::shell::Route::Settings;
@@ -310,7 +309,16 @@ impl Render for Root {
                 }
             }))
             .child(header)
-            .child(body)
+            // The rail is the outermost pane: the schema sidebar and the
+            // canvas both start to its right.
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .child(rail)
+                    .child(div().flex_1().min_w_0().flex().flex_col().child(body)),
+            )
             .when_some(crate::shell::commit_badge(th), |el, b| el.child(b))
     }
 }
