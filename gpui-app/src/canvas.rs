@@ -472,31 +472,14 @@ impl GraphCanvas {
 
     fn on_scroll(&mut self, ev: &ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
         let _ = window;
-        // Two ways round, chosen in Settings. Zoom mode is the web app's:
-        // scroll zooms at the cursor and shift pans. Pan mode is the one most
-        // canvases on this platform use: the swipe moves the sheet under you,
-        // each axis its own, and the platform modifier zooms. Dragging pans in
-        // either mode.
-        let zooming = match crate::config::scroll_mode(cx) {
-            crate::config::ScrollMode::Zoom => !ev.modifiers.shift,
-            crate::config::ScrollMode::Pan => ev.modifiers.platform || ev.modifiers.control,
-        };
-        if !zooming {
-            let (dx, dy) = match ev.delta {
-                ScrollDelta::Pixels(d) => (f32::from(d.x), f32::from(d.y)),
-                // A wheel has one axis, and shift is how the platform asks for
-                // the other one.
-                ScrollDelta::Lines(d) if ev.modifiers.shift => (d.y * 20.0, 0.0),
-                ScrollDelta::Lines(d) => (d.x * 20.0, d.y * 20.0),
-            };
-            self.view.x += dx;
-            self.view.y += dy;
-            cx.notify();
-            return;
-        }
-        let dy = match ev.delta {
-            ScrollDelta::Pixels(d) => f32::from(d.y),
-            ScrollDelta::Lines(d) => d.y * 20.0,
+        let dy = match scroll_action(crate::config::scroll_mode(cx), ev.delta, ev.modifiers) {
+            ScrollAction::Pan(dx, dy) => {
+                self.view.x += dx;
+                self.view.y += dy;
+                cx.notify();
+                return;
+            }
+            ScrollAction::Zoom(dy) => dy,
         };
         // smooth exponential zoom: ±100px of scroll ≈ ×/÷ 1.4
         let ratio = 2f32.powf(dy / 200.0);
@@ -680,6 +663,47 @@ fn edge_is_dimmed(
         (Some(pinned), _) => pinned != index,
         (None, Some(f)) => from != f && to != f,
         (None, None) => hub_faded,
+    }
+}
+
+/// What a scroll gesture asks for, once the mode and the modifiers are read.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ScrollAction {
+    /// Zoom at the cursor by this much vertical scroll.
+    Zoom(f32),
+    /// Move the view by this much, in screen pixels.
+    Pan(f32, f32),
+}
+
+/// Two ways round, chosen in Settings.
+///
+/// Zoom mode is the web app's: scroll zooms at the cursor and shift pans. Pan
+/// mode is the one most canvases on this platform use: the swipe moves the
+/// sheet under you, each axis its own, and the platform modifier zooms.
+/// Dragging pans in either mode.
+///
+/// A wheel has one axis, and shift is how the platform asks for the other,
+/// but macOS has already done that swap by the time the event arrives: a
+/// shifted wheel turn shows up as an x delta with y at zero. So the axis an
+/// amount arrives on is the axis it belongs to, and swapping again here read
+/// the zero and moved nothing.
+fn scroll_action(
+    mode: crate::config::ScrollMode,
+    delta: ScrollDelta,
+    mods: gpui::Modifiers,
+) -> ScrollAction {
+    let zooming = match mode {
+        crate::config::ScrollMode::Zoom => !mods.shift,
+        crate::config::ScrollMode::Pan => mods.platform || mods.control,
+    };
+    let (dx, dy) = match delta {
+        ScrollDelta::Pixels(d) => (f32::from(d.x), f32::from(d.y)),
+        ScrollDelta::Lines(d) => (d.x * 20.0, d.y * 20.0),
+    };
+    if zooming {
+        ScrollAction::Zoom(dy)
+    } else {
+        ScrollAction::Pan(dx, dy)
     }
 }
 
@@ -2269,6 +2293,59 @@ mod tests {
     use super::*;
     use graviz_core::layout::{CubicSeg, Point};
 
+
+    fn wheel(x: f32, y: f32) -> ScrollDelta {
+        ScrollDelta::Lines(gpui::Point { x, y })
+    }
+
+    fn trackpad(x: f32, y: f32) -> ScrollDelta {
+        ScrollDelta::Pixels(gpui::Point { x: gpui::px(x), y: gpui::px(y) })
+    }
+
+    fn shift() -> gpui::Modifiers {
+        gpui::Modifiers { shift: true, ..Default::default() }
+    }
+
+    #[test]
+    fn a_shifted_wheel_turn_pans_sideways() {
+        // macOS hands a shifted wheel turn over as an x delta with y at zero.
+        // Reading shift as "swap the axes" here swapped it back onto the zero
+        // and the view never moved, in either mode.
+        use crate::config::ScrollMode;
+        let m = gpui::Modifiers::default();
+        assert_eq!(
+            scroll_action(ScrollMode::Zoom, wheel(-7.0, 0.0), shift()),
+            ScrollAction::Pan(-140.0, 0.0)
+        );
+        assert_eq!(
+            scroll_action(ScrollMode::Pan, wheel(-7.0, 0.0), shift()),
+            ScrollAction::Pan(-140.0, 0.0)
+        );
+        // And a plain turn still runs down the other axis.
+        assert_eq!(
+            scroll_action(ScrollMode::Pan, wheel(0.0, -3.0), m),
+            ScrollAction::Pan(0.0, -60.0)
+        );
+    }
+
+    #[test]
+    fn each_mode_zooms_on_its_own_gesture() {
+        use crate::config::ScrollMode;
+        let m = gpui::Modifiers::default();
+        let cmd = gpui::Modifiers { platform: true, ..Default::default() };
+        // Zoom mode: the plain gesture zooms, shift pans.
+        assert_eq!(scroll_action(ScrollMode::Zoom, trackpad(3.0, -9.0), m), ScrollAction::Zoom(-9.0));
+        assert_eq!(
+            scroll_action(ScrollMode::Zoom, trackpad(3.0, -9.0), shift()),
+            ScrollAction::Pan(3.0, -9.0)
+        );
+        // Pan mode: the other way round, and a trackpad swipe keeps both axes.
+        assert_eq!(
+            scroll_action(ScrollMode::Pan, trackpad(3.0, -9.0), m),
+            ScrollAction::Pan(3.0, -9.0)
+        );
+        assert_eq!(scroll_action(ScrollMode::Pan, trackpad(3.0, -9.0), cmd), ScrollAction::Zoom(-9.0));
+    }
 
     #[test]
     fn pinning_an_edge_dims_everything_but_that_edge() {
