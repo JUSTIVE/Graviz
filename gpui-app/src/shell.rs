@@ -1,4 +1,4 @@
-//! App shell: the title strip across the top (wordmark, open file, update
+//! App shell: the title strip across the top (the open file and any update
 //! badge), the activity rail down the left, and the bottom-center commit
 //! stamp.
 //!
@@ -8,16 +8,21 @@
 
 use crate::icons::{icon, Icon};
 use crate::theme::Theme;
-use gpui::{div, img, prelude::*, px, MouseButton, SharedString, Window};
+use gpui::{div, prelude::*, px, MouseButton, SharedString, Window};
 use std::path::Path;
 
-/// Left inset that keeps the header's contents clear of the window controls.
+/// Left inset that keeps the strip's contents clear of the window controls.
 /// The titlebar is transparent and the traffic lights are drawn by the system
-/// at (10, 10), so without this the wordmark sits on top of them.
+/// just inside it, so without this the title sits on top of them.
 #[cfg(target_os = "macos")]
 const CONTROLS_INSET: f32 = 78.0;
 #[cfg(not(target_os = "macos"))]
 const CONTROLS_INSET: f32 = 16.0;
+
+/// Height of the title strip: the standard macOS titlebar, not the tall
+/// header the web app needed to hold a nav. The traffic lights in `main.rs`
+/// are centred against this, so the two move together.
+pub const TITLEBAR_H: f32 = 28.0;
 
 /// Short commit the build was made from, stamped bottom-center like the web.
 pub const COMMIT: Option<&str> = option_env!("GRAVIZ_COMMIT");
@@ -185,9 +190,9 @@ pub fn rail<T: 'static>(
         ))
 }
 
-/// The window's title strip. It carries the wordmark, the open file and any
-/// update badge, and nothing clickable beyond that: the routes moved to the
-/// rail and the theme moved into Settings.
+/// The window's title strip: the open file, and any update badge. No
+/// wordmark and no logo, the way a document window on this platform names
+/// what it holds and leaves the app's own name to the menu bar.
 pub fn header(
     th: Theme,
     // Open schema as `(file name, directory)`, from `file_label`.
@@ -196,18 +201,19 @@ pub fn header(
 ) -> impl IntoElement {
     div()
         .id("titlebar")
+        .relative()
         .flex_none()
-        .h(px(56.0))
+        .h(px(TITLEBAR_H))
         .w_full()
         .flex()
         .items_center()
-        .justify_between()
+        .justify_end()
         .pl(px(CONTROLS_INSET))
-        .pr_4()
+        .pr_2()
         .bg(th.bg)
         .border_b_1()
         .border_color(th.panel_border)
-        // The header doubles as the titlebar (there is no system one): drag
+        // The strip doubles as the titlebar (there is no system one): drag
         // moves the window, and a double-click does whatever the system's
         // "double-click a window's title bar to" setting says — usually zoom,
         // which is the maximize toggle.
@@ -220,36 +226,22 @@ pub fn header(
                 window.zoom_window();
             }
         })
-        .child(
-            div()
-                .flex()
-                .flex_none()
-                .items_center()
-                .gap_2()
-                .text_color(th.text)
-                .child(img(crate::icons::LOGO).size(px(20.0)).flex_none())
-                .child(
-                    div()
-                        .text_base()
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .child("Graviz"),
-                ),
-        )
-        .child(
-            // Centred document label, the way a native titlebar names the file
-            // that is open. It sits in the one column that can shrink, so a
-            // long path gives way to the wordmark and the badge instead of
-            // pushing them off the strip.
-            div()
-                .flex()
-                .flex_1()
-                .min_w(px(0.0))
-                .items_center()
-                .justify_center()
-                .gap_2()
-                .px_4()
-                .when_some(file, |el, (name, dir)| {
-                    el.child(
+        .when_some(file, |el, (name, dir)| {
+            el.child(
+                // Absolute, so the title is centred on the window rather than
+                // on whatever is left over beside the traffic lights. The
+                // insets match on both sides to keep that true.
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(px(CONTROLS_INSET))
+                    .right(px(CONTROLS_INSET))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .child(
                         div()
                             .flex_none()
                             .max_w(px(280.0))
@@ -264,24 +256,19 @@ pub fn header(
                                 .min_w(px(0.0))
                                 .overflow_hidden()
                                 .whitespace_nowrap()
-                                // A path is identified by its tail, so the head
-                                // is what gives way.
+                                // A path is identified by its tail, so the
+                                // head is what gives way.
                                 .text_ellipsis_start()
                                 .text_xs()
                                 .text_color(th.text_muted)
                                 .child(dir),
                         )
-                    })
-                }),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_none()
-                .items_center()
-                .gap_3()
-                .when_some(update_badge, |el, b| el.child(b)),
-        )
+                    }),
+            )
+        })
+        // Drawn after the title, so on a narrow window the badge wins the
+        // overlap rather than disappearing under it.
+        .when_some(update_badge, |el, b| el.child(b))
 }
 
 /// Bottom-center commit stamp (10px mono, muted at 40%).

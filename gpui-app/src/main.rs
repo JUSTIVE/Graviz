@@ -87,7 +87,11 @@ fn main() {
                 titlebar: Some(gpui::TitlebarOptions {
                     title: Some("Graviz".into()),
                     appears_transparent: true,
-                    traffic_light_position: Some(gpui::point(px(10.0), px(10.0))),
+                    // Centred in the title strip: (strip - 12pt button) / 2.
+                    traffic_light_position: Some(gpui::point(
+                        px(10.0),
+                        px((shell::TITLEBAR_H - 12.0) / 2.0),
+                    )),
                 }),
                 ..Default::default()
             },
