@@ -695,19 +695,21 @@ const EDGE_MAX_SPEED: f32 = 1100.0;
 /// How fast the view should slide for a cursor at `(x, y)` in a canvas of
 /// `(w, h)`, both in canvas-local pixels.
 ///
-/// Zero away from the sides, ramping to full speed at the very edge. The sign
-/// follows the drag: the cursor pinned against the left edge means "show me
-/// what is further left", and that slides the sheet rightwards, exactly as
-/// dragging rightwards would.
+/// Zero away from the sides, ramping to full speed at the very edge. The
+/// slide carries on in the direction the hand was already going: a drag is a
+/// hand on the sheet, and a cursor pinned against the left edge is a hand
+/// still pushing left, so the sheet keeps going left and the ground to the
+/// right keeps arriving. Which is the opposite sign to a drag-selection,
+/// where the pointer chases content rather than carrying it.
 fn edge_velocity(x: f32, y: f32, w: f32, h: f32) -> (f32, f32) {
     let axis = |p: f32, len: f32| -> f32 {
         if len <= EDGE_BAND * 2.0 {
             return 0.0;
         }
         if p < EDGE_BAND {
-            ((EDGE_BAND - p) / EDGE_BAND).clamp(0.0, 1.0) * EDGE_MAX_SPEED
+            -((EDGE_BAND - p) / EDGE_BAND).clamp(0.0, 1.0) * EDGE_MAX_SPEED
         } else if p > len - EDGE_BAND {
-            -((p - (len - EDGE_BAND)) / EDGE_BAND).clamp(0.0, 1.0) * EDGE_MAX_SPEED
+            ((p - (len - EDGE_BAND)) / EDGE_BAND).clamp(0.0, 1.0) * EDGE_MAX_SPEED
         } else {
             0.0
         }
@@ -2424,17 +2426,17 @@ mod tests {
     fn the_view_only_slides_near_a_side() {
         let (w, h) = (1200.0, 800.0);
         assert_eq!(edge_velocity(600.0, 400.0, w, h), (0.0, 0.0), "middle");
-        // Hard against a side is full speed, and the sign shows what the
-        // drag was reaching for: at the left edge, the ground further left.
-        assert_eq!(edge_velocity(0.0, 400.0, w, h).0, EDGE_MAX_SPEED);
-        assert_eq!(edge_velocity(w, 400.0, w, h).0, -EDGE_MAX_SPEED);
-        assert_eq!(edge_velocity(600.0, 0.0, w, h).1, EDGE_MAX_SPEED);
-        assert_eq!(edge_velocity(600.0, h, w, h).1, -EDGE_MAX_SPEED);
+        // Hard against a side is full speed, in the direction the hand was
+        // already pushing: at the left edge the sheet keeps going left.
+        assert_eq!(edge_velocity(0.0, 400.0, w, h).0, -EDGE_MAX_SPEED);
+        assert_eq!(edge_velocity(w, 400.0, w, h).0, EDGE_MAX_SPEED);
+        assert_eq!(edge_velocity(600.0, 0.0, w, h).1, -EDGE_MAX_SPEED);
+        assert_eq!(edge_velocity(600.0, h, w, h).1, EDGE_MAX_SPEED);
         // Halfway into the band, half the speed: the slide comes on gradually
         // rather than snapping to full tilt at the boundary.
-        assert_eq!(edge_velocity(EDGE_BAND / 2.0, 400.0, w, h).0, EDGE_MAX_SPEED / 2.0);
+        assert_eq!(edge_velocity(EDGE_BAND / 2.0, 400.0, w, h).0, -EDGE_MAX_SPEED / 2.0);
         // A corner travels both ways at once.
-        assert_eq!(edge_velocity(0.0, 0.0, w, h), (EDGE_MAX_SPEED, EDGE_MAX_SPEED));
+        assert_eq!(edge_velocity(0.0, 0.0, w, h), (-EDGE_MAX_SPEED, -EDGE_MAX_SPEED));
         // A canvas with no room for two bands would be all edge, and every
         // cursor position in it would slide. It holds still instead.
         assert_eq!(edge_velocity(10.0, 10.0, 60.0, 60.0), (0.0, 0.0));
