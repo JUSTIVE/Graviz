@@ -472,15 +472,27 @@ impl GraphCanvas {
 
     fn on_scroll(&mut self, ev: &ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
         let _ = window;
-        // Like the web app: scroll/wheel zooms (anchored at the cursor);
-        // hold shift to pan. Dragging pans as well.
-        if ev.modifiers.shift {
-            if let ScrollDelta::Pixels(d) = ev.delta {
-                self.view.x += f32::from(d.x);
-                self.view.y += f32::from(d.y);
-                cx.notify();
-                return;
-            }
+        // Two ways round, chosen in Settings. Zoom mode is the web app's:
+        // scroll zooms at the cursor and shift pans. Pan mode is the one most
+        // canvases on this platform use: the swipe moves the sheet under you,
+        // each axis its own, and the platform modifier zooms. Dragging pans in
+        // either mode.
+        let zooming = match crate::config::scroll_mode(cx) {
+            crate::config::ScrollMode::Zoom => !ev.modifiers.shift,
+            crate::config::ScrollMode::Pan => ev.modifiers.platform || ev.modifiers.control,
+        };
+        if !zooming {
+            let (dx, dy) = match ev.delta {
+                ScrollDelta::Pixels(d) => (f32::from(d.x), f32::from(d.y)),
+                // A wheel has one axis, and shift is how the platform asks for
+                // the other one.
+                ScrollDelta::Lines(d) if ev.modifiers.shift => (d.y * 20.0, 0.0),
+                ScrollDelta::Lines(d) => (d.x * 20.0, d.y * 20.0),
+            };
+            self.view.x += dx;
+            self.view.y += dy;
+            cx.notify();
+            return;
         }
         let dy = match ev.delta {
             ScrollDelta::Pixels(d) => f32::from(d.y),

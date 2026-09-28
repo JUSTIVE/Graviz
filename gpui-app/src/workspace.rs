@@ -368,7 +368,11 @@ impl Workspace {
             sidebar_open: self.sidebar_open,
             sidebar_width: self.sidebar_width,
             dock_height: self.dock_height,
+            // Both of these live in the settings page, not on this toolbar.
+            // They are read back from their globals because this rewrites the
+            // whole file: anything not named here would be reset.
             theme_mode: crate::theme::mode(cx),
+            scroll_mode: config::scroll_mode(cx),
         });
     }
 

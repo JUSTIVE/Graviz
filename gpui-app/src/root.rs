@@ -41,8 +41,9 @@ impl Root {
     ) -> Self {
         let workspace = initial
             .map(|(loaded, path, overlay)| cx.new(|cx| Workspace::new(loaded, path, overlay, cx)));
-        let mode = config::load_settings().theme_mode;
-        crate::theme::set_mode(cx, mode);
+        let saved = config::load_settings();
+        crate::theme::set_mode(cx, saved.theme_mode);
+        config::set_scroll_mode(cx, saved.scroll_mode);
         let editor = cx.new(|cx| {
             let mut e = TextArea::new(cx);
             e.placeholder = "# Paste your GraphQL SDL here…";
@@ -209,14 +210,24 @@ impl Render for Root {
 
         let body: gpui::AnyElement = if self.show_settings {
             crate::settings::view(
-                th,
-                crate::theme::mode(cx),
-                config::settings_path()
-                    .map(|p| gpui::SharedString::from(p.to_string_lossy().into_owned())),
+                crate::settings::SettingsProps {
+                    th,
+                    theme_mode: crate::theme::mode(cx),
+                    scroll_mode: config::scroll_mode(cx),
+                    settings_file: config::settings_path()
+                        .map(|p| gpui::SharedString::from(p.to_string_lossy().into_owned())),
+                },
                 |_this: &mut Self, mode, _w, cx| {
                     crate::theme::set_mode(cx, mode);
                     let mut s = config::load_settings();
                     s.theme_mode = mode;
+                    config::save_settings(&s);
+                    cx.notify();
+                },
+                |_this: &mut Self, mode, _w, cx| {
+                    config::set_scroll_mode(cx, mode);
+                    let mut s = config::load_settings();
+                    s.scroll_mode = mode;
                     config::save_settings(&s);
                     cx.notify();
                 },

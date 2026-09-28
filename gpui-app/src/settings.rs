@@ -7,42 +7,63 @@
 //! What is left is what should still be true the next time you open a
 //! different file.
 
+use crate::config::ScrollMode;
 use crate::icons::{icon, Icon};
 use crate::theme::{Theme, ThemeMode};
 use gpui::{div, prelude::*, px, MouseButton, SharedString, Window};
 
-/// The three theme choices, laid out side by side rather than hidden behind a
-/// button that cycles: a settings page should show what the alternatives are.
-const MODES: &[(ThemeMode, Icon, &str, &str)] = &[
-    (ThemeMode::Light, Icon::Sun, "Light", "Always light."),
-    (ThemeMode::Dark, Icon::Moon, "Dark", "Always dark."),
-    (ThemeMode::System, Icon::Monitor, "System", "Follow macOS."),
-];
-
-fn section_title(th: Theme, text: &'static str) -> impl IntoElement {
-    div()
-        .mt_8()
-        .mb_3()
-        .text_xs()
-        .font_weight(gpui::FontWeight::SEMIBOLD)
-        .text_color(th.text_faint)
-        .child(SharedString::from(text.to_uppercase()))
+/// One card in a picker. The label doubles as the element id, so the labels
+/// across a page have to stay distinct.
+struct Choice<V: 'static> {
+    value: V,
+    icon: Icon,
+    label: &'static str,
+    blurb: &'static str,
 }
 
-pub fn view<T: 'static>(
+const THEMES: &[Choice<ThemeMode>] = &[
+    Choice { value: ThemeMode::Light, icon: Icon::Sun, label: "Light", blurb: "Always light." },
+    Choice { value: ThemeMode::Dark, icon: Icon::Moon, label: "Dark", blurb: "Always dark." },
+    Choice {
+        value: ThemeMode::System,
+        icon: Icon::Monitor,
+        label: "System",
+        blurb: "Follow macOS.",
+    },
+];
+
+const SCROLLING: &[Choice<ScrollMode>] = &[
+    Choice {
+        value: ScrollMode::Zoom,
+        icon: Icon::ZoomIn,
+        label: "Zoom",
+        blurb: "Scroll zooms at the cursor. ⇧ pans.",
+    },
+    Choice {
+        value: ScrollMode::Pan,
+        icon: Icon::Move,
+        label: "Pan",
+        blurb: "Scroll pans, sideways too. ⌘ zooms.",
+    },
+];
+
+/// The options side by side rather than behind a button that cycles: a
+/// settings page should show what the alternatives are.
+fn picker<T: 'static, V: Copy + PartialEq + 'static>(
     th: Theme,
-    mode: ThemeMode,
-    settings_file: Option<SharedString>,
-    on_theme: impl Fn(&mut T, ThemeMode, &mut Window, &mut gpui::Context<T>) + 'static + Clone,
+    current: V,
+    options: &'static [Choice<V>],
+    on_pick: impl Fn(&mut T, V, &mut Window, &mut gpui::Context<T>) + 'static + Clone,
     cx: &mut gpui::Context<T>,
 ) -> impl IntoElement {
-    let mut choices = div().flex().gap_3();
-    for &(m, ic, label, blurb) in MODES {
-        let active = m == mode;
-        let pick = on_theme.clone();
-        choices = choices.child(
+    let mut row = div().flex().gap_3();
+    for choice in options {
+        let active = choice.value == current;
+        let pick = on_pick.clone();
+        let value = choice.value;
+        row = row.child(
             div()
-                .id(label)
+                .id(choice.label)
                 .flex_1()
                 .flex()
                 .flex_col()
@@ -60,24 +81,64 @@ pub fn view<T: 'static>(
                         .text_color(th.text_muted)
                         .hover(|el| el.bg(th.hover_bg).text_color(th.text))
                 })
-                .on_click(cx.listener(move |this, _, window, cx| pick(this, m, window, cx)))
+                .on_click(cx.listener(move |this, _, window, cx| pick(this, value, window, cx)))
                 .child(
                     div()
                         .flex()
                         .items_center()
                         .gap_2()
-                        .child(icon(ic, px(16.0), if active { th.text } else { th.text_muted }))
+                        .child(icon(
+                            choice.icon,
+                            px(16.0),
+                            if active { th.text } else { th.text_muted },
+                        ))
                         .child(
                             div()
                                 .text_sm()
                                 .font_weight(gpui::FontWeight::MEDIUM)
-                                .child(SharedString::from(label)),
+                                .child(SharedString::from(choice.label)),
                         ),
                 )
-                .child(div().text_xs().text_color(th.text_faint).child(SharedString::from(blurb))),
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(th.text_faint)
+                        .child(SharedString::from(choice.blurb)),
+                ),
         );
     }
+    row
+}
 
+fn section_title(th: Theme, text: &'static str) -> impl IntoElement {
+    div()
+        .mt_8()
+        .mb_3()
+        .text_xs()
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(th.text_faint)
+        .child(SharedString::from(text.to_uppercase()))
+}
+
+fn setting_label(th: Theme, text: &'static str) -> impl IntoElement {
+    div().mb_2().text_sm().text_color(th.text).child(SharedString::from(text))
+}
+
+pub struct SettingsProps {
+    pub th: Theme,
+    pub theme_mode: ThemeMode,
+    pub scroll_mode: ScrollMode,
+    /// Where the choices are written, named at the foot of the page.
+    pub settings_file: Option<SharedString>,
+}
+
+pub fn view<T: 'static>(
+    props: SettingsProps,
+    on_theme: impl Fn(&mut T, ThemeMode, &mut Window, &mut gpui::Context<T>) + 'static + Clone,
+    on_scroll: impl Fn(&mut T, ScrollMode, &mut Window, &mut gpui::Context<T>) + 'static + Clone,
+    cx: &mut gpui::Context<T>,
+) -> impl IntoElement {
+    let SettingsProps { th, theme_mode, scroll_mode, settings_file } = props;
     div()
         .id("settings-scroll")
         .flex_1()
@@ -104,17 +165,23 @@ pub fn view<T: 'static>(
                         .text_sm()
                         .line_height(px(22.0))
                         .text_color(th.text_muted)
-                        .child("Saved as you change them, and applied the next time you open a schema."),
+                        .child(
+                            "Saved as you change them, and applied the next time you open a schema.",
+                        ),
                 )
                 .child(section_title(th, "Appearance"))
+                .child(setting_label(th, "Theme"))
+                .child(picker(th, theme_mode, THEMES, on_theme, cx))
+                .child(section_title(th, "Canvas"))
+                .child(setting_label(th, "Scrolling"))
+                .child(picker(th, scroll_mode, SCROLLING, on_scroll, cx))
                 .child(
                     div()
-                        .mb_2()
-                        .text_sm()
-                        .text_color(th.text)
-                        .child("Theme"),
+                        .mt_2()
+                        .text_xs()
+                        .text_color(th.text_faint)
+                        .child("Dragging the canvas pans it either way."),
                 )
-                .child(choices)
                 .when_some(settings_file, |el, path| {
                     el.child(
                         div()
@@ -141,7 +208,7 @@ pub fn view<T: 'static>(
                     )
                 }),
         )
-        // The page is also the window's drag strip's neighbour; a press here
-        // must not start moving the window.
+        // The page sits under the title strip, which is the window's drag
+        // handle; a press here must not start moving the window.
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
 }
