@@ -70,6 +70,11 @@ fn write_json<T: Serialize>(file: &str, value: &T) {
     }
 }
 
+/// Where `save_settings` writes, for the Settings page to name.
+pub fn settings_path() -> Option<PathBuf> {
+    Some(dir()?.join("settings.json"))
+}
+
 pub fn load_settings() -> Settings {
     read_json("settings.json").unwrap_or_default()
 }

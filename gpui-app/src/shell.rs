@@ -2,7 +2,7 @@
 //! (wordmark, nav, theme toggle) plus the bottom-center commit stamp.
 
 use crate::icons::{icon, Icon};
-use crate::theme::{Theme, ThemeMode};
+use crate::theme::Theme;
 use gpui::{div, img, prelude::*, px, MouseButton, SharedString, Stateful, Window};
 use std::path::Path;
 
@@ -48,6 +48,7 @@ pub enum Route {
     New,
     View,
     About,
+    Settings,
 }
 
 fn nav_link(th: Theme, id: &'static str, label: &'static str, active: bool) -> Stateful<gpui::Div> {
@@ -77,19 +78,14 @@ pub fn header<T: 'static>(
     has_schema: bool,
     // Open schema as `(file name, directory)`, from `file_label`.
     file: Option<(SharedString, Option<SharedString>)>,
-    theme_mode: ThemeMode,
     update_badge: Option<gpui::AnyElement>,
     on_nav: impl Fn(&mut T, Route, &mut Window, &mut gpui::Context<T>) + 'static + Clone,
-    on_theme: impl Fn(&mut T, &mut Window, &mut gpui::Context<T>) + 'static,
     cx: &mut gpui::Context<T>,
 ) -> impl IntoElement {
-    let (theme_icon, theme_label) = match theme_mode {
-        ThemeMode::Light => (Icon::Sun, "Light"),
-        ThemeMode::Dark => (Icon::Moon, "Dark"),
-        ThemeMode::System => (Icon::Monitor, "System"),
-    };
     let on_nav_new = on_nav.clone();
     let on_nav_view = on_nav.clone();
+    let on_nav_about = on_nav.clone();
+    let settings_open = route == Route::Settings;
     div()
         .id("titlebar")
         .flex_none()
@@ -155,7 +151,7 @@ pub fn header<T: 'static>(
                         .child(
                             nav_link(th, "nav-about", "About", route == Route::About).on_click(
                                 cx.listener(move |this, _, window, cx| {
-                                    on_nav(this, Route::About, window, cx)
+                                    on_nav_about(this, Route::About, window, cx)
                                 }),
                             ),
                         ),
@@ -208,24 +204,33 @@ pub fn header<T: 'static>(
                 .gap_3()
                 .when_some(update_badge, |el, b| el.child(b))
                 .child(
+                    // The theme toggle used to sit here, cycling through three
+                    // modes one click at a time. It moved into Settings, where
+                    // the alternatives are visible; this is the way in.
                     div()
-                        .id("theme-toggle")
+                        .id("open-settings")
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .h(px(32.0))
+                        .size(px(32.0))
                         .flex()
                         .items_center()
-                        .gap_2()
+                        .justify_center()
                         .rounded_md()
                         .border_1()
-                        .border_color(th.card_border)
-                        .px(px(10.0))
-                        .text_sm()
-                        .text_color(th.text)
                         .cursor_pointer()
-                        .hover(|el| el.bg(th.hover_bg))
-                        .on_click(cx.listener(move |this, _, window, cx| on_theme(this, window, cx)))
-                        .child(icon(theme_icon, px(16.0), th.text))
-                        .child(SharedString::from(theme_label)),
+                        .when(settings_open, |el| {
+                            el.border_color(th.primary).bg(th.active_bg)
+                        })
+                        .when(!settings_open, |el| {
+                            el.border_color(th.card_border).hover(|el| el.bg(th.hover_bg))
+                        })
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            on_nav(this, Route::Settings, window, cx)
+                        }))
+                        .child(icon(
+                            Icon::Settings,
+                            px(16.0),
+                            if settings_open { th.text } else { th.text_muted },
+                        )),
                 ),
         )
 }

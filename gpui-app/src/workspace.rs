@@ -41,6 +41,7 @@ actions!(
         ToggleOverlayDock,
         OpenSchema,
         OpenOverlay,
+        OpenSettings,
         Back,
         ClearSelection
     ]
@@ -59,6 +60,9 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-u", ToggleOverlayDock, None),
         KeyBinding::new("cmd-o", OpenSchema, None),
         KeyBinding::new("cmd-shift-o", OpenOverlay, None),
+        // The macOS convention for Preferences. Nothing under the workspace
+        // claims it, so it bubbles to the root, which owns the route.
+        KeyBinding::new("cmd-,", OpenSettings, None),
         KeyBinding::new("cmd-[", Back, None),
         KeyBinding::new("escape", ClearSelection, None),
     ]);

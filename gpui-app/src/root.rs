@@ -6,7 +6,7 @@ use crate::config::{self, RecentEntry};
 use crate::editor::TextArea;
 use crate::landing;
 use crate::loader;
-use crate::workspace::{OpenSchema, Workspace};
+use crate::workspace::{OpenSchema, OpenSettings, Workspace};
 use gpui::{
     div, prelude::*, px, App, Context, Entity, ExternalPaths, FocusHandle, Focusable,
     PathPromptOptions, Window,
@@ -20,6 +20,7 @@ pub struct Root {
     /// "New" tab: show the landing even though a schema is loaded.
     show_landing: bool,
     show_about: bool,
+    show_settings: bool,
     editor: Entity<TextArea>,
     recents_open: bool,
     warnings: Vec<String>,
@@ -68,6 +69,8 @@ impl Root {
             show_landing: false,
             // Debug: GRAVIZ_ABOUT=1 opens on the About page, for selfshots.
             show_about: std::env::var("GRAVIZ_ABOUT").is_ok(),
+            // Debug: GRAVIZ_SETTINGS=1 opens on Settings, for selfshots.
+            show_settings: std::env::var("GRAVIZ_SETTINGS").is_ok(),
             editor,
             // Debug: GRAVIZ_RECENTS=1 opens the list, for selfshots.
             recents_open: std::env::var("GRAVIZ_RECENTS").is_ok(),
@@ -156,6 +159,8 @@ impl Render for Root {
         let has_schema = self.workspace.is_some();
         let route = if self.show_about {
             crate::shell::Route::About
+        } else if self.show_settings {
+            crate::shell::Route::Settings
         } else if self.show_landing || !has_schema {
             crate::shell::Route::New
         } else {
@@ -193,25 +198,33 @@ impl Render for Root {
             route,
             has_schema,
             file,
-            crate::theme::mode(cx),
             update_badge,
             |this: &mut Self, route, _window, cx| {
                 this.show_about = route == crate::shell::Route::About;
+                this.show_settings = route == crate::shell::Route::Settings;
                 this.show_landing = route == crate::shell::Route::New;
-                cx.notify();
-            },
-            |_this: &mut Self, _window, cx| {
-                let next = crate::theme::mode(cx).next();
-                crate::theme::set_mode(cx, next);
-                let mut s = config::load_settings();
-                s.theme_mode = next;
-                config::save_settings(&s);
                 cx.notify();
             },
             cx,
         );
 
-        let body: gpui::AnyElement = if self.show_about {
+        let body: gpui::AnyElement = if self.show_settings {
+            crate::settings::view(
+                th,
+                crate::theme::mode(cx),
+                config::settings_path()
+                    .map(|p| gpui::SharedString::from(p.to_string_lossy().into_owned())),
+                |_this: &mut Self, mode, _w, cx| {
+                    crate::theme::set_mode(cx, mode);
+                    let mut s = config::load_settings();
+                    s.theme_mode = mode;
+                    config::save_settings(&s);
+                    cx.notify();
+                },
+                cx,
+            )
+            .into_any_element()
+        } else if self.show_about {
             crate::about::view(
                 th,
                 |this: &mut Self, _w, cx| {
@@ -281,6 +294,15 @@ impl Render for Root {
                 if this.workspace.is_none() {
                     this.open_dialog(cx)
                 }
+            }))
+            // ⌘, toggles: pressing it again puts you back where you were,
+            // rather than stranding you on a page with no way out but the nav.
+            .on_action(cx.listener(|this, _: &OpenSettings, _, cx| {
+                this.show_settings = !this.show_settings;
+                if this.show_settings {
+                    this.show_about = false;
+                }
+                cx.notify();
             }))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
                 if let Some(path) = paths.paths().first() {

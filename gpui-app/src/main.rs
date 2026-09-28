@@ -8,6 +8,7 @@ mod loader;
 mod model;
 mod panels;
 mod root;
+mod settings;
 mod shell;
 #[cfg(target_os = "macos")]
 mod selfshot;
@@ -72,7 +73,11 @@ fn main() {
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
         cx.set_menus(vec![Menu {
             name: "Graviz".into(),
-            items: vec![MenuItem::action("Quit Graviz", Quit)],
+            items: vec![
+                MenuItem::action("Settings…", workspace::OpenSettings),
+                MenuItem::separator(),
+                MenuItem::action("Quit Graviz", Quit),
+            ],
             disabled: false,
         }]);
         let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);

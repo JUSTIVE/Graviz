@@ -70,6 +70,7 @@ define_icons! {
     TriangleAlert => "triangle-alert",
     CircleAlert => "circle-alert",
     LoaderCircle => "loader-circle",
+    Settings => "settings",
 }
 
 /// Asset path of the app wordmark's logo — the compass the web app uses as
