@@ -77,6 +77,13 @@ pub struct GraphCanvas {
     /// Window-space origin of the canvas element, recorded at paint time so
     /// event coordinates (window-relative) can be mapped into the canvas.
     canvas_origin: Rc<Cell<(f32, f32)>>,
+    /// Canvas size in window coordinates, captured while painting. The true
+    /// rect, rather than the viewport minus a pane width: the rail and the
+    /// sidebar both sit to its left.
+    canvas_size: Rc<Cell<(f32, f32)>>,
+    /// While drag-panning with the cursor held against a side: how fast the
+    /// view slides, in screen pixels per second, and when it last slid.
+    edge_pan: Option<((f32, f32), std::time::Instant)>,
     /// EMA of paint_scene duration, shown in the perf panel.
     frame_ms: Rc<Cell<f32>>,
     /// Rolling FPS samples (last 60) + the sampling clock, mirroring the
@@ -151,6 +158,8 @@ impl GraphCanvas {
             pending_center: None,
             pinned: None,
             canvas_origin: Rc::new(Cell::new((0.0, 0.0))),
+            canvas_size: Rc::new(Cell::new((0.0, 0.0))),
+            edge_pan: None,
             frame_ms: Rc::new(Cell::new(0.0)),
             fps_hist: Rc::new(std::cell::RefCell::new(Vec::new())),
             fps_now: Rc::new(Cell::new(0.0)),
@@ -523,7 +532,7 @@ impl GraphCanvas {
         cx.notify();
     }
 
-    fn on_mouse_move(&mut self, ev: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_move(&mut self, ev: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(drag) = &mut self.drag {
             let dx = f32::from(ev.position.x - drag.start.x);
             let dy = f32::from(ev.position.y - drag.start.y);
@@ -533,6 +542,17 @@ impl GraphCanvas {
             if drag.moved {
                 self.view.x = drag.orig.x + dx;
                 self.view.y = drag.orig.y + dy;
+                let (ox, oy) = self.canvas_origin.get();
+                let (w, h) = self.canvas_size.get();
+                let v = edge_velocity(
+                    f32::from(ev.position.x) - ox,
+                    f32::from(ev.position.y) - oy,
+                    w,
+                    h,
+                );
+                self.edge_pan =
+                    (v != (0.0, 0.0)).then(|| (v, std::time::Instant::now()));
+                confine_cursor(window, ev.position, (ox, oy, w, h));
                 cx.notify();
             }
         } else {
@@ -558,6 +578,7 @@ impl GraphCanvas {
     fn on_mouse_up(&mut self, ev: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         let was_click = matches!(&self.drag, Some(d) if !d.moved);
         self.drag = None;
+        self.edge_pan = None;
         if was_click {
             // Web: clicking empty canvas clears focus + pin.
             if self.hit_test(ev.position).is_none()
@@ -665,6 +686,70 @@ fn edge_is_dimmed(
         (None, None) => hub_faded,
     }
 }
+
+/// How close to a side the cursor has to be before the view starts sliding,
+/// and how fast it slides once the cursor is right up against it.
+const EDGE_BAND: f32 = 40.0;
+const EDGE_MAX_SPEED: f32 = 1100.0;
+
+/// How fast the view should slide for a cursor at `(x, y)` in a canvas of
+/// `(w, h)`, both in canvas-local pixels.
+///
+/// Zero away from the sides, ramping to full speed at the very edge. The sign
+/// follows the drag: the cursor pinned against the left edge means "show me
+/// what is further left", and that slides the sheet rightwards, exactly as
+/// dragging rightwards would.
+fn edge_velocity(x: f32, y: f32, w: f32, h: f32) -> (f32, f32) {
+    let axis = |p: f32, len: f32| -> f32 {
+        if len <= EDGE_BAND * 2.0 {
+            return 0.0;
+        }
+        if p < EDGE_BAND {
+            ((EDGE_BAND - p) / EDGE_BAND).clamp(0.0, 1.0) * EDGE_MAX_SPEED
+        } else if p > len - EDGE_BAND {
+            -((p - (len - EDGE_BAND)) / EDGE_BAND).clamp(0.0, 1.0) * EDGE_MAX_SPEED
+        } else {
+            0.0
+        }
+    };
+    (axis(x, w), axis(y, h))
+}
+
+/// Hold the cursor inside the canvas while a drag is running.
+///
+/// Without this a pan that reaches the edge carries the pointer out over the
+/// rest of the desktop, and the gesture ends wherever it happens to be let
+/// go. Pinned to the edge instead, it keeps pointing at the canvas and the
+/// auto-pan above takes over the travelling.
+#[cfg(target_os = "macos")]
+fn confine_cursor(window: &Window, local: Point<Pixels>, rect: (f32, f32, f32, f32)) {
+    use core_graphics::display::CGDisplay;
+    use core_graphics::geometry::CGPoint;
+
+    let (ox, oy, w, h) = rect;
+    if w <= 0.0 || h <= 0.0 {
+        return;
+    }
+    let (x, y) = (f32::from(local.x), f32::from(local.y));
+    // One pixel in from the boundary, so the cursor stays over the canvas and
+    // keeps generating the moves the drag is made of.
+    let (cx, cy) = (x.clamp(ox + 1.0, ox + w - 1.0), y.clamp(oy + 1.0, oy + h - 1.0));
+    if (cx - x).abs() < 0.5 && (cy - y).abs() < 0.5 {
+        return;
+    }
+    let wb = window.bounds();
+    let global = CGPoint::new(
+        (f32::from(wb.origin.x) + cx) as f64,
+        (f32::from(wb.origin.y) + cy) as f64,
+    );
+    let _ = CGDisplay::warp_mouse_cursor_position(global);
+    // A warp otherwise swallows the next quarter second of movement, which
+    // would strand the drag the moment it reached a side.
+    let _ = CGDisplay::associate_mouse_and_mouse_cursor_position(true);
+}
+
+#[cfg(not(target_os = "macos"))]
+fn confine_cursor(_: &Window, _: Point<Pixels>, _: (f32, f32, f32, f32)) {}
 
 /// What a scroll gesture asks for, once the mode and the modifiers are read.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -864,12 +949,39 @@ impl Render for GraphCanvas {
             window.request_animation_frame();
         }
 
+        // Edge auto-pan. The cursor cannot leave the canvas mid-drag, so a
+        // gesture that runs out of room parks against a side and the view
+        // keeps travelling on its own, a frame at a time.
+        // A drag that ends without a mouse-up, because the window went to the
+        // background mid-gesture, must not leave the view sliding on its own.
+        if self.drag.is_none() || !window.is_window_active() {
+            self.edge_pan = None;
+        }
+        if let Some(((vx, vy), last)) = self.edge_pan {
+            let now = std::time::Instant::now();
+            // A long frame (or a stalled one) must not launch the view across
+            // the graph in a single step.
+            let dt = (now - last).as_secs_f32().min(0.05);
+            self.view.x += vx * dt;
+            self.view.y += vy * dt;
+            // The drag anchor travels with it. Without this the next mouse
+            // move would rebuild the view from where the press started and
+            // undo everything the slide just did.
+            if let Some(d) = &mut self.drag {
+                d.orig.x += vx * dt;
+                d.orig.y += vy * dt;
+            }
+            self.edge_pan = Some(((vx, vy), now));
+            window.request_animation_frame();
+        }
+
         let model = self.model.clone();
         let view = self.view;
         let hover = self.hover;
         let focus = self.focus;
         let pinned = self.pinned;
         let canvas_origin = self.canvas_origin.clone();
+        let canvas_size = self.canvas_size.clone();
         let frame_ms = self.frame_ms.clone();
         let fps_hist = self.fps_hist.clone();
         let fps_now = self.fps_now.clone();
@@ -1013,6 +1125,8 @@ impl Render for GraphCanvas {
                     move |bounds, _, window, cx| {
                         canvas_origin
                             .set((f32::from(bounds.origin.x), f32::from(bounds.origin.y)));
+                        canvas_size
+                            .set((f32::from(bounds.size.width), f32::from(bounds.size.height)));
                         let t0 = std::time::Instant::now();
                         // Clip all canvas painting to the element bounds —
                         // paint_layer orders, only a content mask clips.
@@ -2304,6 +2418,26 @@ mod tests {
 
     fn shift() -> gpui::Modifiers {
         gpui::Modifiers { shift: true, ..Default::default() }
+    }
+
+    #[test]
+    fn the_view_only_slides_near_a_side() {
+        let (w, h) = (1200.0, 800.0);
+        assert_eq!(edge_velocity(600.0, 400.0, w, h), (0.0, 0.0), "middle");
+        // Hard against a side is full speed, and the sign shows what the
+        // drag was reaching for: at the left edge, the ground further left.
+        assert_eq!(edge_velocity(0.0, 400.0, w, h).0, EDGE_MAX_SPEED);
+        assert_eq!(edge_velocity(w, 400.0, w, h).0, -EDGE_MAX_SPEED);
+        assert_eq!(edge_velocity(600.0, 0.0, w, h).1, EDGE_MAX_SPEED);
+        assert_eq!(edge_velocity(600.0, h, w, h).1, -EDGE_MAX_SPEED);
+        // Halfway into the band, half the speed: the slide comes on gradually
+        // rather than snapping to full tilt at the boundary.
+        assert_eq!(edge_velocity(EDGE_BAND / 2.0, 400.0, w, h).0, EDGE_MAX_SPEED / 2.0);
+        // A corner travels both ways at once.
+        assert_eq!(edge_velocity(0.0, 0.0, w, h), (EDGE_MAX_SPEED, EDGE_MAX_SPEED));
+        // A canvas with no room for two bands would be all edge, and every
+        // cursor position in it would slide. It holds still instead.
+        assert_eq!(edge_velocity(10.0, 10.0, 60.0, 60.0), (0.0, 0.0));
     }
 
     #[test]
