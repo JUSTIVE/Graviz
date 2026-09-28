@@ -6,7 +6,7 @@ use crate::config::{self, RecentEntry};
 use crate::editor::TextArea;
 use crate::landing;
 use crate::loader;
-use crate::workspace::{OpenSchema, OpenSettings, Workspace};
+use crate::workspace::{ClearSelection, OpenSchema, OpenSettings, Workspace};
 use gpui::{
     div, prelude::*, px, App, Context, Entity, ExternalPaths, FocusHandle, Focusable,
     PathPromptOptions, Window,
@@ -199,10 +199,13 @@ impl Render for Root {
             th,
             route,
             has_schema,
-            |this: &mut Self, route, _window, cx| {
+            |this: &mut Self, route, window, cx| {
                 this.show_about = route == crate::shell::Route::About;
                 this.show_settings = route == crate::shell::Route::Settings;
                 this.show_landing = route == crate::shell::Route::New;
+                // The workspace leaves the tree with the focus still on it,
+                // and escape would then have nowhere to land.
+                window.focus(&this.focus, cx);
                 cx.notify();
             },
             cx,
@@ -307,12 +310,24 @@ impl Render for Root {
             }))
             // ⌘, toggles: pressing it again puts you back where you were,
             // rather than stranding you on a page with no way out but the nav.
-            .on_action(cx.listener(|this, _: &OpenSettings, _, cx| {
+            .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                 this.show_settings = !this.show_settings;
                 if this.show_settings {
                     this.show_about = false;
+                    window.focus(&this.focus, cx);
                 }
                 cx.notify();
+            }))
+            // Escape leaves Settings for whatever you were looking at: the
+            // graph, or the landing screen when nothing is open. The
+            // workspace owns this key too, but it is not in the tree while
+            // the page is up, so the two never both fire.
+            .on_action(cx.listener(|this, _: &ClearSelection, _, cx| {
+                if this.show_settings {
+                    this.show_settings = false;
+                    this.show_landing = this.workspace.is_none();
+                    cx.notify();
+                }
             }))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
                 if let Some(path) = paths.paths().first() {
