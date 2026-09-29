@@ -117,6 +117,10 @@ pub struct Workspace {
     investigate: bool,
     root_override: Option<String>,
     tree: Entity<TreePanel>,
+    /// The ⌘K palette, and whether it is up. It lives here rather than in the
+    /// root because choosing a hit has to reach the canvas.
+    palette: Entity<crate::palette::Palette>,
+    palette_open: bool,
     orphan_panel: Entity<OrphanPanel>,
     until_panel: Entity<UntilPanel>,
     canvas: Entity<GraphCanvas>,
@@ -233,6 +237,7 @@ impl Workspace {
             );
         }
         let tree = cx.new(|cx| TreePanel::new(model.clone(), cx));
+        let palette = cx.new(|cx| crate::palette::Palette::new(model.clone(), cx));
         // The Orphaned / Deprecated tab bodies work off the FULL graph, since
         // their whole point is what the reachable slice leaves out.
         let list_opts = ModelOptions { skip_layout: true, ..options.clone() };
@@ -254,6 +259,23 @@ impl Workspace {
             }
             e
         });
+        cx.subscribe(&palette, |this: &mut Self, _, event: &crate::palette::PaletteEvent, cx| {
+            match event {
+                crate::palette::PaletteEvent::Select { node_index, row } => {
+                    let (node_index, row) = (*node_index, *row);
+                    this.palette_open = false;
+                    this.canvas.update(cx, |canvas, cx| {
+                        canvas.navigate_to(node_index as u32, row, cx);
+                    });
+                    cx.notify();
+                }
+                crate::palette::PaletteEvent::Dismiss => {
+                    this.palette_open = false;
+                    cx.notify();
+                }
+            }
+        })
+        .detach();
         cx.subscribe(&tree, |this: &mut Self, _, event: &TreeEvent, cx| match event {
             TreeEvent::RootPicked(name) => {
                 this.root_override = Some(name.clone());
@@ -319,6 +341,8 @@ impl Workspace {
             investigate,
             root_override: None,
             tree,
+            palette,
+            palette_open: std::env::var("GRAVIZ_PALETTE").is_ok(),
             orphan_panel,
             until_panel,
             canvas,
@@ -386,6 +410,7 @@ impl Workspace {
         let model = Rc::new(build_model(sliced, self.schema_name.clone(), &self.options));
         self.model = model.clone();
         self.tree.update(cx, |tree, cx| tree.set_model(model.clone(), cx));
+        self.palette.update(cx, |p, _| p.set_model(model.clone()));
         let list_opts = ModelOptions { skip_layout: true, ..self.options.clone() };
         let full_model = Rc::new(build_model(
             self.full_graph.clone(),
@@ -1444,7 +1469,14 @@ impl Render for Workspace {
 
         if !self.focused_once {
             self.focused_once = true;
-            window.focus(&self.focus, cx);
+            if self.palette_open {
+                self.palette.update(cx, |p, cx| {
+                    p.debug_query();
+                    p.reopen_keeping_query(window, cx);
+                });
+            } else {
+                window.focus(&self.focus, cx);
+            }
             // Debug: GRAVIZ_FOCUS=<TypeName> opens with that card focused, so
             // a selfshot can reproduce the focused state.
             if let Ok(name) = std::env::var("GRAVIZ_FOCUS") {
@@ -1455,6 +1487,7 @@ impl Render for Workspace {
         }
         div()
             .flex()
+            .relative()
             .size_full()
             .track_focus(&self.focus)
             .key_context("Workspace")
@@ -1487,11 +1520,12 @@ impl Render for Workspace {
                     }
                 }),
             )
+            // ⌘K used to open the sidebar and put the caret in its search
+            // box. It opens the palette now: a shortcut for "find me a type"
+            // should not depend on a pane being there, or move the layout.
             .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
-                this.sidebar_open = true;
-                this.sidebar_toggled_at = Some(std::time::Instant::now());
-                let handle = this.tree.read(cx).focus_handle();
-                window.focus(&handle, cx);
+                this.palette_open = true;
+                this.palette.update(cx, |p, cx| p.reopen(window, cx));
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
@@ -1659,6 +1693,14 @@ impl Render for Workspace {
                     )
                     .child(dock),
             )
+            // Above both panes and the canvas, so it covers whatever the
+            // reader was on rather than being wedged into one of them.
+            // The overlay box belongs to the parent: a view's own root cannot
+            // position itself against an ancestor, and an absolute root would
+            // resolve its insets against a zero-sized wrapper.
+            .when(self.palette_open, |el| {
+                el.child(div().absolute().inset_0().child(self.palette.clone()))
+            })
     }
 }
 

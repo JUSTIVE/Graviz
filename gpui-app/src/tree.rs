@@ -10,6 +10,7 @@
 //! a real caret and selection, but no IME; results come from
 //! `graviz_core::search::search_graph`.
 
+use crate::field::{self, FieldKey};
 use crate::icons::{icon, Icon};
 use crate::model::{mono_w, Model, RowKind};
 use crate::textedit::TextEdit;
@@ -18,7 +19,7 @@ use crate::workspace::kind_badge;
 use graviz_core::graph::NodeKind;
 use graviz_core::search::{search_graph, SearchResult, SnippetKind};
 use gpui::{
-    div, prelude::*, px, transparent_black, uniform_list, AnyElement, App, ClipboardItem, Context,
+    div, prelude::*, px, transparent_black, uniform_list, AnyElement, App, Context,
     EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle, Hsla, KeyDownEvent,
     MouseButton, ScrollHandle, SharedString, StyledText, Window,
 };
@@ -51,7 +52,7 @@ const MONO: &str = "Menlo";
 const SEARCH_FONT_PX: f32 = 12.0;
 const SEARCH_LINE_H: f32 = 18.0;
 
-fn kind_label(kind: NodeKind) -> &'static str {
+pub fn kind_label(kind: NodeKind) -> &'static str {
     KIND_ORDER
         .iter()
         .find(|(k, _)| *k == kind)
@@ -338,92 +339,29 @@ impl TreePanel {
     }
 
     fn on_key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let ks = &ev.keystroke;
-        let shift = ks.modifiers.shift;
-        // ⌘-chords. ⌘←/⌘→ are line start/end, the way they are in every other
-        // single-line field on this platform.
-        if ks.modifiers.platform {
-            match ks.key.as_str() {
-                "a" => self.search.select_all(),
-                "c" => {
-                    if let Some(sel) = self.search.selected_text() {
-                        cx.write_to_clipboard(ClipboardItem::new_string(sel.to_string()));
-                    }
-                    return;
-                }
-                "x" => {
-                    let Some(sel) = self.search.selected_text().map(str::to_string) else {
-                        return;
-                    };
-                    cx.write_to_clipboard(ClipboardItem::new_string(sel));
-                    self.search.delete_selection();
-                    self.refresh();
-                }
-                "v" => {
-                    let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
-                        return;
-                    };
-                    self.search.insert(&text);
-                    self.refresh();
-                }
-                "left" => self.search.move_cursor(0, shift),
-                "right" => self.search.move_cursor(self.search.text.len(), shift),
-                _ => return,
-            }
-            cx.notify();
-            return;
-        }
-        if ks.modifiers.control {
-            return;
-        }
-        match ks.key.as_str() {
-            "backspace" => {
-                self.search.backspace();
-                self.refresh();
-            }
-            "delete" => {
-                self.search.delete_forward();
-                self.refresh();
-            }
-            "left" => {
-                let to = self.search.prev_boundary(self.search.cursor);
-                self.search.move_cursor(to, shift);
-            }
-            "right" => {
-                let to = self.search.next_boundary(self.search.cursor);
-                self.search.move_cursor(to, shift);
-            }
-            "home" => self.search.move_cursor(0, shift),
-            "end" => self.search.move_cursor(self.search.text.len(), shift),
-            "escape" => {
+        match field::key(&mut self.search, ev, cx) {
+            FieldKey::Edited => self.refresh(),
+            FieldKey::Moved => {}
+            FieldKey::Escape => {
                 self.search.clear();
                 self.refresh();
                 window.blur();
             }
             // Up/down/enter drive the result list, not the text — there is
             // only ever one line to move within.
-            "up" => {
+            FieldKey::Up => {
                 self.active = self.active.saturating_sub(1);
                 self.results_scroll.scroll_to_item(self.active);
             }
-            "down" => {
+            FieldKey::Down => {
                 self.active = (self.active + 1).min(self.filtered.len().saturating_sub(1));
                 self.results_scroll.scroll_to_item(self.active);
             }
-            "enter" => {
+            FieldKey::Enter => {
                 self.select_result(self.active, cx);
                 return;
             }
-            _ => {
-                if let Some(ch) = ks.key_char.as_deref() {
-                    if !ch.chars().any(|c| c.is_control()) {
-                        self.search.insert(ch);
-                        self.refresh();
-                    }
-                } else {
-                    return;
-                }
-            }
+            FieldKey::Ignored => return,
         }
         cx.notify();
     }
@@ -499,7 +437,7 @@ impl TreePanel {
                                 MouseButton::Left,
                                 cx.listener(|this, ev: &gpui::MouseDownEvent, _, cx| {
                                     let x = f32::from(ev.position.x) - this.search_origin.get();
-                                    let to = offset_for_x(&this.search.text, x);
+                                    let to = field::offset_for_x(&this.search.text, x, SEARCH_FONT_PX);
                                     this.search.move_cursor(to, false);
                                     cx.notify();
                                 }),
@@ -1467,7 +1405,7 @@ fn char_byte_ranges(text: &str, char_idxs: &[usize]) -> Vec<std::ops::Range<usiz
 }
 
 /// Fuzzy-match highlight: matched chars bold in `color`, no background.
-fn highlighted(text: &str, char_idxs: &[usize], color: Hsla) -> AnyElement {
+pub fn highlighted(text: &str, char_idxs: &[usize], color: Hsla) -> AnyElement {
     if char_idxs.is_empty() {
         return SharedString::from(text.to_owned()).into_any_element();
     }
@@ -1486,21 +1424,6 @@ fn sorted_cards(model: &Model) -> Vec<u32> {
     let mut all: Vec<u32> = (0..model.cards.len() as u32).collect();
     all.sort_by(|&a, &b| model.cards[a as usize].name.cmp(&model.cards[b as usize].name));
     all
-}
-
-/// Byte offset whose caret position sits closest to `x`, measured in pixels
-/// from the start of the text. Only char boundaries are candidates, so the
-/// caret can never land inside a multi-byte glyph.
-fn offset_for_x(text: &str, x: f32) -> usize {
-    text.char_indices()
-        .map(|(i, _)| i)
-        .chain(std::iter::once(text.len()))
-        .min_by(|&a, &b| {
-            let da = (mono_w(&text[..a], SEARCH_FONT_PX) - x).abs();
-            let db = (mono_w(&text[..b], SEARCH_FONT_PX) - x).abs();
-            da.total_cmp(&db)
-        })
-        .unwrap_or(0)
 }
 
 /// Every root operation the schema *declares*, in Query → Mutation →
@@ -1626,31 +1549,6 @@ mod tests {
         assert!(!declares_root(&m, Some("Post")), "not a root operation");
         assert!(!declares_root(&m, None));
         assert_eq!(first_root(&m).map(|s| s.to_string()), Some("Query".into()));
-    }
-
-    /// Clicking maps an x offset back to a caret position, snapping to the
-    /// nearer boundary so the caret lands where the pointer looks.
-    #[test]
-    fn click_maps_x_to_the_nearest_caret_offset() {
-        let w = |s: &str| mono_w(s, SEARCH_FONT_PX);
-        assert_eq!(offset_for_x("user", 0.0), 0);
-        assert_eq!(offset_for_x("user", w("user")), 4, "past the end clamps to the end");
-        assert_eq!(offset_for_x("user", w("user") + 999.0), 4);
-        assert_eq!(offset_for_x("user", w("us")), 2);
-        // Just past a glyph's midpoint rounds on to the next boundary.
-        assert_eq!(offset_for_x("user", w("us") + w("e") * 0.6), 3);
-        assert_eq!(offset_for_x("", 42.0), 0, "empty text has only offset 0");
-    }
-
-    /// Byte offsets again: a click inside a multi-byte glyph has to resolve
-    /// to one of its edges, never into the middle.
-    #[test]
-    fn click_never_lands_inside_a_multibyte_glyph() {
-        let text = "한글";
-        for step in 0..40 {
-            let off = offset_for_x(text, step as f32 * 2.0);
-            assert!(text.is_char_boundary(off), "offset {off} splits a glyph");
-        }
     }
 
     /// A schema whose roots are gone (a different file was opened) has to
