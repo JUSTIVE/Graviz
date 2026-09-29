@@ -384,6 +384,20 @@ pub fn layout(
             singleton_ids.len(),
             100.0 * card_area / (packed_w * packed_h).max(1.0)
         );
+        // How many references come out as one straight line, which is what
+        // the port-aware y fit is for: the departure row and the arrival
+        // middle landing at the same height, with nothing bent in between.
+        let straight = edge_paths
+            .iter()
+            .filter(|p| {
+                p.curves.last().is_some_and(|c| (c.end.y - p.start.y).abs() < 2.0)
+            })
+            .count();
+        eprintln!(
+            "straight: {straight}/{} edges ({:.0}%) leave and arrive at the same height",
+            edge_paths.len(),
+            100.0 * straight as f32 / edge_paths.len().max(1) as f32
+        );
         let mut total_len = 0.0f32;
         let mut total_dx = 0.0f32;
         let mut total_dy = 0.0f32;
@@ -706,9 +720,17 @@ fn anchor_points(
     // — instead of merely reporting which card the layout put first. An edge
     // whose target ended up on the left loops back around, which is what a
     // back edge should look like.
-    let _ = (waypoints, tn);
+    let _ = waypoints;
     let start = Point { x: sp.x + sn.w, y: sp.y + port_y };
-    let end = Point { x: tp.x, y: tp.y + tn.h / 2.0 };
+    // Arrive at the height it left from, when that lands on the target's
+    // face. Pinning every arrival to the middle of the face meant the two
+    // ends of a reference sat at different heights by construction, so even
+    // a card sitting straight across from its field got an S. Out of range
+    // the arrival slides to the nearest corner of the face and the curve
+    // takes up the rest.
+    const FACE_INSET: f32 = 8.0;
+    let (lo, hi) = (tp.y + FACE_INSET, tp.y + (tn.h - FACE_INSET).max(FACE_INSET));
+    let end = Point { x: tp.x, y: start.y.clamp(lo, hi) };
     (start, end)
 }
 
@@ -885,6 +907,26 @@ fn layout_component(
         .collect();
     pairs.sort_unstable();
     pairs.dedup();
+
+    // Where an edge meets its source: the row of the field it comes from,
+    // clamped the way the path builder clamps it. Several fields pointing at
+    // the same type share one pair, so the median row stands for them.
+    let mut port_rows: HashMap<(u32, u32), Vec<f32>> = HashMap::new();
+    for &ei in comp_edge_ids {
+        let e = &edges[ei as usize];
+        let (f, t) = (local_of[&e.from], local_of[&e.to]);
+        if f != t {
+            let h = nodes[comp[f as usize] as usize].h;
+            port_rows
+                .entry((f, t))
+                .or_default()
+                .push(e.from_port_y.clamp(8.0, (h - 8.0).max(8.0)));
+        }
+    }
+    let port_of: HashMap<(u32, u32), f32> = port_rows
+        .into_iter()
+        .filter_map(|(k, mut v)| median(&mut v).map(|m| (k, m)))
+        .collect();
 
     // ---- cycle break: DFS, reverse back edges ----
     // acyclic keeps the pair's ORIGINAL orientation alongside the DAG one.
@@ -1102,11 +1144,28 @@ fn layout_component(
     // ordering adjacency (adjacent ranks only) over xnodes
     let mut xout: Vec<Vec<u32>> = vec![Vec::new(); m];
     let mut xin: Vec<Vec<u32>> = vec![Vec::new(); m];
+    // Parallel to xout/xin: where this edge touches each end, as (own, other)
+    // offsets from the node's top. A card is touched at its field row when it
+    // is the source and at the middle of its left face when it is the target,
+    // so the offset belongs to the edge, not to the node. Lanes are points,
+    // so they sit on the line at 0.
+    let mut pout: Vec<Vec<(f32, f32)>> = vec![Vec::new(); m];
+    let mut pin: Vec<Vec<(f32, f32)>> = vec![Vec::new(); m];
     // chains: original directed pair -> virtual xnode ids from source to target
     let mut chains: HashMap<(u32, u32), Vec<u32>> = HashMap::new();
-    let push_edge = |xout: &mut Vec<Vec<u32>>, xin: &mut Vec<Vec<u32>>, a: u32, b: u32| {
+    #[allow(clippy::too_many_arguments)]
+    let push_edge = |xout: &mut Vec<Vec<u32>>,
+                     xin: &mut Vec<Vec<u32>>,
+                     pout: &mut Vec<Vec<(f32, f32)>>,
+                     pin: &mut Vec<Vec<(f32, f32)>>,
+                     a: u32,
+                     b: u32,
+                     oa: f32,
+                     ob: f32| {
         xout[a as usize].push(b);
+        pout[a as usize].push((oa, ob));
         xin[b as usize].push(a);
+        pin[b as usize].push((ob, oa));
     };
     for &((a, b), reversed) in &acyclic {
         let (ra, rb) = (rank[a as usize], rank[b as usize]);
@@ -1118,8 +1177,20 @@ fn layout_component(
         if span == 0 || virtual_budget == 0 {
             continue;
         }
+        let (src, dst) = orig_pair;
+        let port = port_of.get(&orig_pair).copied().unwrap_or(0.0);
+        let dst_mid = nodes[comp[dst as usize] as usize].h / 2.0;
+        let off = |v: u32| -> f32 {
+            if v == src {
+                port
+            } else if v == dst {
+                dst_mid
+            } else {
+                0.0
+            }
+        };
         if span == 1 {
-            push_edge(&mut xout, &mut xin, a, b);
+            push_edge(&mut xout, &mut xin, &mut pout, &mut pin, a, b, off(a), off(b));
             continue;
         }
         // Each edge gets its own lane. Sharing one lane per target — bundling
@@ -1131,11 +1202,15 @@ fn layout_component(
                        xnodes: &mut Vec<XNode>,
                        xout: &mut Vec<Vec<u32>>,
                        xin: &mut Vec<Vec<u32>>,
+                       pout: &mut Vec<Vec<(f32, f32)>>,
+                       pin: &mut Vec<Vec<(f32, f32)>>,
                        budget: &mut usize| {
             let id = xnodes.len() as u32;
             xnodes.push(XNode { real: None, rank: r, w: VIRTUAL_W, h: VIRTUAL_H });
             xout.push(Vec::new());
             xin.push(Vec::new());
+            pout.push(Vec::new());
+            pin.push(Vec::new());
             *budget = budget.saturating_sub(1);
             id
         };
@@ -1143,12 +1218,13 @@ fn layout_component(
         let mut prev = a;
         if span > 1 {
             for r in ra + 1..rb {
-                let id = lane_at(r, &mut xnodes, &mut xout, &mut xin, &mut virtual_budget);
-                push_edge(&mut xout, &mut xin, prev, id);
+                let id =
+                    lane_at(r, &mut xnodes, &mut xout, &mut xin, &mut pout, &mut pin, &mut virtual_budget);
+                push_edge(&mut xout, &mut xin, &mut pout, &mut pin, prev, id, off(prev), 0.0);
                 chain.push(id);
                 prev = id;
             }
-            push_edge(&mut xout, &mut xin, prev, b);
+            push_edge(&mut xout, &mut xin, &mut pout, &mut pin, prev, b, off(prev), off(b));
         } else {
             // rb < ra. BFS ranks leave a minority of edges pointing backwards;
             // left unrouted they fly straight back across every rank in
@@ -1157,12 +1233,13 @@ fn layout_component(
             // wiring every ordering edge in increasing-rank direction so the
             // sweeps still see a DAG.
             for r in (rb + 1..ra).rev() {
-                let id = lane_at(r, &mut xnodes, &mut xout, &mut xin, &mut virtual_budget);
-                push_edge(&mut xout, &mut xin, id, prev);
+                let id =
+                    lane_at(r, &mut xnodes, &mut xout, &mut xin, &mut pout, &mut pin, &mut virtual_budget);
+                push_edge(&mut xout, &mut xin, &mut pout, &mut pin, id, prev, 0.0, off(prev));
                 chain.push(id);
                 prev = id;
             }
-            push_edge(&mut xout, &mut xin, b, prev);
+            push_edge(&mut xout, &mut xin, &mut pout, &mut pin, b, prev, off(b), 0.0);
         }
         let chain_oriented = if reversed {
             let mut c = chain.clone();
@@ -1395,7 +1472,7 @@ fn layout_component(
     // ~5% and halves the drawing's height, but packs the cards so tightly
     // that edges cross 42% more cards and 28% more edges. Complexity is
     // crossings first, length second.
-    relax_y(&ranks, &xnodes, &xin, &xout, &sep_of, &mut y, 6);
+    relax_y(&ranks, &xnodes, &xin, &xout, &pin, &pout, &sep_of, &mut y, 6);
 
     if timing {
         eprintln!("  stage coords    {:>6.1}ms", t_stage.elapsed().as_secs_f32() * 1000.0);
@@ -1536,11 +1613,14 @@ fn order_ranks(
 /// respects the order, rather than a forward push that makes each rank drift
 /// diagonally downward.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn relax_y(
     ranks: &[Vec<u32>],
     xnodes: &[XNode],
     xin: &[Vec<u32>],
     xout: &[Vec<u32>],
+    pin: &[Vec<(f32, f32)>],
+    pout: &[Vec<(f32, f32)>],
     sep_of: &impl Fn(&XNode) -> f32,
     y: &mut [f32],
     yiters: usize,
@@ -1558,9 +1638,19 @@ fn relax_y(
             for &v in rank_nodes {
                 let vi = v as usize;
                 let mut centers: Vec<f32> = Vec::new();
-                for &u in xin[vi].iter().chain(xout[vi].iter()) {
-                    let ui = u as usize;
-                    centers.push(y[ui] + xnodes[ui].h / 2.0);
+                for (&u, &(own, other)) in xin[vi]
+                    .iter()
+                    .zip(pin[vi].iter())
+                    .chain(xout[vi].iter().zip(pout[vi].iter()))
+                {
+                    // The edge is straight when the two points it touches
+                    // share a y: `y[u] + other == y[v] + own`. Solve that for
+                    // v's centre, which is what the fit below works in.
+                    // Aligning card centres instead, as this did, put the
+                    // departure row and the arrival middle at different
+                    // heights by construction, so every reference came out as
+                    // an S even when nothing was in its way.
+                    centers.push(y[u as usize] + other - own + xnodes[vi].h / 2.0);
                 }
                 // The median, not the mean: it is the L1 optimum, so it
                 // minimises total edge length. The mean (L2) was measured —

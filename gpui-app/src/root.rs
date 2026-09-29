@@ -6,7 +6,7 @@ use crate::config::{self, RecentEntry};
 use crate::editor::TextArea;
 use crate::landing;
 use crate::loader;
-use crate::workspace::{OpenSchema, Workspace};
+use crate::workspace::{ClearSelection, OpenSchema, OpenSettings, Workspace};
 use gpui::{
     div, prelude::*, px, App, Context, Entity, ExternalPaths, FocusHandle, Focusable,
     PathPromptOptions, Window,
@@ -20,6 +20,7 @@ pub struct Root {
     /// "New" tab: show the landing even though a schema is loaded.
     show_landing: bool,
     show_about: bool,
+    show_settings: bool,
     editor: Entity<TextArea>,
     recents_open: bool,
     warnings: Vec<String>,
@@ -40,8 +41,9 @@ impl Root {
     ) -> Self {
         let workspace = initial
             .map(|(loaded, path, overlay)| cx.new(|cx| Workspace::new(loaded, path, overlay, cx)));
-        let mode = config::load_settings().theme_mode;
-        crate::theme::set_mode(cx, mode);
+        let saved = config::load_settings();
+        crate::theme::set_mode(cx, saved.theme_mode);
+        config::set_scroll_mode(cx, saved.scroll_mode);
         let editor = cx.new(|cx| {
             let mut e = TextArea::new(cx);
             e.placeholder = "# Paste your GraphQL SDL here…";
@@ -68,6 +70,8 @@ impl Root {
             show_landing: false,
             // Debug: GRAVIZ_ABOUT=1 opens on the About page, for selfshots.
             show_about: std::env::var("GRAVIZ_ABOUT").is_ok(),
+            // Debug: GRAVIZ_SETTINGS=1 opens on Settings, for selfshots.
+            show_settings: std::env::var("GRAVIZ_SETTINGS").is_ok(),
             editor,
             // Debug: GRAVIZ_RECENTS=1 opens the list, for selfshots.
             recents_open: std::env::var("GRAVIZ_RECENTS").is_ok(),
@@ -156,6 +160,8 @@ impl Render for Root {
         let has_schema = self.workspace.is_some();
         let route = if self.show_about {
             crate::shell::Route::About
+        } else if self.show_settings {
+            crate::shell::Route::Settings
         } else if self.show_landing || !has_schema {
             crate::shell::Route::New
         } else {
@@ -166,46 +172,72 @@ impl Render for Root {
             div()
                 .id("update-available")
                 .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .h(px(32.0))
+                .h(px(20.0))
                 .flex()
                 .items_center()
-                .gap_2()
+                .gap_1()
                 .rounded_md()
                 .border_1()
                 .border_color(th.investigate)
-                .px(px(10.0))
-                .text_sm()
+                .px(px(6.0))
+                .text_xs()
                 .text_color(th.investigate)
                 .cursor_pointer()
                 .hover(|el| el.bg(th.investigate.opacity(0.1)))
                 .on_click(move |_, _, cx| cx.open_url(&url))
-                .child(crate::icons::icon(crate::icons::Icon::Sparkles, px(16.0), th.investigate))
+                .child(crate::icons::icon(crate::icons::Icon::Sparkles, px(12.0), th.investigate))
                 .child(gpui::SharedString::from(format!("v{} available", info.version)))
                 .into_any_element()
         });
-        let header = crate::shell::header(
+        let home = std::env::var("HOME").ok();
+        let file = self
+            .workspace
+            .as_ref()
+            .map(|w| crate::shell::file_label(w.read(cx).schema_path(), home.as_deref()));
+        let header = crate::shell::header(th, file, update_badge);
+        let rail = crate::shell::rail(
             th,
             route,
             has_schema,
-            crate::theme::mode(cx),
-            update_badge,
-            |this: &mut Self, route, _window, cx| {
+            |this: &mut Self, route, window, cx| {
                 this.show_about = route == crate::shell::Route::About;
+                this.show_settings = route == crate::shell::Route::Settings;
                 this.show_landing = route == crate::shell::Route::New;
-                cx.notify();
-            },
-            |_this: &mut Self, _window, cx| {
-                let next = crate::theme::mode(cx).next();
-                crate::theme::set_mode(cx, next);
-                let mut s = config::load_settings();
-                s.theme_mode = next;
-                config::save_settings(&s);
+                // The workspace leaves the tree with the focus still on it,
+                // and escape would then have nowhere to land.
+                window.focus(&this.focus, cx);
                 cx.notify();
             },
             cx,
         );
 
-        let body: gpui::AnyElement = if self.show_about {
+        let body: gpui::AnyElement = if self.show_settings {
+            crate::settings::view(
+                crate::settings::SettingsProps {
+                    th,
+                    theme_mode: crate::theme::mode(cx),
+                    scroll_mode: config::scroll_mode(cx),
+                    settings_file: config::settings_path()
+                        .map(|p| gpui::SharedString::from(p.to_string_lossy().into_owned())),
+                },
+                |_this: &mut Self, mode, _w, cx| {
+                    crate::theme::set_mode(cx, mode);
+                    let mut s = config::load_settings();
+                    s.theme_mode = mode;
+                    config::save_settings(&s);
+                    cx.notify();
+                },
+                |_this: &mut Self, mode, _w, cx| {
+                    config::set_scroll_mode(cx, mode);
+                    let mut s = config::load_settings();
+                    s.scroll_mode = mode;
+                    config::save_settings(&s);
+                    cx.notify();
+                },
+                cx,
+            )
+            .into_any_element()
+        } else if self.show_about {
             crate::about::view(
                 th,
                 |this: &mut Self, _w, cx| {
@@ -276,13 +308,43 @@ impl Render for Root {
                     this.open_dialog(cx)
                 }
             }))
+            // ⌘, toggles: pressing it again puts you back where you were,
+            // rather than stranding you on a page with no way out but the nav.
+            .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
+                this.show_settings = !this.show_settings;
+                if this.show_settings {
+                    this.show_about = false;
+                    window.focus(&this.focus, cx);
+                }
+                cx.notify();
+            }))
+            // Escape leaves Settings for whatever you were looking at: the
+            // graph, or the landing screen when nothing is open. The
+            // workspace owns this key too, but it is not in the tree while
+            // the page is up, so the two never both fire.
+            .on_action(cx.listener(|this, _: &ClearSelection, _, cx| {
+                if this.show_settings {
+                    this.show_settings = false;
+                    this.show_landing = this.workspace.is_none();
+                    cx.notify();
+                }
+            }))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
                 if let Some(path) = paths.paths().first() {
                     this.open_path(path.clone(), cx);
                 }
             }))
             .child(header)
-            .child(body)
+            // The rail is the outermost pane: the schema sidebar and the
+            // canvas both start to its right.
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .child(rail)
+                    .child(div().flex_1().min_w_0().flex().flex_col().child(body)),
+            )
             .when_some(crate::shell::commit_badge(th), |el, b| el.child(b))
     }
 }

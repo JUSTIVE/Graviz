@@ -296,7 +296,14 @@ impl TextArea {
         let ks = &ev.keystroke;
         let cmd = ks.modifiers.platform;
         let shift = ks.modifiers.shift;
+        // ⌥ moves and deletes by word; fn turns the arrows into the home, end
+        // and page keys, which macOS usually rewrites before they get here.
+        let word = ks.modifiers.alt;
+        let fnkey = ks.modifiers.function;
         let viewport_h = self.origin.get().2;
+        // A page is whatever is on screen, less a line so the eye keeps one
+        // row of context across the jump.
+        let page_lines = ((viewport_h / LINE_H) as usize).saturating_sub(1).max(1);
         match ks.key.as_str() {
             "enter" if cmd => {
                 cx.emit(EditorEvent::Submitted);
@@ -306,7 +313,11 @@ impl TextArea {
             "tab" => self.insert("  ", cx),
             "backspace" => {
                 if !self.delete_selection() && self.cursor > 0 {
-                    let p = self.prev_boundary(self.cursor);
+                    let p = if word {
+                        crate::textedit::prev_word_boundary(&self.text, self.cursor)
+                    } else {
+                        self.prev_boundary(self.cursor)
+                    };
                     self.text.replace_range(p..self.cursor, "");
                     self.cursor = p;
                 }
@@ -314,46 +325,86 @@ impl TextArea {
             }
             "delete" => {
                 if !self.delete_selection() && self.cursor < self.text.len() {
-                    let n = self.next_boundary(self.cursor);
+                    let n = if word {
+                        crate::textedit::next_word_boundary(&self.text, self.cursor)
+                    } else {
+                        self.next_boundary(self.cursor)
+                    };
                     self.text.replace_range(self.cursor..n, "");
                 }
                 cx.emit(EditorEvent::Changed);
             }
+            "home" => {
+                let to = self.cursor_line_col().1;
+                self.move_cursor(to, shift);
+            }
+            "end" => {
+                let (line, _, _) = self.cursor_line_col();
+                let to = self.offset_for_line_col(line, usize::MAX / 2);
+                self.move_cursor(to, shift);
+            }
+            "pageup" => {
+                let (line, _, col) = self.cursor_line_col();
+                let to = self.offset_for_line_col(line.saturating_sub(page_lines), col);
+                self.move_cursor(to, shift);
+            }
+            "pagedown" => {
+                let (line, _, col) = self.cursor_line_col();
+                let to = self.offset_for_line_col(line + page_lines, col);
+                self.move_cursor(to, shift);
+            }
             "left" => {
-                let to = if cmd {
+                let to = if cmd || fnkey {
                     self.cursor_line_col().1
+                } else if word {
+                    crate::textedit::prev_word_boundary(&self.text, self.cursor)
                 } else {
                     self.prev_boundary(self.cursor)
                 };
                 self.move_cursor(to, shift);
             }
             "right" => {
-                let to = if cmd {
+                let to = if cmd || fnkey {
                     let (line, _, _) = self.cursor_line_col();
                     self.offset_for_line_col(line, usize::MAX / 2)
+                } else if word {
+                    crate::textedit::next_word_boundary(&self.text, self.cursor)
                 } else {
                     self.next_boundary(self.cursor)
                 };
                 self.move_cursor(to, shift);
             }
             "up" => {
+                let (line, _, col) = self.cursor_line_col();
                 let to = if cmd {
                     0
-                } else {
-                    let (line, _, col) = self.cursor_line_col();
-                    if line == 0 {
-                        0
+                } else if fnkey {
+                    self.offset_for_line_col(line.saturating_sub(page_lines), col)
+                } else if word {
+                    // ⌥↑ is "up a paragraph": the start of this line, or of
+                    // the one above when the caret already sits there.
+                    let start = self.cursor_line_col().1;
+                    if self.cursor == start && line > 0 {
+                        self.offset_for_line_col(line - 1, 0)
                     } else {
-                        self.offset_for_line_col(line - 1, col)
+                        start
                     }
+                } else if line == 0 {
+                    0
+                } else {
+                    self.offset_for_line_col(line - 1, col)
                 };
                 self.move_cursor(to, shift);
             }
             "down" => {
+                let (line, _, col) = self.cursor_line_col();
                 let to = if cmd {
                     self.text.len()
+                } else if fnkey {
+                    self.offset_for_line_col(line + page_lines, col)
+                } else if word {
+                    self.offset_for_line_col(line, usize::MAX / 2)
                 } else {
-                    let (line, _, col) = self.cursor_line_col();
                     self.offset_for_line_col(line + 1, col)
                 };
                 self.move_cursor(to, shift);

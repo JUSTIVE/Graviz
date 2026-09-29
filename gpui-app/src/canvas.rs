@@ -77,6 +77,13 @@ pub struct GraphCanvas {
     /// Window-space origin of the canvas element, recorded at paint time so
     /// event coordinates (window-relative) can be mapped into the canvas.
     canvas_origin: Rc<Cell<(f32, f32)>>,
+    /// Canvas size in window coordinates, captured while painting. The true
+    /// rect, rather than the viewport minus a pane width: the rail and the
+    /// sidebar both sit to its left.
+    canvas_size: Rc<Cell<(f32, f32)>>,
+    /// While drag-panning with the cursor held against a side: how fast the
+    /// view slides, in screen pixels per second, and when it last slid.
+    edge_pan: Option<((f32, f32), std::time::Instant)>,
     /// EMA of paint_scene duration, shown in the perf panel.
     frame_ms: Rc<Cell<f32>>,
     /// Rolling FPS samples (last 60) + the sampling clock, mirroring the
@@ -151,6 +158,8 @@ impl GraphCanvas {
             pending_center: None,
             pinned: None,
             canvas_origin: Rc::new(Cell::new((0.0, 0.0))),
+            canvas_size: Rc::new(Cell::new((0.0, 0.0))),
+            edge_pan: None,
             frame_ms: Rc::new(Cell::new(0.0)),
             fps_hist: Rc::new(std::cell::RefCell::new(Vec::new())),
             fps_now: Rc::new(Cell::new(0.0)),
@@ -192,6 +201,12 @@ impl GraphCanvas {
     pub fn set_investigate(&mut self, on: bool, cx: &mut Context<Self>) {
         if self.investigate != on {
             self.investigate = on;
+            // An edge hovered or pinned when the mode came on would otherwise
+            // stay lit, tooltip and all, against a mode that dims every edge.
+            if on {
+                self.hovered_edge = None;
+                self.focused_edge = None;
+            }
             cx.notify();
         }
     }
@@ -349,6 +364,15 @@ impl GraphCanvas {
         None
     }
 
+    /// Nearest edge the cursor can actually act on.
+    ///
+    /// Investigate dims every edge and highlights none, so there an edge is
+    /// scenery: hover, tooltip and click-to-pin all fall through to the
+    /// canvas underneath.
+    fn hit_test_edge_interactive(&self, p: Point<Pixels>) -> Option<u32> {
+        (!self.investigate).then(|| self.hit_test_edge(p)).flatten()
+    }
+
     /// Nearest edge within ~6 screen px of the cursor.
     fn hit_test_edge(&self, p: Point<Pixels>) -> Option<u32> {
         let (wx, wy) = self.screen_to_world(p);
@@ -457,19 +481,14 @@ impl GraphCanvas {
 
     fn on_scroll(&mut self, ev: &ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
         let _ = window;
-        // Like the web app: scroll/wheel zooms (anchored at the cursor);
-        // hold shift to pan. Dragging pans as well.
-        if ev.modifiers.shift {
-            if let ScrollDelta::Pixels(d) = ev.delta {
-                self.view.x += f32::from(d.x);
-                self.view.y += f32::from(d.y);
+        let dy = match scroll_action(crate::config::scroll_mode(cx), ev.delta, ev.modifiers) {
+            ScrollAction::Pan(dx, dy) => {
+                self.view.x += dx;
+                self.view.y += dy;
                 cx.notify();
                 return;
             }
-        }
-        let dy = match ev.delta {
-            ScrollDelta::Pixels(d) => f32::from(d.y),
-            ScrollDelta::Lines(d) => d.y * 20.0,
+            ScrollAction::Zoom(dy) => dy,
         };
         // smooth exponential zoom: ±100px of scroll ≈ ×/÷ 1.4
         let ratio = 2f32.powf(dy / 200.0);
@@ -513,7 +532,7 @@ impl GraphCanvas {
         cx.notify();
     }
 
-    fn on_mouse_move(&mut self, ev: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_move(&mut self, ev: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(drag) = &mut self.drag {
             let dx = f32::from(ev.position.x - drag.start.x);
             let dy = f32::from(ev.position.y - drag.start.y);
@@ -523,6 +542,17 @@ impl GraphCanvas {
             if drag.moved {
                 self.view.x = drag.orig.x + dx;
                 self.view.y = drag.orig.y + dy;
+                let (ox, oy) = self.canvas_origin.get();
+                let (w, h) = self.canvas_size.get();
+                let v = edge_velocity(
+                    f32::from(ev.position.x) - ox,
+                    f32::from(ev.position.y) - oy,
+                    w,
+                    h,
+                );
+                self.edge_pan =
+                    (v != (0.0, 0.0)).then(|| (v, std::time::Instant::now()));
+                confine_cursor(window, ev.position, (ox, oy, w, h));
                 cx.notify();
             }
         } else {
@@ -531,7 +561,7 @@ impl GraphCanvas {
             // every mouse event — the tooltip re-anchors on the next paint.
             let hover = self.hit_test(ev.position);
             let hovered_edge = if hover.is_none() {
-                self.hit_test_edge(ev.position)
+                self.hit_test_edge_interactive(ev.position)
             } else {
                 None
             };
@@ -548,9 +578,12 @@ impl GraphCanvas {
     fn on_mouse_up(&mut self, ev: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         let was_click = matches!(&self.drag, Some(d) if !d.moved);
         self.drag = None;
+        self.edge_pan = None;
         if was_click {
             // Web: clicking empty canvas clears focus + pin.
-            if self.hit_test(ev.position).is_none() && self.hit_test_edge(ev.position).is_none() {
+            if self.hit_test(ev.position).is_none()
+                && self.hit_test_edge_interactive(ev.position).is_none()
+            {
                 self.focus = None;
                 self.pinned = None;
                 self.hovered_edge = None;
@@ -559,7 +592,7 @@ impl GraphCanvas {
             let vw = f32::from(window.viewport_size().width) - self.pane_offset_x;
             let vh = f32::from(window.viewport_size().height);
             if self.hit_test(ev.position).is_none() {
-                if let Some(ei) = self.hit_test_edge(ev.position) {
+                if let Some(ei) = self.hit_test_edge_interactive(ev.position) {
                     self.focus_edge(ei, vw, vh);
                 }
             }
@@ -654,12 +687,119 @@ fn edge_is_dimmed(
     }
 }
 
+/// How close to a side the cursor has to be before the view starts sliding,
+/// and how fast it slides once the cursor is right up against it.
+const EDGE_BAND: f32 = 40.0;
+const EDGE_MAX_SPEED: f32 = 1100.0;
+
+/// How fast the view should slide for a cursor at `(x, y)` in a canvas of
+/// `(w, h)`, both in canvas-local pixels.
+///
+/// Zero away from the sides, ramping to full speed at the very edge. The
+/// slide carries on in the direction the hand was already going: a drag is a
+/// hand on the sheet, and a cursor pinned against the left edge is a hand
+/// still pushing left, so the sheet keeps going left and the ground to the
+/// right keeps arriving. Which is the opposite sign to a drag-selection,
+/// where the pointer chases content rather than carrying it.
+fn edge_velocity(x: f32, y: f32, w: f32, h: f32) -> (f32, f32) {
+    let axis = |p: f32, len: f32| -> f32 {
+        if len <= EDGE_BAND * 2.0 {
+            return 0.0;
+        }
+        if p < EDGE_BAND {
+            -((EDGE_BAND - p) / EDGE_BAND).clamp(0.0, 1.0) * EDGE_MAX_SPEED
+        } else if p > len - EDGE_BAND {
+            ((p - (len - EDGE_BAND)) / EDGE_BAND).clamp(0.0, 1.0) * EDGE_MAX_SPEED
+        } else {
+            0.0
+        }
+    };
+    (axis(x, w), axis(y, h))
+}
+
+/// Hold the cursor inside the canvas while a drag is running.
+///
+/// Without this a pan that reaches the edge carries the pointer out over the
+/// rest of the desktop, and the gesture ends wherever it happens to be let
+/// go. Pinned to the edge instead, it keeps pointing at the canvas and the
+/// auto-pan above takes over the travelling.
+#[cfg(target_os = "macos")]
+fn confine_cursor(window: &Window, local: Point<Pixels>, rect: (f32, f32, f32, f32)) {
+    use core_graphics::display::CGDisplay;
+    use core_graphics::geometry::CGPoint;
+
+    let (ox, oy, w, h) = rect;
+    if w <= 0.0 || h <= 0.0 {
+        return;
+    }
+    let (x, y) = (f32::from(local.x), f32::from(local.y));
+    // One pixel in from the boundary, so the cursor stays over the canvas and
+    // keeps generating the moves the drag is made of.
+    let (cx, cy) = (x.clamp(ox + 1.0, ox + w - 1.0), y.clamp(oy + 1.0, oy + h - 1.0));
+    if (cx - x).abs() < 0.5 && (cy - y).abs() < 0.5 {
+        return;
+    }
+    let wb = window.bounds();
+    let global = CGPoint::new(
+        (f32::from(wb.origin.x) + cx) as f64,
+        (f32::from(wb.origin.y) + cy) as f64,
+    );
+    let _ = CGDisplay::warp_mouse_cursor_position(global);
+    // A warp otherwise swallows the next quarter second of movement, which
+    // would strand the drag the moment it reached a side.
+    let _ = CGDisplay::associate_mouse_and_mouse_cursor_position(true);
+}
+
+#[cfg(not(target_os = "macos"))]
+fn confine_cursor(_: &Window, _: Point<Pixels>, _: (f32, f32, f32, f32)) {}
+
+/// What a scroll gesture asks for, once the mode and the modifiers are read.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ScrollAction {
+    /// Zoom at the cursor by this much vertical scroll.
+    Zoom(f32),
+    /// Move the view by this much, in screen pixels.
+    Pan(f32, f32),
+}
+
+/// Two ways round, chosen in Settings.
+///
+/// Zoom mode is the web app's: scroll zooms at the cursor and shift pans. Pan
+/// mode is the one most canvases on this platform use: the swipe moves the
+/// sheet under you, each axis its own, and the platform modifier zooms.
+/// Dragging pans in either mode.
+///
+/// A wheel has one axis, and shift is how the platform asks for the other,
+/// but macOS has already done that swap by the time the event arrives: a
+/// shifted wheel turn shows up as an x delta with y at zero. So the axis an
+/// amount arrives on is the axis it belongs to, and swapping again here read
+/// the zero and moved nothing.
+fn scroll_action(
+    mode: crate::config::ScrollMode,
+    delta: ScrollDelta,
+    mods: gpui::Modifiers,
+) -> ScrollAction {
+    let zooming = match mode {
+        crate::config::ScrollMode::Zoom => !mods.shift,
+        crate::config::ScrollMode::Pan => mods.platform || mods.control,
+    };
+    let (dx, dy) = match delta {
+        ScrollDelta::Pixels(d) => (f32::from(d.x), f32::from(d.y)),
+        ScrollDelta::Lines(d) => (d.x * 20.0, d.y * 20.0),
+    };
+    if zooming {
+        ScrollAction::Zoom(dy)
+    } else {
+        ScrollAction::Pan(dx, dy)
+    }
+}
+
 /// Is this card fully documented — description on the type and on every field
 /// or enum value it lists?
 fn card_is_documented(card: &crate::model::Card) -> bool {
     card.description.is_some()
         && !card.rows.iter().any(|r| {
-            matches!(r.kind, RowKind::Field | RowKind::EnumValue) && r.description.is_none()
+            matches!(r.kind, RowKind::Field | RowKind::EnumValue) && !r.is_documented()
         })
 }
 
@@ -811,12 +951,39 @@ impl Render for GraphCanvas {
             window.request_animation_frame();
         }
 
+        // Edge auto-pan. The cursor cannot leave the canvas mid-drag, so a
+        // gesture that runs out of room parks against a side and the view
+        // keeps travelling on its own, a frame at a time.
+        // A drag that ends without a mouse-up, because the window went to the
+        // background mid-gesture, must not leave the view sliding on its own.
+        if self.drag.is_none() || !window.is_window_active() {
+            self.edge_pan = None;
+        }
+        if let Some(((vx, vy), last)) = self.edge_pan {
+            let now = std::time::Instant::now();
+            // A long frame (or a stalled one) must not launch the view across
+            // the graph in a single step.
+            let dt = (now - last).as_secs_f32().min(0.05);
+            self.view.x += vx * dt;
+            self.view.y += vy * dt;
+            // The drag anchor travels with it. Without this the next mouse
+            // move would rebuild the view from where the press started and
+            // undo everything the slide just did.
+            if let Some(d) = &mut self.drag {
+                d.orig.x += vx * dt;
+                d.orig.y += vy * dt;
+            }
+            self.edge_pan = Some(((vx, vy), now));
+            window.request_animation_frame();
+        }
+
         let model = self.model.clone();
         let view = self.view;
         let hover = self.hover;
         let focus = self.focus;
         let pinned = self.pinned;
         let canvas_origin = self.canvas_origin.clone();
+        let canvas_size = self.canvas_size.clone();
         let frame_ms = self.frame_ms.clone();
         let fps_hist = self.fps_hist.clone();
         let fps_now = self.fps_now.clone();
@@ -960,6 +1127,8 @@ impl Render for GraphCanvas {
                     move |bounds, _, window, cx| {
                         canvas_origin
                             .set((f32::from(bounds.origin.x), f32::from(bounds.origin.y)));
+                        canvas_size
+                            .set((f32::from(bounds.size.width), f32::from(bounds.size.height)));
                         let t0 = std::time::Instant::now();
                         // Clip all canvas painting to the element bounds —
                         // paint_layer orders, only a content mask clips.
@@ -1277,30 +1446,44 @@ impl Render for GraphCanvas {
                 },
             )
             .when(offscreen, |el| {
+                // Centred in the canvas. Safe to sit dead centre: this only
+                // appears once the whole graph has left the viewport, so
+                // there is nothing behind it to cover. The centring wrapper
+                // carries no interactivity, so GPUI gives it no hitbox
+                // (`should_insert_hitbox`) and pan/zoom still reach the
+                // canvas everywhere except the button itself.
                 el.child(
                     div()
-                        .id("back-to-graph")
                         .absolute()
-                        .top(px(16.0))
-                        .right(px(16.0))
-                        .rounded_lg()
-                        .border_1()
-                        .border_color(th.card_border)
-                        .bg(th.chrome_bg)
-                        .shadow_lg()
-                        .px_3()
-                        .py_2()
-                        .text_xs()
-                        .text_color(th.text)
-                        .cursor_pointer()
-                        .hover(|el| el.bg(th.hover_bg))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            let vw = f32::from(window.viewport_size().width) - this.pane_offset_x;
-                            let vh = f32::from(window.viewport_size().height);
-                            this.fit(vw, vh);
-                            cx.notify();
-                        }))
-                        .child("Back to graph"),
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .id("back-to-graph")
+                                .rounded_lg()
+                                .border_1()
+                                .border_color(th.card_border)
+                                .bg(th.chrome_bg)
+                                .shadow_lg()
+                                .px_3()
+                                .py_2()
+                                .text_xs()
+                                .text_color(th.text)
+                                .cursor_pointer()
+                                .hover(|el| el.bg(th.hover_bg))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    let vw = f32::from(window.viewport_size().width)
+                                        - this.pane_offset_x;
+                                    let vh = f32::from(window.viewport_size().height);
+                                    this.fit(vw, vh);
+                                    cx.notify();
+                                }))
+                                .child("Back to graph"),
+                        ),
                 )
             })
             .when_some(self.context_menu, |el, menu| {
@@ -1551,13 +1734,12 @@ fn paint_scene(
             // hub-star edges dim (the web app's hub fading).
             let mut dimmed =
                 edge_is_dimmed(ei as u32, e.from, e.to, e.hub_faded, focused_edge, focus);
-            // In investigate mode an edge is only interesting if it touches
-            // something undocumented; the rest recede with their cards.
-            if investigate && !dimmed {
-                let touches_gap = [e.from, e.to].iter().any(|&c| {
-                    model.cards.get(c as usize).is_some_and(|c| !card_is_documented(c))
-                });
-                dimmed = !touches_gap;
+            // Investigate highlights types and rows, never edges. An edge
+            // into an undocumented type says nothing about the edge itself,
+            // and lighting it up drags the eye away from the card that
+            // actually needs the prose. The web dims every edge here too.
+            if investigate {
+                dimmed = true;
             }
             if dimmed != dim_pass {
                 continue;
@@ -2029,16 +2211,19 @@ fn paint_scene(
                     BorderStyle::Solid,
                 ));
             }
-            if k >= LOD_ROWS {
-                for (ri, row) in card.rows.iter().enumerate() {
-                    if matches!(row.kind, RowKind::Field | RowKind::EnumValue)
-                        && row.description.is_none()
-                    {
-                        window.paint_quad(fill(
-                            rect(4.0, card.row_y(ri), card.w - 8.0, pitch),
-                            th.investigate.opacity(0.22),
-                        ));
-                    }
+            // No LOD gate on the stripes. The mode is most useful zoomed
+            // out, where a card's own outline says nothing about which of
+            // its fields are bare, and the row text this zoom drops is not
+            // what the stripe is made of. The web draws them at every scale.
+            let (r_lo, r_hi) = visible_rows(card, pos.y, wy0, wy1);
+            for (ri, row) in card.rows.iter().enumerate().take(r_hi).skip(r_lo) {
+                if matches!(row.kind, RowKind::Field | RowKind::EnumValue)
+                    && !row.is_documented()
+                {
+                    window.paint_quad(fill(
+                        rect(4.0, card.row_y(ri), card.w - 8.0, pitch),
+                        th.investigate.opacity(0.22),
+                    ));
                 }
             }
         }
@@ -2224,6 +2409,79 @@ mod tests {
     use super::*;
     use graviz_core::layout::{CubicSeg, Point};
 
+
+    fn wheel(x: f32, y: f32) -> ScrollDelta {
+        ScrollDelta::Lines(gpui::Point { x, y })
+    }
+
+    fn trackpad(x: f32, y: f32) -> ScrollDelta {
+        ScrollDelta::Pixels(gpui::Point { x: gpui::px(x), y: gpui::px(y) })
+    }
+
+    fn shift() -> gpui::Modifiers {
+        gpui::Modifiers { shift: true, ..Default::default() }
+    }
+
+    #[test]
+    fn the_view_only_slides_near_a_side() {
+        let (w, h) = (1200.0, 800.0);
+        assert_eq!(edge_velocity(600.0, 400.0, w, h), (0.0, 0.0), "middle");
+        // Hard against a side is full speed, in the direction the hand was
+        // already pushing: at the left edge the sheet keeps going left.
+        assert_eq!(edge_velocity(0.0, 400.0, w, h).0, -EDGE_MAX_SPEED);
+        assert_eq!(edge_velocity(w, 400.0, w, h).0, EDGE_MAX_SPEED);
+        assert_eq!(edge_velocity(600.0, 0.0, w, h).1, -EDGE_MAX_SPEED);
+        assert_eq!(edge_velocity(600.0, h, w, h).1, EDGE_MAX_SPEED);
+        // Halfway into the band, half the speed: the slide comes on gradually
+        // rather than snapping to full tilt at the boundary.
+        assert_eq!(edge_velocity(EDGE_BAND / 2.0, 400.0, w, h).0, -EDGE_MAX_SPEED / 2.0);
+        // A corner travels both ways at once.
+        assert_eq!(edge_velocity(0.0, 0.0, w, h), (-EDGE_MAX_SPEED, -EDGE_MAX_SPEED));
+        // A canvas with no room for two bands would be all edge, and every
+        // cursor position in it would slide. It holds still instead.
+        assert_eq!(edge_velocity(10.0, 10.0, 60.0, 60.0), (0.0, 0.0));
+    }
+
+    #[test]
+    fn a_shifted_wheel_turn_pans_sideways() {
+        // macOS hands a shifted wheel turn over as an x delta with y at zero.
+        // Reading shift as "swap the axes" here swapped it back onto the zero
+        // and the view never moved, in either mode.
+        use crate::config::ScrollMode;
+        let m = gpui::Modifiers::default();
+        assert_eq!(
+            scroll_action(ScrollMode::Zoom, wheel(-7.0, 0.0), shift()),
+            ScrollAction::Pan(-140.0, 0.0)
+        );
+        assert_eq!(
+            scroll_action(ScrollMode::Pan, wheel(-7.0, 0.0), shift()),
+            ScrollAction::Pan(-140.0, 0.0)
+        );
+        // And a plain turn still runs down the other axis.
+        assert_eq!(
+            scroll_action(ScrollMode::Pan, wheel(0.0, -3.0), m),
+            ScrollAction::Pan(0.0, -60.0)
+        );
+    }
+
+    #[test]
+    fn each_mode_zooms_on_its_own_gesture() {
+        use crate::config::ScrollMode;
+        let m = gpui::Modifiers::default();
+        let cmd = gpui::Modifiers { platform: true, ..Default::default() };
+        // Zoom mode: the plain gesture zooms, shift pans.
+        assert_eq!(scroll_action(ScrollMode::Zoom, trackpad(3.0, -9.0), m), ScrollAction::Zoom(-9.0));
+        assert_eq!(
+            scroll_action(ScrollMode::Zoom, trackpad(3.0, -9.0), shift()),
+            ScrollAction::Pan(3.0, -9.0)
+        );
+        // Pan mode: the other way round, and a trackpad swipe keeps both axes.
+        assert_eq!(
+            scroll_action(ScrollMode::Pan, trackpad(3.0, -9.0), m),
+            ScrollAction::Pan(3.0, -9.0)
+        );
+        assert_eq!(scroll_action(ScrollMode::Pan, trackpad(3.0, -9.0), cmd), ScrollAction::Zoom(-9.0));
+    }
 
     #[test]
     fn pinning_an_edge_dims_everything_but_that_edge() {

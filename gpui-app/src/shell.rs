@@ -1,81 +1,219 @@
-//! App shell: the sticky header the web app puts above every route
-//! (wordmark, nav, theme toggle) plus the bottom-center commit stamp.
+//! App shell: the title strip across the top (the open file and any update
+//! badge), the activity rail down the left, and the bottom-center commit
+//! stamp.
+//!
+//! The web app put its routes in the header as text links and cycled the
+//! theme from a button beside them. Here the routes are icons on a rail of
+//! their own, outside every other pane, and the theme lives in Settings.
 
 use crate::icons::{icon, Icon};
-use crate::theme::{Theme, ThemeMode};
-use gpui::{div, img, prelude::*, px, MouseButton, SharedString, Stateful, Window};
+use crate::theme::Theme;
+use gpui::{div, prelude::*, px, MouseButton, SharedString, Window};
+use std::path::Path;
 
-/// Left inset that keeps the header's contents clear of the window controls.
+/// Left inset that keeps the strip's contents clear of the window controls.
 /// The titlebar is transparent and the traffic lights are drawn by the system
-/// at (10, 10), so without this the wordmark sits on top of them.
+/// just inside it, so without this the title sits on top of them.
 #[cfg(target_os = "macos")]
 const CONTROLS_INSET: f32 = 78.0;
 #[cfg(not(target_os = "macos"))]
 const CONTROLS_INSET: f32 = 16.0;
 
+/// Height of the title strip: the standard macOS titlebar, not the tall
+/// header the web app needed to hold a nav. The traffic lights in `main.rs`
+/// are centred against this, so the two move together.
+pub const TITLEBAR_H: f32 = 28.0;
+
 /// Short commit the build was made from, stamped bottom-center like the web.
 pub const COMMIT: Option<&str> = option_env!("GRAVIZ_COMMIT");
 
-/// Which route the shell highlights in its nav.
+/// Splits a schema path into what the titlebar shows: the file name, and the
+/// directory holding it with `$HOME` collapsed to `~`.
+///
+/// `home` is passed in rather than read here so the split is testable without
+/// a real environment. A pasted schema has no directory, and neither does a
+/// bare relative name.
+pub fn file_label(path: &Path, home: Option<&str>) -> (SharedString, Option<SharedString>) {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+    let dir = path
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .filter(|d| !d.is_empty())
+        .map(|d| match home {
+            Some(h) if !h.is_empty() && d == h => "~".to_string(),
+            Some(h) if !h.is_empty() && d.starts_with(&format!("{h}/")) => {
+                format!("~{}", &d[h.len()..])
+            }
+            _ => d,
+        });
+    (name.into(), dir.map(SharedString::from))
+}
+
+/// Which view the rail highlights. `View` is the graph itself; the rest are
+/// the full-window pages that replace it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Route {
     New,
     View,
     About,
+    Settings,
 }
 
-fn nav_link(th: Theme, id: &'static str, label: &'static str, active: bool) -> Stateful<gpui::Div> {
+/// A rail button's hover label. The rail is icons only, so the name has to
+/// live somewhere: a real tooltip, rather than a caption that would double
+/// the strip's width for something you read once.
+struct Tip(SharedString);
+
+impl gpui::Render for Tip {
+    fn render(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+        let th = crate::theme::current(cx, window.appearance());
+        div()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(th.card_border)
+            .bg(th.panel)
+            .text_xs()
+            .text_color(th.text)
+            .child(self.0.clone())
+    }
+}
+
+fn rail_button<T: 'static>(
+    th: Theme,
+    id: &'static str,
+    ic: Icon,
+    label: &'static str,
+    active: bool,
+    on_click: impl Fn(&mut T, &mut Window, &mut gpui::Context<T>) + 'static,
+    cx: &mut gpui::Context<T>,
+) -> impl IntoElement {
     div()
         .id(id)
-        // The header is also the window's drag strip; without this a press on
-        // a nav link would start moving the window instead of navigating.
-        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .rounded_md()
-        .px_3()
-        .py(px(6.0))
-        .text_sm()
+        .relative()
+        .size(px(RAIL_W))
+        .flex()
+        .items_center()
+        .justify_center()
         .cursor_pointer()
-        .when(active, |el| el.bg(th.active_bg).text_color(th.text))
-        .when(!active, |el| {
-            el.text_color(th.text_muted).hover(|el| el.bg(th.hover_bg).text_color(th.text))
+        .when(!active, |el| el.hover(|el| el.bg(th.hover_bg)))
+        .tooltip(move |_, cx| cx.new(|_| Tip(label.into())).into())
+        .on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx)))
+        .child(icon(ic, px(20.0), if active { th.text } else { th.text_faint }))
+        // The selected item wears a bar on the rail's edge, the way VS Code
+        // marks the active activity: it reads at a glance without asking the
+        // icon to carry both "what" and "where you are".
+        .when(active, |el| {
+            el.child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top(px((RAIL_W - 22.0) / 2.0))
+                    .w(px(2.0))
+                    .h(px(22.0))
+                    .bg(th.primary),
+            )
         })
-        .child(SharedString::from(label))
 }
 
-/// The sticky app header. `on_nav` fires with the clicked route, `on_theme`
-/// cycles light → dark → system like the web's single-button toggle.
-#[allow(clippy::too_many_arguments)]
-pub fn header<T: 'static>(
+/// Width of the activity rail, and of the square buttons on it.
+const RAIL_W: f32 = 48.0;
+
+/// The leftmost strip: the app's routes as icons, with Settings pinned at the
+/// bottom. It sits outside everything else, so the schema sidebar and the
+/// canvas both begin to its right.
+pub fn rail<T: 'static>(
     th: Theme,
     route: Route,
     has_schema: bool,
-    theme_mode: ThemeMode,
-    update_badge: Option<gpui::AnyElement>,
     on_nav: impl Fn(&mut T, Route, &mut Window, &mut gpui::Context<T>) + 'static + Clone,
-    on_theme: impl Fn(&mut T, &mut Window, &mut gpui::Context<T>) + 'static,
     cx: &mut gpui::Context<T>,
 ) -> impl IntoElement {
-    let (theme_icon, theme_label) = match theme_mode {
-        ThemeMode::Light => (Icon::Sun, "Light"),
-        ThemeMode::Dark => (Icon::Moon, "Dark"),
-        ThemeMode::System => (Icon::Monitor, "System"),
-    };
-    let on_nav_new = on_nav.clone();
-    let on_nav_view = on_nav.clone();
+    let (new, view, about, settings) =
+        (on_nav.clone(), on_nav.clone(), on_nav.clone(), on_nav);
+    div()
+        .flex_none()
+        .w(px(RAIL_W))
+        .h_full()
+        .flex()
+        .flex_col()
+        .justify_between()
+        .bg(th.panel)
+        .border_r_1()
+        .border_color(th.panel_border)
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .child(rail_button(
+                    th,
+                    "rail-new",
+                    Icon::Upload,
+                    "New schema",
+                    route == Route::New,
+                    move |this, window, cx| new(this, Route::New, window, cx),
+                    cx,
+                ))
+                .when(has_schema, |el| {
+                    el.child(rail_button(
+                        th,
+                        "rail-view",
+                        Icon::Waypoints,
+                        "Graph",
+                        route == Route::View,
+                        move |this, window, cx| view(this, Route::View, window, cx),
+                        cx,
+                    ))
+                })
+                .child(rail_button(
+                    th,
+                    "rail-about",
+                    Icon::Info,
+                    "About",
+                    route == Route::About,
+                    move |this, window, cx| about(this, Route::About, window, cx),
+                    cx,
+                )),
+        )
+        .child(rail_button(
+            th,
+            "rail-settings",
+            Icon::Settings,
+            "Settings (⌘,)",
+            route == Route::Settings,
+            move |this, window, cx| settings(this, Route::Settings, window, cx),
+            cx,
+        ))
+}
+
+/// The window's title strip: the open file, and any update badge. No
+/// wordmark and no logo, the way a document window on this platform names
+/// what it holds and leaves the app's own name to the menu bar.
+pub fn header(
+    th: Theme,
+    // Open schema as `(file name, directory)`, from `file_label`.
+    file: Option<(SharedString, Option<SharedString>)>,
+    update_badge: Option<gpui::AnyElement>,
+) -> impl IntoElement {
     div()
         .id("titlebar")
+        .relative()
         .flex_none()
-        .h(px(56.0))
+        .h(px(TITLEBAR_H))
         .w_full()
         .flex()
         .items_center()
-        .justify_between()
+        .justify_end()
         .pl(px(CONTROLS_INSET))
-        .pr_4()
+        .pr_2()
         .bg(th.bg)
         .border_b_1()
         .border_color(th.panel_border)
-        // The header doubles as the titlebar (there is no system one): drag
+        // The strip doubles as the titlebar (there is no system one): drag
         // moves the window, and a double-click does whatever the system's
         // "double-click a window's title bar to" setting says — usually zoom,
         // which is the maximize toggle.
@@ -88,77 +226,49 @@ pub fn header<T: 'static>(
                 window.zoom_window();
             }
         })
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap_6()
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .text_color(th.text)
-                        .child(img(crate::icons::LOGO).size(px(20.0)).flex_none())
-                        .child(div().text_base().font_weight(gpui::FontWeight::SEMIBOLD).child("Graviz")),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .child(
-                            nav_link(th, "nav-new", "New", route == Route::New).on_click(
-                                cx.listener(move |this, _, window, cx| {
-                                    on_nav_new(this, Route::New, window, cx)
-                                }),
-                            ),
+        .when_some(file, |el, (name, dir)| {
+            el.child(
+                // Absolute, so the title is centred on the window rather than
+                // on whatever is left over beside the traffic lights. The
+                // insets match on both sides to keep that true.
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(px(CONTROLS_INSET))
+                    .right(px(CONTROLS_INSET))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_none()
+                            .max_w(px(280.0))
+                            .truncate()
+                            .text_sm()
+                            .text_color(th.text)
+                            .child(name),
+                    )
+                    .when_some(dir, |el, dir| {
+                        el.child(
+                            div()
+                                .min_w(px(0.0))
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                // A path is identified by its tail, so the
+                                // head is what gives way.
+                                .text_ellipsis_start()
+                                .text_xs()
+                                .text_color(th.text_muted)
+                                .child(dir),
                         )
-                        .when(has_schema, |el| {
-                            el.child(
-                                nav_link(th, "nav-view", "View", route == Route::View).on_click(
-                                    cx.listener(move |this, _, window, cx| {
-                                        on_nav_view(this, Route::View, window, cx)
-                                    }),
-                                ),
-                            )
-                        })
-                        .child(
-                            nav_link(th, "nav-about", "About", route == Route::About).on_click(
-                                cx.listener(move |this, _, window, cx| {
-                                    on_nav(this, Route::About, window, cx)
-                                }),
-                            ),
-                        ),
-                ),
-        )
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap_3()
-                .when_some(update_badge, |el, b| el.child(b))
-                .child(
-                    div()
-                        .id("theme-toggle")
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .h(px(32.0))
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(th.card_border)
-                        .px(px(10.0))
-                        .text_sm()
-                        .text_color(th.text)
-                        .cursor_pointer()
-                        .hover(|el| el.bg(th.hover_bg))
-                        .on_click(cx.listener(move |this, _, window, cx| on_theme(this, window, cx)))
-                        .child(icon(theme_icon, px(16.0), th.text))
-                        .child(SharedString::from(theme_label)),
-                ),
-        )
+                    }),
+            )
+        })
+        // Drawn after the title, so on a narrow window the badge wins the
+        // overlap rather than disappearing under it.
+        .when_some(update_badge, |el, b| el.child(b))
 }
 
 /// Bottom-center commit stamp (10px mono, muted at 40%).
@@ -179,4 +289,31 @@ pub fn commit_badge(th: Theme) -> Option<impl IntoElement> {
                     .child(SharedString::from(c)),
             )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_label_splits_the_name_from_its_directory() {
+        let (name, dir) = file_label(Path::new("/Users/b/git/crepe/schema.graphql"), Some("/Users/b"));
+        assert_eq!(&*name, "schema.graphql");
+        assert_eq!(dir.as_deref(), Some("~/git/crepe"));
+    }
+
+    #[test]
+    fn file_label_leaves_a_pasted_schema_without_a_directory() {
+        let (name, dir) = file_label(Path::new("(pasted)"), Some("/Users/b"));
+        assert_eq!(&*name, "(pasted)");
+        assert_eq!(dir, None, "a pasted schema is not a file on disk");
+    }
+
+    #[test]
+    fn file_label_collapses_home_but_not_a_lookalike_sibling() {
+        let (_, dir) = file_label(Path::new("/Users/b/a.graphql"), Some("/Users/b"));
+        assert_eq!(dir.as_deref(), Some("~"), "home itself");
+        let (_, dir) = file_label(Path::new("/Users/bison/a.graphql"), Some("/Users/b"));
+        assert_eq!(dir.as_deref(), Some("/Users/bison"), "shares a prefix, not a parent");
+    }
 }

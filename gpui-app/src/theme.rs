@@ -141,16 +141,6 @@ pub enum ThemeMode {
     System,
 }
 
-impl ThemeMode {
-    pub fn next(self) -> Self {
-        match self {
-            ThemeMode::Light => ThemeMode::Dark,
-            ThemeMode::Dark => ThemeMode::System,
-            ThemeMode::System => ThemeMode::Light,
-        }
-    }
-}
-
 /// App-wide theme choice, so every view resolves the same palette.
 #[derive(Clone, Copy, Default)]
 pub struct ThemeState(pub Option<ThemeMode>);

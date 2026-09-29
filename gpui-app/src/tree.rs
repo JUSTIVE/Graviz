@@ -6,20 +6,24 @@
 //! collapsible "All types", the context sections (implemented by / members /
 //! referenced by) and the `TypeDetail` pane.
 //!
-//! The search box is a minimal key-capture input (schema identifiers are
-//! ASCII); results come from `graviz_core::search::search_graph`.
+//! The search box is a key-capture input over a [`TextEdit`] buffer — it has
+//! a real caret and selection, but no IME; results come from
+//! `graviz_core::search::search_graph`.
 
+use crate::field::{self, FieldKey};
 use crate::icons::{icon, Icon};
-use crate::model::{Model, RowKind};
+use crate::model::{mono_w, Model, RowKind};
+use crate::textedit::TextEdit;
 use crate::theme::Theme;
 use crate::workspace::kind_badge;
 use graviz_core::graph::NodeKind;
 use graviz_core::search::{search_graph, SearchResult, SnippetKind};
 use gpui::{
-    div, prelude::*, px, transparent_black, uniform_list, AnyElement, App, Context, EventEmitter,
-    FocusHandle, Focusable, FontWeight, HighlightStyle, Hsla, KeyDownEvent, MouseButton,
-    ScrollHandle, SharedString, StyledText, Window,
+    div, prelude::*, px, transparent_black, uniform_list, AnyElement, App, Context,
+    EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle, Hsla, KeyDownEvent,
+    MouseButton, ScrollHandle, SharedString, StyledText, Window,
 };
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
@@ -43,7 +47,12 @@ const LIST_MAX_H: f32 = 192.0;
 
 const MONO: &str = "Menlo";
 
-fn kind_label(kind: NodeKind) -> &'static str {
+/// The search box is monospaced so the caret can be placed by measuring the
+/// text to its left rather than round-tripping through the text system.
+const SEARCH_FONT_PX: f32 = 12.0;
+const SEARCH_LINE_H: f32 = 18.0;
+
+pub fn kind_label(kind: NodeKind) -> &'static str {
     KIND_ORDER
         .iter()
         .find(|(k, _)| *k == kind)
@@ -59,7 +68,8 @@ pub enum TreeEvent {
 
 pub struct TreePanel {
     model: Rc<Model>,
-    query: String,
+    /// The search box's buffer: text plus caret and selection.
+    search: TextEdit,
     /// Unfiltered hits — the kind chips count over these.
     results: Vec<SearchResult>,
     /// Indices into `results` surviving `kind_filter`.
@@ -91,6 +101,9 @@ pub struct TreePanel {
     referenced_by: Vec<(u32, Vec<SharedString>)>,
     /// `(card, display row)` of the field whose right-click menu is open.
     context_menu_field: Option<(u32, usize)>,
+    /// Left edge of the search text, recorded at paint time so a click can be
+    /// mapped to a caret offset.
+    search_origin: Rc<Cell<f32>>,
 }
 
 impl TreePanel {
@@ -99,7 +112,7 @@ impl TreePanel {
         let root_pick = first_root(&model);
         let mut this = Self {
             model,
-            query: String::new(),
+            search: TextEdit::default(),
             results: Vec::new(),
             filtered: Vec::new(),
             kind_counts: HashMap::new(),
@@ -118,11 +131,12 @@ impl TreePanel {
             union_members: Vec::new(),
             referenced_by: Vec::new(),
             context_menu_field: None,
+            search_origin: Rc::new(Cell::new(0.0)),
         };
         // Debug presets, matching GRAVIZ_MODE / GRAVIZ_VIEW: open the panel
         // on a query or a selected type so selfshots can verify both states.
         if let Ok(q) = std::env::var("GRAVIZ_TREE") {
-            this.query = q;
+            this.search.set_text(q);
             this.refresh();
         }
         if let Ok(name) = std::env::var("GRAVIZ_TREE_SEL") {
@@ -133,13 +147,6 @@ impl TreePanel {
             }
         }
         this
-    }
-
-    /// What ⌘K focuses — the search input, so the recent-search list opens
-    /// with it. Keys still reach `on_key_down` on the panel root, which is an
-    /// ancestor of the input in the focus dispatch path.
-    pub fn focus_handle(&self) -> FocusHandle {
-        self.search_focus.clone()
     }
 
     /// Swap in a different slice of the schema (mode change).
@@ -154,7 +161,7 @@ impl TreePanel {
             self.root_pick = first_root(&model);
         }
         self.model = model;
-        self.query.clear();
+        self.search.clear();
         self.kind_filter.clear();
         self.selected = None;
         self.pinned = None;
@@ -167,10 +174,10 @@ impl TreePanel {
     }
 
     fn refresh(&mut self) {
-        self.results = if self.query.trim().is_empty() {
+        self.results = if self.search.text.trim().is_empty() {
             Vec::new()
         } else {
-            search_graph(&self.model.graph, &self.query)
+            search_graph(&self.model.graph, &self.search.text)
         };
         self.kind_counts.clear();
         for r in &self.results {
@@ -188,7 +195,7 @@ impl TreePanel {
     }
 
     fn set_query(&mut self, q: String, cx: &mut Context<Self>) {
-        self.query = q;
+        self.search.set_text(q);
         self.refresh();
         cx.notify();
     }
@@ -304,13 +311,13 @@ impl TreePanel {
             let r = &self.results[ri];
             (r.node_index as u32, r.row_index)
         };
-        if !self.query.trim().is_empty() {
-            crate::config::push_search(&self.query);
+        if !self.search.text.trim().is_empty() {
+            crate::config::push_search(&self.search.text);
             self.search_history = crate::config::search_history();
         }
         self.active = ix;
         self.select_card(card, row, cx);
-        self.query.clear();
+        self.search.clear();
         self.refresh();
     }
 
@@ -325,50 +332,29 @@ impl TreePanel {
     }
 
     fn on_key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let ks = &ev.keystroke;
-        if ks.modifiers.platform && ks.key == "v" {
-            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                self.query.push_str(&text);
-                self.refresh();
-                cx.notify();
-            }
-            return;
-        }
-        if ks.modifiers.platform || ks.modifiers.control {
-            return;
-        }
-        match ks.key.as_str() {
-            "backspace" => {
-                self.query.pop();
-                self.refresh();
-            }
-            "escape" => {
-                self.query.clear();
+        match field::key(&mut self.search, ev, cx) {
+            FieldKey::Edited => self.refresh(),
+            FieldKey::Moved => {}
+            FieldKey::Escape => {
+                self.search.clear();
                 self.refresh();
                 window.blur();
             }
-            "up" => {
+            // Up/down/enter drive the result list, not the text — there is
+            // only ever one line to move within.
+            FieldKey::Up => {
                 self.active = self.active.saturating_sub(1);
                 self.results_scroll.scroll_to_item(self.active);
             }
-            "down" => {
+            FieldKey::Down => {
                 self.active = (self.active + 1).min(self.filtered.len().saturating_sub(1));
                 self.results_scroll.scroll_to_item(self.active);
             }
-            "enter" => {
+            FieldKey::Enter => {
                 self.select_result(self.active, cx);
                 return;
             }
-            _ => {
-                if let Some(ch) = ks.key_char.as_deref() {
-                    if !ch.chars().any(|c| c.is_control()) {
-                        self.query.push_str(ch);
-                        self.refresh();
-                    }
-                } else {
-                    return;
-                }
-            }
+            FieldKey::Ignored => return,
         }
         cx.notify();
     }
@@ -376,12 +362,20 @@ impl TreePanel {
     // ---- 1. search input -------------------------------------------------
 
     fn render_search(&self, th: Theme, focused: bool, cx: &mut Context<Self>) -> AnyElement {
-        let empty = self.query.is_empty();
+        let query = self.search.text.clone();
+        let empty = query.is_empty();
         let text: SharedString = if empty {
             "Search types & fields…".into()
         } else {
-            self.query.clone().into()
+            query.clone().into()
         };
+        // The caret and the selection band are placed by measuring the text
+        // to their left, which is exact because the box is monospaced.
+        let caret_x = mono_w(&query[..self.search.cursor], SEARCH_FONT_PX);
+        let selection = self.search.selection().map(|(s, e)| {
+            (mono_w(&query[..s], SEARCH_FONT_PX), mono_w(&query[s..e], SEARCH_FONT_PX))
+        });
+        let origin = self.search_origin.clone();
         div()
             .flex_none()
             .px_3()
@@ -408,13 +402,66 @@ impl TreePanel {
                     .child(icon(Icon::Search, px(12.0), th.text_muted))
                     .child(
                         div()
+                            .id("search-text")
                             .flex_1()
                             .min_w_0()
-                            .text_size(px(12.0))
+                            .relative()
+                            .h(px(SEARCH_LINE_H))
+                            .flex()
+                            .items_center()
+                            .font_family(MONO)
+                            .text_size(px(SEARCH_FONT_PX))
                             .whitespace_nowrap()
                             .overflow_hidden()
                             .text_color(if empty { th.text_muted } else { th.text })
-                            .child(text),
+                            // Records where the text starts so a click can be
+                            // turned back into a caret offset.
+                            .child(
+                                gpui::canvas(
+                                    |_, _, _| (),
+                                    move |bounds, _, _, _| {
+                                        origin.set(f32::from(bounds.origin.x))
+                                    },
+                                )
+                                .absolute()
+                                .size_full(),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, ev: &gpui::MouseDownEvent, _, cx| {
+                                    let x = f32::from(ev.position.x) - this.search_origin.get();
+                                    let to = field::offset_for_x(&this.search.text, x, SEARCH_FONT_PX);
+                                    this.search.move_cursor(to, false);
+                                    cx.notify();
+                                }),
+                            )
+                            // Painted before the glyphs so it sits behind them.
+                            .when_some(selection, |el, (x, w)| {
+                                el.child(
+                                    div()
+                                        .absolute()
+                                        .left(px(x))
+                                        .top_0()
+                                        .bottom_0()
+                                        .w(px(w))
+                                        .rounded(px(2.0))
+                                        .bg(th.accent.opacity(0.35)),
+                                )
+                            })
+                            .child(text)
+                            // No caret while a selection is up, matching the
+                            // platform's own fields.
+                            .when(focused && selection.is_none(), |el| {
+                                el.child(
+                                    div()
+                                        .absolute()
+                                        .left(px(caret_x))
+                                        .top(px(2.0))
+                                        .bottom(px(2.0))
+                                        .w(px(1.5))
+                                        .bg(th.accent),
+                                )
+                            }),
                     )
                     .child(if empty {
                         div()
@@ -1351,7 +1398,7 @@ fn char_byte_ranges(text: &str, char_idxs: &[usize]) -> Vec<std::ops::Range<usiz
 }
 
 /// Fuzzy-match highlight: matched chars bold in `color`, no background.
-fn highlighted(text: &str, char_idxs: &[usize], color: Hsla) -> AnyElement {
+pub fn highlighted(text: &str, char_idxs: &[usize], color: Hsla) -> AnyElement {
     if char_idxs.is_empty() {
         return SharedString::from(text.to_owned()).into_any_element();
     }
@@ -1407,7 +1454,7 @@ impl Render for TreePanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let th = crate::theme::current(cx, window.appearance());
         let focused = self.search_focus.is_focused(window);
-        let query_empty = self.query.trim().is_empty();
+        let query_empty = self.search.text.trim().is_empty();
         // The web hides the tree while the recent list is showing. Keyed on
         // the *input's* focus: keyed on the panel's, every click in the
         // sidebar would swap the tree out from under the cursor and the
@@ -1424,6 +1471,20 @@ impl Render for TreePanel {
             .border_color(th.panel_border)
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key_down))
+            // Same as the palette: the escape binding is dispatched as an
+            // action before any key handler, so the search box can only hear
+            // it this way. Only while it has something to clear, otherwise
+            // escape still means "drop the canvas selection".
+            .on_action(cx.listener(
+                |this, _: &crate::workspace::ClearSelection, window, cx| {
+                    if this.search_focus.is_focused(window) && !this.search.text.is_empty() {
+                        this.search.clear();
+                        this.refresh();
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                },
+            ))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {

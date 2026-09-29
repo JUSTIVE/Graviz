@@ -2,15 +2,19 @@ mod about;
 mod canvas;
 mod config;
 mod editor;
+mod field;
 mod icons;
 mod landing;
 mod loader;
 mod model;
+mod palette;
 mod panels;
 mod root;
+mod settings;
 mod shell;
 #[cfg(target_os = "macos")]
 mod selfshot;
+mod textedit;
 mod theme;
 mod tree;
 mod update_check;
@@ -71,7 +75,11 @@ fn main() {
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
         cx.set_menus(vec![Menu {
             name: "Graviz".into(),
-            items: vec![MenuItem::action("Quit Graviz", Quit)],
+            items: vec![
+                MenuItem::action("Settings…", workspace::OpenSettings),
+                MenuItem::separator(),
+                MenuItem::action("Quit Graviz", Quit),
+            ],
             disabled: false,
         }]);
         let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
@@ -81,7 +89,11 @@ fn main() {
                 titlebar: Some(gpui::TitlebarOptions {
                     title: Some("Graviz".into()),
                     appears_transparent: true,
-                    traffic_light_position: Some(gpui::point(px(10.0), px(10.0))),
+                    // Centred in the title strip: (strip - 12pt button) / 2.
+                    traffic_light_position: Some(gpui::point(
+                        px(10.0),
+                        px((shell::TITLEBAR_H - 12.0) / 2.0),
+                    )),
                 }),
                 ..Default::default()
             },

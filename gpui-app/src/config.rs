@@ -3,6 +3,33 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// What a trackpad swipe or a wheel turn does over the canvas.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ScrollMode {
+    /// Scroll zooms at the cursor and shift pans. What the web app does, and
+    /// what this app has always done.
+    #[default]
+    Zoom,
+    /// Scroll pans, each axis following its own direction, and the platform
+    /// modifier zooms. What a canvas on this platform usually does.
+    Pan,
+}
+
+/// The live scroll mode, so the canvas can read it inside an event handler
+/// without the workspace having to thread it down on every change.
+#[derive(Clone, Copy, Default)]
+pub struct ScrollModeState(pub ScrollMode);
+
+impl gpui::Global for ScrollModeState {}
+
+pub fn scroll_mode(cx: &gpui::App) -> ScrollMode {
+    cx.try_global::<ScrollModeState>().map(|s| s.0).unwrap_or_default()
+}
+
+pub fn set_scroll_mode(cx: &mut gpui::App, mode: ScrollMode) {
+    cx.set_global(ScrollModeState(mode));
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
 pub struct Settings {
@@ -15,6 +42,7 @@ pub struct Settings {
     pub sidebar_width: f32,
     pub dock_height: f32,
     pub theme_mode: crate::theme::ThemeMode,
+    pub scroll_mode: ScrollMode,
 }
 
 /// Drag limits for the two resizable panes, matching the web's clamps.
@@ -37,6 +65,7 @@ impl Default for Settings {
             sidebar_width: SIDEBAR_DEFAULT_W,
             dock_height: DOCK_DEFAULT_H,
             theme_mode: crate::theme::ThemeMode::System,
+            scroll_mode: ScrollMode::Zoom,
         }
     }
 }
@@ -68,6 +97,11 @@ fn write_json<T: Serialize>(file: &str, value: &T) {
     if let Ok(json) = serde_json::to_string_pretty(value) {
         let _ = std::fs::write(base.join(file), json);
     }
+}
+
+/// Where `save_settings` writes, for the Settings page to name.
+pub fn settings_path() -> Option<PathBuf> {
+    Some(dir()?.join("settings.json"))
 }
 
 pub fn load_settings() -> Settings {
