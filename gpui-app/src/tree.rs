@@ -1471,6 +1471,20 @@ impl Render for TreePanel {
             .border_color(th.panel_border)
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key_down))
+            // Same as the palette: the escape binding is dispatched as an
+            // action before any key handler, so the search box can only hear
+            // it this way. Only while it has something to clear, otherwise
+            // escape still means "drop the canvas selection".
+            .on_action(cx.listener(
+                |this, _: &crate::workspace::ClearSelection, window, cx| {
+                    if this.search_focus.is_focused(window) && !this.search.text.is_empty() {
+                        this.search.clear();
+                        this.refresh();
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                },
+            ))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {

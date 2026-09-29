@@ -121,6 +121,10 @@ pub struct Workspace {
     /// root because choosing a hit has to reach the canvas.
     palette: Entity<crate::palette::Palette>,
     palette_open: bool,
+    /// Set when the palette closes: the keyboard has to come back here, or
+    /// the focused node is one that no longer exists and every shortcut on
+    /// this workspace stops answering.
+    reclaim_focus: bool,
     orphan_panel: Entity<OrphanPanel>,
     until_panel: Entity<UntilPanel>,
     canvas: Entity<GraphCanvas>,
@@ -264,6 +268,7 @@ impl Workspace {
                 crate::palette::PaletteEvent::Select { node_index, row } => {
                     let (node_index, row) = (*node_index, *row);
                     this.palette_open = false;
+                    this.reclaim_focus = true;
                     this.canvas.update(cx, |canvas, cx| {
                         canvas.navigate_to(node_index as u32, row, cx);
                     });
@@ -271,6 +276,7 @@ impl Workspace {
                 }
                 crate::palette::PaletteEvent::Dismiss => {
                     this.palette_open = false;
+                    this.reclaim_focus = true;
                     cx.notify();
                 }
             }
@@ -343,6 +349,7 @@ impl Workspace {
             tree,
             palette,
             palette_open: std::env::var("GRAVIZ_PALETTE").is_ok(),
+            reclaim_focus: false,
             orphan_panel,
             until_panel,
             canvas,
@@ -1467,6 +1474,10 @@ impl Render for Workspace {
             })
         };
 
+        if self.reclaim_focus {
+            self.reclaim_focus = false;
+            window.focus(&self.focus, cx);
+        }
         if !self.focused_once {
             self.focused_once = true;
             if self.palette_open {
@@ -1524,8 +1535,13 @@ impl Render for Workspace {
             // box. It opens the palette now: a shortcut for "find me a type"
             // should not depend on a pane being there, or move the layout.
             .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
-                this.palette_open = true;
-                this.palette.update(cx, |p, cx| p.reopen(window, cx));
+                // A second press closes it, the way ⌘, closes Settings.
+                this.palette_open = !this.palette_open;
+                if this.palette_open {
+                    this.palette.update(cx, |p, cx| p.reopen(window, cx));
+                } else {
+                    window.focus(&this.focus, cx);
+                }
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {

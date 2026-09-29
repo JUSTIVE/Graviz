@@ -252,6 +252,16 @@ impl Render for Palette {
                     .bg(th.panel)
                     .track_focus(&self.focus)
                     .on_key_down(cx.listener(Self::on_key_down))
+                    // escape is bound to ClearSelection app-wide, and gpui
+                    // runs bindings before key handlers and stops there, so
+                    // the key itself never reaches on_key_down. Claiming the
+                    // action is the only way to hear it, and stopping there
+                    // keeps the same press from also clearing the canvas
+                    // selection underneath.
+                    .on_action(cx.listener(|_, _: &crate::workspace::ClearSelection, _, cx| {
+                        cx.emit(PaletteEvent::Dismiss);
+                        cx.stop_propagation();
+                    }))
                     // The backdrop's own press dismisses; a press inside must
                     // not travel up to it.
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
