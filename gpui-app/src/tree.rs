@@ -149,13 +149,6 @@ impl TreePanel {
         this
     }
 
-    /// What ⌘K focuses — the search input, so the recent-search list opens
-    /// with it. Keys still reach `on_key_down` on the panel root, which is an
-    /// ancestor of the input in the focus dispatch path.
-    pub fn focus_handle(&self) -> FocusHandle {
-        self.search_focus.clone()
-    }
-
     /// Swap in a different slice of the schema (mode change).
     pub fn set_model(&mut self, model: Rc<Model>, cx: &mut Context<Self>) {
         self.all_sorted = sorted_cards(&model);

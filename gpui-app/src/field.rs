@@ -87,7 +87,28 @@ pub fn key<T: 'static>(
     if ks.modifiers.control {
         return FieldKey::Ignored;
     }
+    // ⌥ is the word modifier on this platform, and fn turns the arrows into
+    // home/end/page keys. macOS usually rewrites fn+← into "home" before it
+    // gets here, but not on every keyboard, so the modifier is honoured too.
+    let word = ks.modifiers.alt;
+    let whole_line = ks.modifiers.function;
     match ks.key.as_str() {
+        "backspace" if word => {
+            if !edit.delete_selection() {
+                let to = edit.prev_word(edit.cursor);
+                edit.move_cursor(to, true);
+                edit.delete_selection();
+            }
+            FieldKey::Edited
+        }
+        "delete" if word => {
+            if !edit.delete_selection() {
+                let to = edit.next_word(edit.cursor);
+                edit.move_cursor(to, true);
+                edit.delete_selection();
+            }
+            FieldKey::Edited
+        }
         "backspace" => {
             edit.backspace();
             FieldKey::Edited
@@ -97,20 +118,43 @@ pub fn key<T: 'static>(
             FieldKey::Edited
         }
         "left" => {
-            let to = edit.prev_boundary(edit.cursor);
+            let to = if whole_line {
+                0
+            } else if word {
+                edit.prev_word(edit.cursor)
+            } else {
+                edit.prev_boundary(edit.cursor)
+            };
             edit.move_cursor(to, shift);
             FieldKey::Moved
         }
         "right" => {
-            let to = edit.next_boundary(edit.cursor);
+            let to = if whole_line {
+                edit.text.len()
+            } else if word {
+                edit.next_word(edit.cursor)
+            } else {
+                edit.next_boundary(edit.cursor)
+            };
             edit.move_cursor(to, shift);
             FieldKey::Moved
         }
-        "home" => {
+        // One line means there is nowhere vertical to go: ⌥↑ and the page
+        // keys land on the ends, the way a single-line field does anywhere
+        // else on this platform.
+        "home" | "pageup" => {
             edit.move_cursor(0, shift);
             FieldKey::Moved
         }
-        "end" => {
+        "end" | "pagedown" => {
+            edit.move_cursor(edit.text.len(), shift);
+            FieldKey::Moved
+        }
+        "up" if word => {
+            edit.move_cursor(0, shift);
+            FieldKey::Moved
+        }
+        "down" if word => {
             edit.move_cursor(edit.text.len(), shift);
             FieldKey::Moved
         }

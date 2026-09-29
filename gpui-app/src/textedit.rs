@@ -114,6 +114,16 @@ impl TextEdit {
         self.text.len()
     }
 
+    /// Start of the word at or before the caret, for ⌥←.
+    pub fn prev_word(&self, from: usize) -> usize {
+        prev_word_boundary(&self.text, from)
+    }
+
+    /// End of the word at or after the caret, for ⌥→.
+    pub fn next_word(&self, from: usize) -> usize {
+        next_word_boundary(&self.text, from)
+    }
+
     /// Move the caret. `select` extends the selection, dropping the anchor
     /// when it is not set; without it the selection collapses.
     pub fn move_cursor(&mut self, to: usize, select: bool) {
@@ -126,6 +136,44 @@ impl TextEdit {
         }
         self.cursor = to.min(self.text.len());
     }
+}
+
+/// Underscores belong to the word here. The text these fields hold is
+/// GraphQL identifiers, where `commission_type` is one name and stopping in
+/// the middle of it is never what ⌥← was asked for.
+fn is_word(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Start of the word at or before `at`.
+///
+/// Whatever separates the caret from the word behind it is stepped over
+/// first, then the word itself, which is what ⌥← does on this platform: from
+/// mid-word it lands on that word's start, from a gap it lands on the
+/// previous word's start.
+pub fn prev_word_boundary(text: &str, at: usize) -> usize {
+    let mut i = at.min(text.len());
+    let back = |i: usize| text[..i].chars().next_back();
+    while let Some(c) = back(i).filter(|&c| !is_word(c)) {
+        i -= c.len_utf8();
+    }
+    while let Some(c) = back(i).filter(|&c| is_word(c)) {
+        i -= c.len_utf8();
+    }
+    i
+}
+
+/// End of the word at or after `at`, the mirror of [`prev_word_boundary`].
+pub fn next_word_boundary(text: &str, at: usize) -> usize {
+    let mut i = at.min(text.len());
+    let fwd = |i: usize| text[i..].chars().next();
+    while let Some(c) = fwd(i).filter(|&c| !is_word(c)) {
+        i += c.len_utf8();
+    }
+    while let Some(c) = fwd(i).filter(|&c| is_word(c)) {
+        i += c.len_utf8();
+    }
+    i
 }
 
 #[cfg(test)]
@@ -233,5 +281,48 @@ mod tests {
         let mut t = at("", 0);
         t.select_all();
         assert_eq!(t.selection(), None);
+    }
+}
+
+#[cfg(test)]
+mod word_tests {
+    use super::*;
+
+    #[test]
+    fn word_movement_matches_the_platform() {
+        let t = "let user_name = post.title;";
+        // From mid-word, back to that word's start and on to its end.
+        assert_eq!(prev_word_boundary(t, 8), 4, "inside user_name");
+        assert_eq!(next_word_boundary(t, 8), 13, "to the end of user_name");
+        // From a gap it carries on over the punctuation to the end of the
+        // next real word, which is what the platform does: `=` is not a word.
+        assert_eq!(next_word_boundary(t, 13), 20, "past ` = ` and through post");
+        assert_eq!(prev_word_boundary(t, 4), 0, "over the space, through let");
+        // The ends hold.
+        assert_eq!(prev_word_boundary(t, 0), 0);
+        assert_eq!(next_word_boundary(t, t.len()), t.len());
+    }
+
+    #[test]
+    fn an_underscore_does_not_break_a_word() {
+        // `user_name` is one identifier, not two: stopping at the underscore
+        // would make ⌥← useless on the names these fields actually hold.
+        assert_eq!(prev_word_boundary("user_name", 9), 0);
+        assert_eq!(next_word_boundary("user_name", 0), 9);
+        // A dot does break one.
+        assert_eq!(prev_word_boundary("post.title", 10), 5);
+    }
+
+    #[test]
+    fn word_movement_lands_on_char_boundaries() {
+        let t = "한글 이름 test";
+        for i in 0..=t.len() {
+            if !t.is_char_boundary(i) {
+                continue;
+            }
+            assert!(t.is_char_boundary(prev_word_boundary(t, i)), "prev from {i}");
+            assert!(t.is_char_boundary(next_word_boundary(t, i)), "next from {i}");
+        }
+        assert_eq!(next_word_boundary(t, 0), "한글".len());
     }
 }
