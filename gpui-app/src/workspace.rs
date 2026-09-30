@@ -130,6 +130,9 @@ pub struct Workspace {
     palette: Entity<crate::palette::Palette>,
     palette_open: bool,
     file_panel: Entity<crate::filepanel::FilePanel>,
+    /// Text the file pane applied over the file. The graph is drawn from
+    /// this while it is set; the file itself is never written.
+    sketch: Option<String>,
     file_panel_open: bool,
     /// The pane reads the file the first time it is shown, not before.
     file_panel_loaded: bool,
@@ -279,9 +282,16 @@ impl Workspace {
         });
         cx.subscribe(&file_panel, |this: &mut Self, _, event: &crate::filepanel::FileEvent, cx| {
             match event {
-                // The file on disk is the graph's source, so a save is a
-                // rebuild.
-                crate::filepanel::FileEvent::Saved => this.reload_from_disk(cx),
+                // The pane never writes: what it hands over is text to draw
+                // from, held here until it is reverted or the file reloads.
+                crate::filepanel::FileEvent::Apply(text) => {
+                    this.sketch = Some(text.clone());
+                    this.reload_schema(cx);
+                }
+                crate::filepanel::FileEvent::Revert => {
+                    this.sketch = None;
+                    this.reload_schema(cx);
+                }
                 crate::filepanel::FileEvent::Close => {
                     this.file_panel_open = false;
                     this.save_settings(cx);
@@ -376,6 +386,7 @@ impl Workspace {
             tree,
             palette,
             file_panel,
+            sketch: None,
             // Debug: GRAVIZ_FILE=<query> opens the pane on that search.
             file_panel_open: settings.file_panel_open
                 || std::env::var("GRAVIZ_FILE").is_ok(),
@@ -491,14 +502,46 @@ impl Workspace {
         &self.schema_path
     }
 
+    /// Rebuild from whatever the schema currently *is*: the file, or the
+    /// file pane's sketch when one has been applied over it.
+    fn reload_schema(&mut self, cx: &mut Context<Self>) {
+        let sketched = self.sketch.clone();
+        let loaded = match &sketched {
+            Some(text) => {
+                let name = self
+                    .schema_path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| self.schema_path.display().to_string());
+                loader::load_sdl(text, name, self.overlay_text.as_deref(), self.hide_relay)
+            }
+            None => loader::load(
+                &self.schema_path,
+                self.overlay_text.as_deref(),
+                self.hide_relay,
+            ),
+        };
+        self.apply_loaded(loaded, cx);
+    }
+
     fn reload_from_disk(&mut self, cx: &mut Context<Self>) {
-        match loader::load(
-            &self.schema_path,
-            self.overlay_text.as_deref(),
-            self.hide_relay,
-        ) {
+        // Reading the file again is a statement that the file is the truth,
+        // so a sketch over it is done with. The pane keeps the text it holds:
+        // dropping what somebody typed because a watcher fired would be the
+        // worst moment to lose it.
+        if self.sketch.take().is_some() {
+            self.file_panel.update(cx, |p, cx| p.sketch_dropped(cx));
+        }
+        self.reload_schema(cx);
+    }
+
+    fn apply_loaded(
+        &mut self,
+        loaded: anyhow::Result<loader::LoadedSchema>,
+        cx: &mut Context<Self>,
+    ) {
+        match loaded {
             Ok(loaded) => {
-                eprintln!("reloaded {}", self.schema_path.display());
                 self.full_graph = loaded.graph;
                 let counts = tab_counts(&self.full_graph);
                 self.orphan_count = counts.0;

@@ -5,8 +5,12 @@
 //! answering it meant leaving for an editor. This pane puts the source next
 //! to the picture, with the line numbers to talk about it by.
 //!
-//! It opens read-only. The buffer is somebody's schema on disk, and a pane
-//! you opened to read should not be one keypress away from rewriting it.
+//! It opens read-only, and unlocking it never touches the file. Edits apply
+//! to the graph the way the overlay does: the drawing follows the buffer, the
+//! file on disk stays as it was, and closing the pane or reloading throws the
+//! edit away. A pane you opened to read a schema should not be able to
+//! rewrite somebody's source, and a sketch is worth more when it costs
+//! nothing to abandon.
 
 use crate::editor::{EditorEvent, TextArea};
 use crate::field::{self, FieldKey, MONO};
@@ -22,16 +26,20 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 pub enum FileEvent {
-    /// Written to disk: the workspace reloads the graph from it.
-    Saved,
+    /// Draw the graph from this text instead of the file. Nothing is written.
+    Apply(String),
+    /// Forget the edit and go back to the file as it is on disk.
+    Revert,
     Close,
 }
 
 pub struct FilePanel {
     editor: Entity<TextArea>,
     path: Option<PathBuf>,
-    /// What was last read from or written to disk, to tell edited from not.
+    /// The file as it is on disk, to tell edited from not and to revert to.
     on_disk: String,
+    /// The text last applied to the graph, when it is not the file's.
+    applied: Option<String>,
     read_only: bool,
     find: TextEdit,
     find_origin: Rc<Cell<f32>>,
@@ -53,7 +61,7 @@ impl FilePanel {
             e
         });
         cx.subscribe(&editor, |this: &mut Self, _, event: &EditorEvent, cx| match event {
-            EditorEvent::Save => this.save(cx),
+            EditorEvent::Save => this.apply(cx),
             // Retyping invalidates the byte offsets the hits are made of.
             EditorEvent::Changed => this.refind(cx),
             EditorEvent::Submitted => {}
@@ -63,6 +71,7 @@ impl FilePanel {
             editor,
             path: None,
             on_disk: String::new(),
+            applied: None,
             read_only: true,
             find: TextEdit::default(),
             find_origin: Rc::new(Cell::new(0.0)),
@@ -86,6 +95,7 @@ impl FilePanel {
             Ok(text) => {
                 self.error = None;
                 self.on_disk = text.clone();
+                self.applied = None;
                 self.editor.update(cx, |e, cx| e.set_text(text, cx));
             }
             Err(e) => self.error = Some(format!("{e}")),
@@ -95,17 +105,34 @@ impl FilePanel {
         cx.notify();
     }
 
-    fn save(&mut self, cx: &mut Context<Self>) {
-        let (Some(path), false) = (self.path.clone(), self.read_only) else { return };
-        let text = self.editor.read(cx).text().to_string();
-        match std::fs::write(&path, &text) {
-            Ok(()) => {
-                self.on_disk = text;
-                self.error = None;
-                cx.emit(FileEvent::Saved);
-            }
-            Err(e) => self.error = Some(format!("{e}")),
+    /// ⌘S applies the buffer to the graph. It does not write the file: this
+    /// pane is a sketchpad over the schema, not an editor of it.
+    fn apply(&mut self, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
         }
+        let text = self.editor.read(cx).text().to_string();
+        self.applied = Some(text.clone());
+        self.error = None;
+        cx.emit(FileEvent::Apply(text));
+        cx.notify();
+    }
+
+    /// The workspace went back to drawing the file, so what was applied no
+    /// longer is. The buffer is left alone: the text is the reader's, and
+    /// the header's "⌘S to draw this" already says it is not on screen.
+    pub fn sketch_dropped(&mut self, cx: &mut Context<Self>) {
+        if self.applied.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Put the file back, dropping whatever was typed over it.
+    fn revert(&mut self, cx: &mut Context<Self>) {
+        let text = self.on_disk.clone();
+        self.applied = None;
+        self.editor.update(cx, |e, cx| e.set_text(text, cx));
+        cx.emit(FileEvent::Revert);
         cx.notify();
     }
 
@@ -178,6 +205,7 @@ impl FilePanel {
 
     fn header(&mut self, th: Theme, window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
         let dirty = self.is_dirty_with(cx);
+        let applied = self.applied.is_some();
         let name: SharedString = self
             .path
             .as_ref()
@@ -221,7 +249,27 @@ impl FilePanel {
                                 .flex_none()
                                 .text_size(px(10.0))
                                 .text_color(th.type_amber)
-                                .child("edited · ⌘S"),
+                                // The file is never written, so the words have
+                                // to say what the keystroke actually does.
+                                .child("⌘S to draw this"),
+                        )
+                    })
+                    .when(applied, |el| {
+                        el.child(
+                            div()
+                                .id("file-revert")
+                                .flex_none()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(th.card_border)
+                                .px(px(6.0))
+                                .py(px(2.0))
+                                .text_size(px(10.0))
+                                .text_color(th.text_muted)
+                                .cursor_pointer()
+                                .hover(|el| el.bg(th.hover_bg))
+                                .on_click(cx.listener(|this, _, _, cx| this.revert(cx)))
+                                .child("Revert to file"),
                         )
                     })
                     .child(
@@ -251,7 +299,7 @@ impl FilePanel {
                                 px(11.0),
                                 if ro { th.text_muted } else { th.type_amber },
                             ))
-                            .child(if ro { "Read only" } else { "Editing" }),
+                            .child(if ro { "Read only" } else { "Sketching" }),
                     )
                     .child(
                         div()
