@@ -25,7 +25,16 @@ use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+/// A right-click menu over the text, placed in the pane's own coordinates.
+struct Menu {
+    x: f32,
+    y: f32,
+    type_name: SharedString,
+}
+
 pub enum FileEvent {
+    /// Show this type on the canvas.
+    GoToType(String),
     /// Draw the graph from this text instead of the file. Nothing is written.
     Apply(String),
     /// Forget the edit and go back to the file as it is on disk.
@@ -48,6 +57,11 @@ pub struct FilePanel {
     active: usize,
     error: Option<String>,
     focus: FocusHandle,
+    /// The graph as currently drawn, to tell a type name from any other word.
+    model: Option<Rc<crate::model::Model>>,
+    menu: Option<Menu>,
+    /// The pane's own origin, so a window-space click can be placed inside it.
+    origin: Rc<Cell<(f32, f32)>>,
 }
 
 impl FilePanel {
@@ -65,6 +79,7 @@ impl FilePanel {
             // Retyping invalidates the byte offsets the hits are made of.
             EditorEvent::Changed => this.refind(cx),
             EditorEvent::Submitted => {}
+            EditorEvent::RightClick { offset, x, y } => this.open_menu(*offset, *x, *y, cx),
         })
         .detach();
         FilePanel {
@@ -80,7 +95,16 @@ impl FilePanel {
             active: 0,
             error: None,
             focus: cx.focus_handle(),
+            model: None,
+            menu: None,
+            origin: Rc::new(Cell::new((0.0, 0.0))),
         }
+    }
+
+    /// The workspace's current graph. Only names in it are worth offering to
+    /// jump to; everything else in the file is prose or punctuation.
+    pub fn set_model(&mut self, model: Rc<crate::model::Model>) {
+        self.model = Some(model);
     }
 
     /// Read `path` from disk. Called when the pane opens and after the
@@ -116,6 +140,26 @@ impl FilePanel {
         self.error = None;
         cx.emit(FileEvent::Apply(text));
         cx.notify();
+    }
+
+    /// Offer to jump when the click landed on a name the graph knows.
+    fn open_menu(&mut self, offset: usize, x: f32, y: f32, cx: &mut Context<Self>) {
+        let word = {
+            let text = self.editor.read(cx).text();
+            word_at(text, offset)
+        };
+        let known = word.filter(|w| {
+            self.model.as_ref().is_some_and(|m| m.index_of.contains_key(w.as_str()))
+        });
+        let (ox, oy) = self.origin.get();
+        self.menu = known.map(|w| Menu { x: x - ox, y: y - oy, type_name: w.into() });
+        cx.notify();
+    }
+
+    fn close_menu(&mut self, cx: &mut Context<Self>) {
+        if self.menu.take().is_some() {
+            cx.notify();
+        }
     }
 
     /// Put the caret on the start of 1-based `line` and scroll it into view.
@@ -397,6 +441,27 @@ impl FilePanel {
     }
 }
 
+/// The identifier `offset` falls in, if any.
+///
+/// GraphQL names are letters, digits and underscores, so the word runs out
+/// to whatever is neither. A click on a space or a brace is not on a name.
+fn word_at(text: &str, offset: usize) -> Option<String> {
+    let at = offset.min(text.len());
+    if !text.is_char_boundary(at) {
+        return None;
+    }
+    let is_name = |c: char| c.is_alphanumeric() || c == '_';
+    let start = text[..at]
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| is_name(*c))
+        .last()
+        .map(|(i, _)| i)
+        .unwrap_or(at);
+    let end = at + text[at..].chars().take_while(|c| is_name(*c)).map(char::len_utf8).sum::<usize>();
+    (start < end).then(|| text[start..end].to_string())
+}
+
 /// Byte offset where 1-based `line` starts, clamped to the end of the text.
 ///
 /// Line 0 does not exist: the parser counts from one, and anything without a
@@ -459,8 +524,10 @@ impl Render for FilePanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let th = crate::theme::current(cx, window.appearance());
         let header = self.header(th, window, cx);
+        let origin = self.origin.clone();
         div()
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .min_w_0()
@@ -468,6 +535,19 @@ impl Render for FilePanel {
             .border_l_1()
             .border_color(th.panel_border)
             .track_focus(&self.focus)
+            .child(
+                gpui::canvas(
+                    |_, _, _| (),
+                    move |bounds, _, _, _| {
+                        origin.set((
+                            f32::from(bounds.origin.x),
+                            f32::from(bounds.origin.y),
+                        ))
+                    },
+                )
+                .absolute()
+                .size_full(),
+            )
             // escape is an app-wide action binding, dispatched before any key
             // handler, so the find box can only hear it this way. Only while
             // it has something to clear.
@@ -483,7 +563,13 @@ impl Render for FilePanel {
             ))
             // The canvas is behind this pane and reads raw mouse events; a
             // press meant for the text must not also pan the graph.
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.close_menu(cx);
+                    cx.stop_propagation();
+                }),
+            )
             .child(header)
             .when_some(self.error.clone(), |el, e| {
                 el.child(
@@ -497,6 +583,44 @@ impl Render for FilePanel {
                 )
             })
             .child(div().flex_1().min_h_0().child(self.editor.clone()))
+            .when_some(self.menu.as_ref().map(|m| (m.x, m.y, m.type_name.clone())), |el, (x, y, name)| {
+                el.child(
+                    div()
+                        .absolute()
+                        .left(px(x))
+                        .top(px(y))
+                        .min_w(px(160.0))
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(th.card_border)
+                        .bg(th.chrome_bg)
+                        .py_1()
+                        .font_family(MONO)
+                        .text_size(px(12.0))
+                        .text_color(th.text)
+                        // The press that opens a menu must not also reach the
+                        // text underneath, and the one that picks an item
+                        // must not be read as "dismiss".
+                        .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
+                        .child(
+                            div()
+                                .id("file-goto-type")
+                                .px_3()
+                                .py(px(6.0))
+                                .cursor_pointer()
+                                .hover(|el| el.bg(th.hover_bg))
+                                .on_click(cx.listener({
+                                    let name = name.clone();
+                                    move |this, _, _, cx| {
+                                        this.menu = None;
+                                        cx.emit(FileEvent::GoToType(name.to_string()));
+                                        cx.notify();
+                                    }
+                                }))
+                                .child(SharedString::from(format!("Go to {name}"))),
+                        ),
+                )
+            })
     }
 }
 
@@ -555,5 +679,33 @@ mod line_tests {
             assert!(t.is_char_boundary(at), "line {line} -> {at}");
         }
         assert_eq!(line_start(t, 2), "한글\n".len());
+    }
+}
+
+#[cfg(test)]
+mod word_tests {
+    use super::*;
+
+    #[test]
+    fn word_at_reads_the_identifier_under_the_offset() {
+        let t = "  author: User!";
+        assert_eq!(word_at(t, 2).as_deref(), Some("author"));
+        assert_eq!(word_at(t, 5).as_deref(), Some("author"), "from inside it");
+        assert_eq!(word_at(t, 8).as_deref(), Some("author"), "the trailing edge");
+        assert_eq!(word_at(t, 10).as_deref(), Some("User"));
+        assert_eq!(word_at(t, 14).as_deref(), Some("User"), "the ! is not a name");
+        assert_eq!(word_at(t, 0), None, "a space is not a name");
+        assert_eq!(word_at(t, 9), None, "the colon is not a name");
+    }
+
+    #[test]
+    fn word_at_holds_on_multibyte_text() {
+        let t = "\"\"\"한글 설명\"\"\" type_이름: Post";
+        for i in 0..=t.len() {
+            // Every offset answers something or nothing, and never panics.
+            let _ = word_at(t, i);
+        }
+        let at = t.find("Post").unwrap();
+        assert_eq!(word_at(t, at + 1).as_deref(), Some("Post"));
     }
 }

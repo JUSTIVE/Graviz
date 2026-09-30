@@ -119,6 +119,10 @@ pub enum EditorEvent {
     Submitted,
     /// ⌘S. What saving means is the owner's business.
     Save,
+    /// Right-click, with the byte offset under it and where it landed in the
+    /// window. What to offer there is the owner's business too: this buffer
+    /// does not know a type name from any other word.
+    RightClick { offset: usize, x: f32, y: f32 },
 }
 
 pub struct TextArea {
@@ -526,6 +530,14 @@ impl TextArea {
         cx.notify();
     }
 
+    fn on_right_click(&mut self, ev: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(EditorEvent::RightClick {
+            offset: self.offset_at(ev.position),
+            x: f32::from(ev.position.x),
+            y: f32::from(ev.position.y),
+        });
+    }
+
     fn on_mouse_move(&mut self, ev: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         if self.dragging {
             let off = self.offset_at(ev.position);
@@ -591,6 +603,7 @@ impl Render for TextArea {
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_click))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_scroll_wheel(cx.listener(Self::on_scroll))

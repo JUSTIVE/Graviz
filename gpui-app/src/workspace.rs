@@ -258,7 +258,11 @@ impl Workspace {
         }
         let tree = cx.new(|cx| TreePanel::new(model.clone(), cx));
         let palette = cx.new(|cx| crate::palette::Palette::new(model.clone(), cx));
-        let file_panel = cx.new(crate::filepanel::FilePanel::new);
+        let file_panel = cx.new(|cx| {
+            let mut p = crate::filepanel::FilePanel::new(cx);
+            p.set_model(model.clone());
+            p
+        });
         // The Orphaned / Deprecated tab bodies work off the FULL graph, since
         // their whole point is what the reachable slice leaves out.
         let list_opts = ModelOptions { skip_layout: true, ..options.clone() };
@@ -297,6 +301,12 @@ impl Workspace {
                 crate::filepanel::FileEvent::Revert => {
                     this.sketch = None;
                     this.reload_schema(cx);
+                }
+                // The reverse of the canvas's "Go to line": from a name in
+                // the source to the card that draws it.
+                crate::filepanel::FileEvent::GoToType(name) => {
+                    let name = name.clone();
+                    this.navigate_to_type(&name, cx);
                 }
                 crate::filepanel::FileEvent::Close => {
                     this.file_panel_open = false;
@@ -505,6 +515,7 @@ impl Workspace {
         self.model = model.clone();
         self.tree.update(cx, |tree, cx| tree.set_model(model.clone(), cx));
         self.palette.update(cx, |p, _| p.set_model(model.clone()));
+        self.file_panel.update(cx, |p, _| p.set_model(model.clone()));
         let list_opts = ModelOptions { skip_layout: true, ..self.options.clone() };
         let full_model = Rc::new(build_model(
             self.full_graph.clone(),
