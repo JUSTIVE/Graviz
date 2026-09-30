@@ -82,6 +82,9 @@ pub struct GraphField {
     /// Set when this field came from the temporary overlay SDL rather than
     /// the loaded schema.
     pub is_overlay: bool,
+    /// 1-based line in the SDL this was read from; 0 when it has no source,
+    /// which is anything the overlay or a stub invented.
+    pub line: u32,
 }
 
 /// One value of an Enum node.
@@ -95,6 +98,8 @@ pub struct EnumValue {
     pub until: Option<String>,
     /// See [`GraphField::is_overlay`].
     pub is_overlay: bool,
+    /// See [`GraphField::line`].
+    pub line: u32,
 }
 
 /// A schema type rendered as a graph node.
@@ -118,6 +123,8 @@ pub struct GraphNodeData {
     pub member_of_unions: Option<Vec<String>>,
     /// Set when the whole type is new in the overlay.
     pub is_overlay: bool,
+    /// See [`GraphField::line`].
+    pub line: u32,
 }
 
 impl GraphNodeData {
@@ -135,6 +142,7 @@ impl GraphNodeData {
             interfaces: None,
             member_of_unions: None,
             is_overlay: false,
+            line: 0,
         }
     }
 }

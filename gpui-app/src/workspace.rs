@@ -280,6 +280,12 @@ impl Workspace {
             }
             e
         });
+        cx.subscribe(&canvas, |this: &mut Self, _, event: &crate::canvas::CanvasEvent, cx| {
+            match event {
+                crate::canvas::CanvasEvent::GoToLine(line) => this.goto_line(*line, cx),
+            }
+        })
+        .detach();
         cx.subscribe(&file_panel, |this: &mut Self, _, event: &crate::filepanel::FileEvent, cx| {
             match event {
                 // The pane never writes: what it hands over is text to draw
@@ -431,6 +437,24 @@ impl Workspace {
             self.canvas
                 .update(cx, |c, cx| c.navigate_to(card, row, cx));
         }
+    }
+
+    /// Show the file pane on `line`, opening it if it was closed. The pane
+    /// is where "where is this written" gets answered, so the question
+    /// brings it up rather than asking for it first.
+    fn goto_line(&mut self, line: u32, cx: &mut Context<Self>) {
+        let first_open = !self.file_panel_open;
+        self.file_panel_open = true;
+        self.file_panel_loaded = true;
+        let path = self.schema_path.clone();
+        self.file_panel.update(cx, |p, cx| {
+            if first_open {
+                p.load(&path, cx);
+            }
+            p.reveal_line(line, cx);
+        });
+        self.save_settings(cx);
+        cx.notify();
     }
 
     pub fn file_panel_open(&self) -> bool {

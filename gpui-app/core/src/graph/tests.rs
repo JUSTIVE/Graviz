@@ -36,6 +36,26 @@ fn field<'a>(n: &'a GraphNodeData, name: &str) -> &'a GraphField {
     n.fields.as_ref().unwrap().iter().find(|f| f.name == name).unwrap()
 }
 
+/// "Go to line" is only as good as these numbers, and they are counted from
+/// one, the way an editor's gutter counts.
+#[test]
+fn types_fields_and_values_carry_their_source_line() {
+    let sdl = "\ntype User {\n  id: ID!\n  name: String\n}\n\nenum Role {\n  ADMIN\n}\n";
+    let g = graph(sdl);
+    let user = node(&g, "User");
+    assert_eq!(user.line, 2);
+    assert_eq!(field(user, "id").line, 3);
+    assert_eq!(field(user, "name").line, 4);
+    let role = node(&g, "Role");
+    assert_eq!(role.line, 7);
+    assert_eq!(role.values.as_ref().unwrap()[0].line, 8);
+
+    // A described type points at its description, not at the keyword under
+    // it. That is where reading it should start, so it is left alone.
+    let g = graph("\"\"\"doc\"\"\"\ntype Post {\n  id: ID!\n}\n");
+    assert_eq!(node(&g, "Post").line, 1);
+}
+
 // ── extend-types.test.ts ───────────────────────────────────────────────────
 
 #[test]

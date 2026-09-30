@@ -53,6 +53,12 @@ struct Drag {
     moved: bool,
 }
 
+/// What the canvas asks the workspace for.
+pub enum CanvasEvent {
+    /// Show this 1-based SDL line in the file pane.
+    GoToLine(u32),
+}
+
 /// Right-click menu, anchored at the click's canvas-local position.
 #[derive(Clone, Copy)]
 struct ContextMenu {
@@ -925,6 +931,8 @@ fn run(len: usize, font: &Font, color: Hsla) -> TextRun {
     }
 }
 
+impl gpui::EventEmitter<CanvasEvent> for GraphCanvas {}
+
 impl Render for GraphCanvas {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The painted rect, once there is one: panes on either side make
@@ -1494,6 +1502,16 @@ impl Render for GraphCanvas {
                 )
             })
             .when_some(self.context_menu, |el, menu| {
+                // The most specific source line the click has: the field's
+                // when it landed on one, else the type's.
+                let card = &self.model.cards[menu.card as usize];
+                let row_line = match menu.row {
+                    Some(RowHit::Row(r)) => card.rows.get(r).map(|r| r.line).filter(|&l| l > 0),
+                    _ => None,
+                };
+                let goto = row_line
+                    .or(Some(card.line).filter(|&l| l > 0))
+                    .map(|l| (SharedString::from(format!("Go to line {l}")), l));
                 el.child(
                     div()
                         .absolute()
@@ -1542,6 +1560,25 @@ impl Render for GraphCanvas {
                                 )
                             },
                         )
+                        // Where this is written. The overlay invents rows
+                        // that were never in a file, and those have no line
+                        // to go to.
+                        .when_some(goto, |el, (label, line)| {
+                            el.child(
+                                div()
+                                    .id("ctx-goto-line")
+                                    .px_3()
+                                    .py(px(6.0))
+                                    .cursor_pointer()
+                                    .hover(|el| el.bg(th.hover_bg))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.context_menu = None;
+                                        cx.emit(CanvasEvent::GoToLine(line));
+                                        cx.notify();
+                                    }))
+                                    .child(label),
+                            )
+                        })
                         .child(
                             div()
                                 .id("ctx-copy-type-name")

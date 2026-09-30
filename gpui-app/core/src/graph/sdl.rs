@@ -224,6 +224,7 @@ fn build_nodes(doc: &ServiceDocument) -> Vec<GraphNodeData> {
             TypeKind::Scalar => GraphNodeData::new(name, NodeKind::Scalar),
         };
         node.description = description;
+        node.line = ty.pos.line as u32;
         nodes.push(node);
     }
     nodes
@@ -296,6 +297,7 @@ fn build_fields(defs: &[Positioned<FieldDefinition>]) -> Vec<GraphField> {
                 deprecation_reason: dep.reason,
                 until: dep.until,
                 is_overlay: false,
+                line: f.pos.line as u32,
             }
         })
         .collect()
@@ -320,6 +322,7 @@ fn build_input_fields(defs: &[Positioned<InputValueDefinition>]) -> Vec<GraphFie
                 deprecation_reason: dep.reason,
                 until: dep.until,
                 is_overlay: false,
+                line: f.pos.line as u32,
             }
         })
         .collect()
@@ -336,6 +339,7 @@ fn build_enum_values(defs: &[Positioned<EnumValueDefinition>]) -> Vec<EnumValue>
                 deprecation_reason: dep.reason,
                 until: dep.until,
                 is_overlay: false,
+                line: v.pos.line as u32,
             }
         })
         .collect()

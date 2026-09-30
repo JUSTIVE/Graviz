@@ -103,6 +103,8 @@ pub struct Row {
     /// Field args, for the sidebar's arity badge and hover list.
     pub args: Vec<(gpui::SharedString, gpui::SharedString)>,
     pub required_args: usize,
+    /// 1-based line in the SDL, or 0 when this row has no source to point at.
+    pub line: u32,
 }
 
 /// Blank prose is no prose — the web reads every description through
@@ -126,6 +128,8 @@ impl Row {
 
 #[derive(Debug, Clone)]
 pub struct Card {
+    /// 1-based line the type is declared on, or 0 when it has no source.
+    pub line: u32,
     /// Index into `ParsedGraph::nodes` / `Model::cards`.
     pub index: u32,
     /// Fields a filter is hiding. A card with every field hidden would
@@ -646,6 +650,7 @@ pub fn build_model(graph: ParsedGraph, schema_name: String, options: &ModelOptio
             right_w: 0.0,
             args: Vec::new(),
             required_args: 0,
+            line: 0,
         };
         // Body rows: fields, OR enum values, OR union members — never mixed
         // (the web renderer paints exactly one of these grids).
@@ -673,6 +678,7 @@ pub fn build_model(graph: ParsedGraph, schema_name: String, options: &ModelOptio
             r.deprecation_reason = f.deprecation_reason.clone();
             r.until_expired = is_until_expired(f.until.as_deref(), &options.today);
             r.is_relay = f.is_relay_connection;
+            r.line = f.line;
             r.type_color = if r.until_expired {
                 TypeColor::Expired
             } else if BUILTIN_SCALARS.contains(&f.type_name.as_str()) {
@@ -697,6 +703,7 @@ pub fn build_model(graph: ParsedGraph, schema_name: String, options: &ModelOptio
             r.description = v.description.clone();
             r.deprecation_reason = v.deprecation_reason.clone();
             r.until_expired = is_until_expired(v.until.as_deref(), &options.today);
+            r.line = v.line;
             rows.push(r);
         }
         for m in n.members.as_deref().unwrap_or(&[]) {
@@ -838,6 +845,7 @@ pub fn build_model(graph: ParsedGraph, schema_name: String, options: &ModelOptio
         }
 
         cards.push(Card {
+            line: n.line,
             hidden_rows,
             index: i as u32,
             name: n.name.clone().into(),

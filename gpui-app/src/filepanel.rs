@@ -118,6 +118,16 @@ impl FilePanel {
         cx.notify();
     }
 
+    /// Put the caret on the start of 1-based `line` and scroll it into view.
+    pub fn reveal_line(&mut self, line: u32, cx: &mut Context<Self>) {
+        let at = {
+            let text = self.editor.read(cx).text();
+            line_start(text, line)
+        };
+        self.editor.update(cx, |e, cx| e.reveal(at, cx));
+        cx.notify();
+    }
+
     /// The workspace went back to drawing the file, so what was applied no
     /// longer is. The buffer is left alone: the text is the reader's, and
     /// the header's "⌘S to draw this" already says it is not on screen.
@@ -387,6 +397,26 @@ impl FilePanel {
     }
 }
 
+/// Byte offset where 1-based `line` starts, clamped to the end of the text.
+///
+/// Line 0 does not exist: the parser counts from one, and anything without a
+/// source is marked 0 rather than pointing at the top of the file.
+fn line_start(text: &str, line: u32) -> usize {
+    if line <= 1 {
+        return 0;
+    }
+    let mut seen = 1u32;
+    for (i, c) in text.char_indices() {
+        if c == '\n' {
+            seen += 1;
+            if seen == line {
+                return i + 1;
+            }
+        }
+    }
+    text.len()
+}
+
 /// Case-insensitive hits, as byte ranges into `hay` itself.
 ///
 /// Lowercasing the whole buffer first and searching that is the obvious way
@@ -497,5 +527,33 @@ mod tests {
                 let _ = &hay[s..e];
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod line_tests {
+    use super::*;
+
+    #[test]
+    fn line_start_counts_from_one() {
+        let t = "a\nbb\n\nccc";
+        assert_eq!(line_start(t, 1), 0);
+        assert_eq!(line_start(t, 2), 2);
+        assert_eq!(line_start(t, 3), 5, "the empty line still occupies one");
+        assert_eq!(line_start(t, 4), 6);
+        // Off the end clamps rather than panicking, and line 0 is not a line.
+        assert_eq!(line_start(t, 99), t.len());
+        assert_eq!(line_start(t, 0), 0);
+        assert_eq!(line_start("", 3), 0);
+    }
+
+    #[test]
+    fn line_start_lands_on_a_char_boundary() {
+        let t = "한글\n타입 User\n{}";
+        for line in 1..=4 {
+            let at = line_start(t, line);
+            assert!(t.is_char_boundary(at), "line {line} -> {at}");
+        }
+        assert_eq!(line_start(t, 2), "한글\n".len());
     }
 }
