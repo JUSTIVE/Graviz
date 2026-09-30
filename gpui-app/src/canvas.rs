@@ -1509,9 +1509,7 @@ impl Render for GraphCanvas {
                     Some(RowHit::Row(r)) => card.rows.get(r).map(|r| r.line).filter(|&l| l > 0),
                     _ => None,
                 };
-                let goto = row_line
-                    .or(Some(card.line).filter(|&l| l > 0))
-                    .map(|l| (SharedString::from(format!("Go to line {l}")), l));
+                let goto = row_line.or(Some(card.line).filter(|&l| l > 0));
                 el.child(
                     div()
                         .absolute()
@@ -1563,7 +1561,7 @@ impl Render for GraphCanvas {
                         // Where this is written. The overlay invents rows
                         // that were never in a file, and those have no line
                         // to go to.
-                        .when_some(goto, |el, (label, line)| {
+                        .when_some(goto, |el, line| {
                             el.child(
                                 div()
                                     .id("ctx-goto-line")
@@ -1576,7 +1574,7 @@ impl Render for GraphCanvas {
                                         cx.emit(CanvasEvent::GoToLine(line));
                                         cx.notify();
                                     }))
-                                    .child(label),
+                                    .child("Go to line"),
                             )
                         })
                         .child(
