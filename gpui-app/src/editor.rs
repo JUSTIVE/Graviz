@@ -37,9 +37,13 @@ fn highlight(line: &str, th: Theme) -> Vec<(usize, gpui::Hsla)> {
     };
     let bytes = line.as_bytes();
     let mut i = 0usize;
-    while i < bytes.len() {
+    while i < line.len() {
         let rest = &line[i..];
-        let ch = bytes[i] as char;
+        // The character, not the byte. `bytes[i] as char` reads one byte as
+        // Latin-1: a Hangul syllable's first byte came out as some accented
+        // letter three bytes wide, the walk advanced by two, and the next
+        // slice cut the syllable in half and took the window with it.
+        let Some(ch) = rest.chars().next() else { break };
         if ch == '#' {
             push(line.len() - i, th.text_muted, &mut runs);
             break;
@@ -48,16 +52,18 @@ fn highlight(line: &str, th: Theme) -> Vec<(usize, gpui::Hsla)> {
             // block or single-line string (descriptions)
             let quote_len = if rest.starts_with("\"\"\"") { 3 } else { 1 };
             let mut j = i + quote_len;
-            while j < bytes.len() {
+            // Descriptions are prose, and prose here is often Korean, so the
+            // scan for the closing quote steps by characters too.
+            while let Some(c) = line.get(j..).and_then(|r| r.chars().next()) {
                 if quote_len == 3 && line[j..].starts_with("\"\"\"") {
                     j += 3;
                     break;
                 }
-                if quote_len == 1 && bytes[j] == b'"' {
+                if quote_len == 1 && c == '"' {
                     j += 1;
                     break;
                 }
-                j += 1;
+                j += c.len_utf8();
             }
             push(j.min(line.len()) - i, th.overlay_green, &mut runs);
             i = j.min(line.len());
@@ -90,6 +96,7 @@ fn highlight(line: &str, th: Theme) -> Vec<(usize, gpui::Hsla)> {
             continue;
         }
         if ch == '-' && rest.len() > 1 && !bytes[i + 1].is_ascii_digit() {
+            // `-` is one byte, so `i + 1` is a boundary whenever we are here.
             // the overlay's `-Type.field` removal marker
             push(1, th.red, &mut runs);
             i += 1;
@@ -848,6 +855,37 @@ mod tests {
             "  tags: [String!]!",
         ] {
             assert_eq!(total(line), line.len(), "line: {line:?}");
+        }
+    }
+
+    /// Typing Hangul into the editor used to take the whole window down: the
+    /// walk read one byte as a character, stepped by that character's width
+    /// rather than the real one, and the next slice landed inside a syllable.
+    /// Every line here has to be walked start to end without splitting one.
+    #[test]
+    fn highlighting_walks_multibyte_text_without_splitting_it() {
+        for line in [
+            "ㅁ",
+            "  name: String! # 이름입니다",
+            "\"\"\"커미션 타입의 이름\"\"\"",
+            "  \"한 줄 설명\" field: 타입",
+            "타입 이름 @deprecated(reason: \"쓰지 마세요\")",
+            "emoji 🎨 and 한글 mixed",
+        ] {
+            assert_eq!(total(line), line.len(), "line: {line:?}");
+        }
+    }
+
+    /// The same walk, over every prefix of a line being typed one character
+    /// at a time. An IME leaves half-formed jamo in the buffer, and those are
+    /// what the editor is asked to paint between keystrokes.
+    #[test]
+    fn highlighting_survives_a_line_being_typed() {
+        let line = "  \"\"\"한글 설명\"\"\" name: 타입!";
+        let mut prefix = String::new();
+        for c in line.chars() {
+            prefix.push(c);
+            assert_eq!(total(&prefix), prefix.len(), "prefix: {prefix:?}");
         }
     }
 
