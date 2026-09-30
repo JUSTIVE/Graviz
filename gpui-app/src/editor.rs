@@ -110,6 +110,8 @@ const PAD: f32 = 8.0;
 pub enum EditorEvent {
     Changed,
     Submitted,
+    /// ⌘S. What saving means is the owner's business.
+    Save,
 }
 
 pub struct TextArea {
@@ -124,6 +126,14 @@ pub struct TextArea {
     /// Element origin+height recorded at paint time for click mapping.
     origin: Rc<Cell<(f32, f32, f32)>>,
     pub placeholder: &'static str,
+    /// Line numbers down the left edge.
+    pub gutter: bool,
+    /// Refuse every edit. The file panel opens this way: the buffer is
+    /// somebody's schema on disk, and a stray keypress should not rewrite it.
+    pub read_only: bool,
+    /// Byte ranges the in-file search found, and which of them is current.
+    matches: Vec<(usize, usize)>,
+    active_match: usize,
 }
 
 impl TextArea {
@@ -137,7 +147,36 @@ impl TextArea {
             dragging: false,
             origin: Rc::new(Cell::new((0.0, 0.0, 0.0))),
             placeholder: "",
+            gutter: false,
+            read_only: false,
+            matches: Vec::new(),
+            active_match: 0,
         }
+    }
+
+    /// Ranges for the in-file search to paint, and which one the view should
+    /// be showing.
+    pub fn set_matches(&mut self, matches: Vec<(usize, usize)>, active: usize) {
+        self.matches = matches;
+        self.active_match = active;
+    }
+
+    /// Put the caret on `offset` and bring it into view, for "go to match".
+    pub fn reveal(&mut self, offset: usize, cx: &mut Context<Self>) {
+        self.cursor = offset.min(self.text.len());
+        self.anchor = None;
+        let viewport_h = self.origin.get().2;
+        self.ensure_cursor_visible(viewport_h);
+        cx.notify();
+    }
+
+    /// Width the line-number column needs, including its padding.
+    fn gutter_w(&self) -> f32 {
+        if !self.gutter {
+            return 0.0;
+        }
+        let digits = self.line_count().max(1).to_string().len().max(2) as f32;
+        (digits + 2.0) * FONT_PX * crate::model::MONO_ADVANCE
     }
 
     pub fn text(&self) -> &str {
@@ -282,7 +321,7 @@ impl TextArea {
 
     fn offset_at(&self, pos: Point<Pixels>) -> usize {
         let (ox, oy, _h) = self.origin.get();
-        let x = (f32::from(pos.x) - ox - PAD).max(0.0);
+        let x = (f32::from(pos.x) - ox - PAD - self.gutter_w()).max(0.0);
         let y = f32::from(pos.y) - oy - PAD + self.scroll_y;
         let line = ((y / LINE_H).floor().max(0.0)) as usize;
         let line = line.min(self.line_count().saturating_sub(1));
@@ -304,7 +343,19 @@ impl TextArea {
         // A page is whatever is on screen, less a line so the eye keeps one
         // row of context across the jump.
         let page_lines = ((viewport_h / LINE_H) as usize).saturating_sub(1).max(1);
+        // Read-only stops the keys that change text. Moving, selecting and
+        // copying all still work, which is the point of reading.
+        if self.read_only
+            && matches!(ks.key.as_str(), "enter" | "tab" | "backspace" | "delete")
+            || self.read_only && cmd && matches!(ks.key.as_str(), "v" | "x")
+        {
+            return;
+        }
         match ks.key.as_str() {
+            "s" if cmd => {
+                cx.emit(EditorEvent::Save);
+                return;
+            }
             "enter" if cmd => {
                 cx.emit(EditorEvent::Submitted);
                 return;
@@ -434,7 +485,7 @@ impl TextArea {
                 }
             }
             _ => {
-                if cmd || ks.modifiers.control {
+                if cmd || ks.modifiers.control || self.read_only {
                     return;
                 }
                 if let Some(ch) = ks.key_char.as_deref() {
@@ -511,6 +562,9 @@ impl Render for TextArea {
         let scroll_y = self.scroll_y;
         let origin = self.origin.clone();
         let placeholder: SharedString = self.placeholder.into();
+        let gutter_w = self.gutter_w();
+        let matches = self.matches.clone();
+        let active_match = self.active_match;
 
         div()
             .size_full()
@@ -534,13 +588,18 @@ impl Render for TextArea {
                             f32::from(bounds.size.height),
                         ));
                         paint_editor(
-                            &text,
-                            cursor,
-                            selection,
-                            scroll_y,
-                            focused,
-                            &placeholder,
-                            th,
+                            Painted {
+                                text: &text,
+                                cursor,
+                                selection,
+                                scroll_y,
+                                focused,
+                                placeholder: &placeholder,
+                                gutter_w,
+                                matches: &matches,
+                                active_match,
+                                th,
+                            },
                             bounds,
                             window,
                             cx,
@@ -552,21 +611,36 @@ impl Render for TextArea {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn paint_editor(
-    text: &str,
+/// Everything one paint of the buffer needs.
+struct Painted<'a> {
+    text: &'a str,
     cursor: usize,
     selection: Option<(usize, usize)>,
     scroll_y: f32,
     focused: bool,
-    placeholder: &SharedString,
+    placeholder: &'a SharedString,
+    /// Width of the line-number column; zero when there is none.
+    gutter_w: f32,
+    matches: &'a [(usize, usize)],
+    active_match: usize,
     th: Theme,
-    bounds: Bounds<Pixels>,
-    window: &mut Window,
-    cx: &mut App,
-) {
+}
+
+fn paint_editor(p: Painted, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
+    let Painted {
+        text,
+        cursor,
+        selection,
+        scroll_y,
+        focused,
+        placeholder,
+        gutter_w,
+        matches,
+        active_match,
+        th,
+    } = p;
     window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
-        let ox = f32::from(bounds.origin.x) + PAD;
+        let ox = f32::from(bounds.origin.x) + PAD + gutter_w;
         let oy = f32::from(bounds.origin.y) + PAD - scroll_y;
         let vh = f32::from(bounds.size.height);
         let mut font = gpui::font("Menlo");
@@ -622,6 +696,36 @@ fn paint_editor(
                         ));
                     }
                 }
+                // Search hits: every one tinted, the current one stronger,
+                // so the eye can see where it is among them without losing
+                // the others.
+                let cell_x = |from: usize, to: usize| {
+                    let before = crate::model::mono_cells(&text[byte..from]);
+                    let w = crate::model::mono_cells(&text[from..to]);
+                    (
+                        ox + before * FONT_PX * crate::model::MONO_ADVANCE,
+                        (w * FONT_PX * crate::model::MONO_ADVANCE).max(2.0),
+                    )
+                };
+                for (mi, &(ms, me)) in matches.iter().enumerate() {
+                    let (s0, e0) = (ms.max(byte), me.min(byte + line_len));
+                    if s0 >= e0 {
+                        continue;
+                    }
+                    let (x0, w) = cell_x(s0, e0);
+                    let color = if mi == active_match {
+                        th.type_amber.opacity(0.55)
+                    } else {
+                        th.type_amber.opacity(0.22)
+                    };
+                    window.paint_quad(fill(
+                        Bounds {
+                            origin: point(px(x0), px(top)),
+                            size: size(px(w), px(LINE_H)),
+                        },
+                        color,
+                    ));
+                }
                 if !l.is_empty() {
                     let runs: Vec<TextRun> = highlight(l, th)
                         .into_iter()
@@ -642,6 +746,30 @@ fn paint_editor(
                     );
                     let _ = line.paint(
                         point(px(ox), px(top)),
+                        px(LINE_H),
+                        TextAlign::Left,
+                        None,
+                        window,
+                        cx,
+                    );
+                }
+                if gutter_w > 0.0 {
+                    let n = SharedString::from((li + 1).to_string());
+                    let run = TextRun {
+                        len: n.len(),
+                        font: font.clone(),
+                        color: th.text_faint,
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    };
+                    let shaped = text_system.shape_line(n.clone(), px(FONT_PX), &[run], None);
+                    // Right-aligned against the text column, so the digits
+                    // line up however many of them there are.
+                    let w = n.len() as f32 * FONT_PX * crate::model::MONO_ADVANCE;
+                    let gx = ox - FONT_PX * crate::model::MONO_ADVANCE - w;
+                    let _ = shaped.paint(
+                        point(px(gx), px(top)),
                         px(LINE_H),
                         TextAlign::Left,
                         None,

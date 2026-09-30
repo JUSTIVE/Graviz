@@ -198,6 +198,8 @@ pub fn header(
     // Open schema as `(file name, directory)`, from `file_label`.
     file: Option<(SharedString, Option<SharedString>)>,
     update_badge: Option<gpui::AnyElement>,
+    // Right end of the strip: the file pane's toggle, when there is a file.
+    trailing: Option<gpui::AnyElement>,
 ) -> impl IntoElement {
     div()
         .id("titlebar")
@@ -266,9 +268,17 @@ pub fn header(
                     }),
             )
         })
-        // Drawn after the title, so on a narrow window the badge wins the
-        // overlap rather than disappearing under it.
-        .when_some(update_badge, |el, b| el.child(b))
+        // Drawn after the title, so on a narrow window these win the overlap
+        // rather than disappearing under it.
+        .child(
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap_2()
+                .when_some(update_badge, |el, b| el.child(b))
+                .when_some(trailing, |el, b| el.child(b)),
+        )
 }
 
 /// Bottom-center commit stamp (10px mono, muted at 40%).

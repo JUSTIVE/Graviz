@@ -74,6 +74,9 @@ define_icons! {
     Info => "info",
     Move => "move",
     ZoomIn => "zoom-in",
+    Lock => "lock",
+    LockOpen => "lock-open",
+    FileCode => "file-code",
 }
 
 /// Asset path of the app wordmark's logo — the compass the web app uses as

@@ -3,6 +3,7 @@ mod canvas;
 mod config;
 mod editor;
 mod field;
+mod filepanel;
 mod icons;
 mod landing;
 mod loader;

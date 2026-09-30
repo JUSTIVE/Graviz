@@ -927,8 +927,15 @@ fn run(len: usize, font: &Font, color: Hsla) -> TextRun {
 
 impl Render for GraphCanvas {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let vw = f32::from(window.viewport_size().width) - self.pane_offset_x;
-        let vh = f32::from(window.viewport_size().height);
+        // The painted rect, once there is one: panes on either side make
+        // "viewport minus the sidebar" wrong by however wide they are.
+        let (pw, ph) = self.canvas_size.get();
+        let vw = if pw > 0.0 {
+            pw
+        } else {
+            f32::from(window.viewport_size().width) - self.pane_offset_x
+        };
+        let vh = if ph > 0.0 { ph } else { f32::from(window.viewport_size().height) };
         if !self.fitted && vw > 0.0 {
             self.fit(vw, vh);
             self.fitted = true;

@@ -40,6 +40,8 @@ pub struct Settings {
     pub hide_relay: bool,
     pub sidebar_open: bool,
     pub sidebar_width: f32,
+    pub file_panel_open: bool,
+    pub file_panel_width: f32,
     pub dock_height: f32,
     pub theme_mode: crate::theme::ThemeMode,
     pub scroll_mode: ScrollMode,
@@ -49,6 +51,9 @@ pub struct Settings {
 pub const SIDEBAR_MIN_W: f32 = 260.0;
 pub const SIDEBAR_MAX_W: f32 = 720.0;
 pub const SIDEBAR_DEFAULT_W: f32 = 340.0;
+pub const FILE_MIN_W: f32 = 320.0;
+pub const FILE_MAX_W: f32 = 1100.0;
+pub const FILE_DEFAULT_W: f32 = 520.0;
 pub const DOCK_MIN_H: f32 = 160.0;
 pub const DOCK_MAX_H: f32 = 720.0;
 pub const DOCK_DEFAULT_H: f32 = 280.0;
@@ -63,6 +68,8 @@ impl Default for Settings {
             hide_relay: true,
             sidebar_open: true,
             sidebar_width: SIDEBAR_DEFAULT_W,
+            file_panel_open: false,
+            file_panel_width: FILE_DEFAULT_W,
             dock_height: DOCK_DEFAULT_H,
             theme_mode: crate::theme::ThemeMode::System,
             scroll_mode: ScrollMode::Zoom,

@@ -194,7 +194,35 @@ impl Render for Root {
             .workspace
             .as_ref()
             .map(|w| crate::shell::file_label(w.read(cx).schema_path(), home.as_deref()));
-        let header = crate::shell::header(th, file, update_badge);
+        // The file pane's toggle. It belongs to the workspace, so the strip
+        // only offers it when there is one.
+        let file_button = self.workspace.as_ref().map(|ws| {
+            let open = ws.read(cx).file_panel_open();
+            div()
+                .id("toggle-file-panel")
+                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .size(px(20.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(4.0))
+                .cursor_pointer()
+                .when(open, |el| el.bg(th.active_bg))
+                .when(!open, |el| el.hover(|el| el.bg(th.hover_bg)))
+                .on_click(cx.listener(|this: &mut Self, _, _, cx| {
+                    if let Some(ws) = this.workspace.clone() {
+                        ws.update(cx, |w, cx| w.toggle_file_panel(cx));
+                    }
+                    cx.notify();
+                }))
+                .child(crate::icons::icon(
+                    crate::icons::Icon::FileCode,
+                    px(14.0),
+                    if open { th.text } else { th.text_muted },
+                ))
+                .into_any_element()
+        });
+        let header = crate::shell::header(th, file, update_badge, file_button);
         let rail = crate::shell::rail(
             th,
             route,

@@ -73,6 +73,9 @@ pub fn init(cx: &mut App) {
 enum Splitter {
     Sidebar,
     Dock,
+    /// The file pane's left edge. It is the pane that has a width, so the
+    /// drag reads from the right of the window rather than the left.
+    File,
 }
 
 /// A 5px grab strip on a pane's edge. It only records which splitter went
@@ -85,11 +88,16 @@ fn splitter(
     active: bool,
     cx: &mut Context<Workspace>,
 ) -> impl IntoElement {
-    let vertical = matches!(which, Splitter::Sidebar);
+    let vertical = !matches!(which, Splitter::Dock);
     div()
         .id(id)
         .absolute()
-        .when(vertical, |el| el.top_0().bottom_0().right(px(-2.0)).w(px(5.0)))
+        .when(matches!(which, Splitter::Sidebar), |el| {
+            el.top_0().bottom_0().right(px(-2.0)).w(px(5.0))
+        })
+        .when(matches!(which, Splitter::File), |el| {
+            el.top_0().bottom_0().left(px(-2.0)).w(px(5.0))
+        })
         .when(!vertical, |el| el.left_0().right_0().top(px(-2.0)).h(px(5.0)))
         .cursor(if vertical {
             gpui::CursorStyle::ResizeLeftRight
@@ -121,6 +129,11 @@ pub struct Workspace {
     /// root because choosing a hit has to reach the canvas.
     palette: Entity<crate::palette::Palette>,
     palette_open: bool,
+    file_panel: Entity<crate::filepanel::FilePanel>,
+    file_panel_open: bool,
+    /// The pane reads the file the first time it is shown, not before.
+    file_panel_loaded: bool,
+    file_panel_width: f32,
     /// Set when the palette closes: the keyboard has to come back here, or
     /// the focused node is one that no longer exists and every shortcut on
     /// this workspace stops answering.
@@ -242,6 +255,7 @@ impl Workspace {
         }
         let tree = cx.new(|cx| TreePanel::new(model.clone(), cx));
         let palette = cx.new(|cx| crate::palette::Palette::new(model.clone(), cx));
+        let file_panel = cx.new(crate::filepanel::FilePanel::new);
         // The Orphaned / Deprecated tab bodies work off the FULL graph, since
         // their whole point is what the reachable slice leaves out.
         let list_opts = ModelOptions { skip_layout: true, ..options.clone() };
@@ -263,6 +277,19 @@ impl Workspace {
             }
             e
         });
+        cx.subscribe(&file_panel, |this: &mut Self, _, event: &crate::filepanel::FileEvent, cx| {
+            match event {
+                // The file on disk is the graph's source, so a save is a
+                // rebuild.
+                crate::filepanel::FileEvent::Saved => this.reload_from_disk(cx),
+                crate::filepanel::FileEvent::Close => {
+                    this.file_panel_open = false;
+                    this.save_settings(cx);
+                    cx.notify();
+                }
+            }
+        })
+        .detach();
         cx.subscribe(&palette, |this: &mut Self, _, event: &crate::palette::PaletteEvent, cx| {
             match event {
                 crate::palette::PaletteEvent::Select { node_index, row } => {
@@ -348,6 +375,12 @@ impl Workspace {
             root_override: None,
             tree,
             palette,
+            file_panel,
+            // Debug: GRAVIZ_FILE=<query> opens the pane on that search.
+            file_panel_open: settings.file_panel_open
+                || std::env::var("GRAVIZ_FILE").is_ok(),
+            file_panel_loaded: false,
+            file_panel_width: settings.file_panel_width.clamp(config::FILE_MIN_W, config::FILE_MAX_W),
             palette_open: std::env::var("GRAVIZ_PALETTE").is_ok(),
             reclaim_focus: false,
             orphan_panel,
@@ -389,6 +422,23 @@ impl Workspace {
         }
     }
 
+    pub fn file_panel_open(&self) -> bool {
+        self.file_panel_open
+    }
+
+    /// Show or hide the file pane, reading the file in on the way up so it
+    /// is the text on disk and not a memory of it.
+    pub fn toggle_file_panel(&mut self, cx: &mut Context<Self>) {
+        self.file_panel_open = !self.file_panel_open;
+        if self.file_panel_open {
+            self.file_panel_loaded = true;
+            let path = self.schema_path.clone();
+            self.file_panel.update(cx, |p, cx| p.load(&path, cx));
+        }
+        self.save_settings(cx);
+        cx.notify();
+    }
+
     fn save_settings(&self, cx: &gpui::App) {
         config::save_settings(&config::Settings {
             show_descriptions: self.options.show_descriptions,
@@ -398,6 +448,8 @@ impl Workspace {
             hide_relay: self.hide_relay,
             sidebar_open: self.sidebar_open,
             sidebar_width: self.sidebar_width,
+            file_panel_open: self.file_panel_open,
+            file_panel_width: self.file_panel_width,
             dock_height: self.dock_height,
             // Both of these live in the settings page, not on this toolbar.
             // They are read back from their globals because this rewrites the
@@ -1474,6 +1526,18 @@ impl Render for Workspace {
             })
         };
 
+        if self.file_panel_open && !self.file_panel_loaded {
+            self.file_panel_loaded = true;
+            let path = self.schema_path.clone();
+            self.file_panel.update(cx, |p, cx| {
+                p.load(&path, cx);
+                if let Ok(q) = std::env::var("GRAVIZ_FILE") {
+                    if !q.is_empty() && q != "1" {
+                        p.debug_find(q, cx);
+                    }
+                }
+            });
+        }
         if self.reclaim_focus {
             self.reclaim_focus = false;
             window.focus(&self.focus, cx);
@@ -1513,6 +1577,11 @@ impl Render for Workspace {
                             .clamp(config::SIDEBAR_MIN_W, config::SIDEBAR_MAX_W);
                         let w = this.sidebar_width;
                         this.canvas.update(cx, |c, cx| c.set_pane_offset(w, cx));
+                    }
+                    Splitter::File => {
+                        let vw = f32::from(window.viewport_size().width);
+                        this.file_panel_width = (vw - f32::from(ev.position.x))
+                            .clamp(config::FILE_MIN_W, config::FILE_MAX_W.min(vw * 0.8));
                     }
                     Splitter::Dock => {
                         let vh = f32::from(window.viewport_size().height);
@@ -1663,6 +1732,12 @@ impl Render for Workspace {
                         div()
                             .flex_1()
                             .min_h_0()
+                            .flex()
+                            .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
                             .relative()
                             // Cached: sidebar/dock/tab/hover animations here
                             // are otherwise enough to re-render the whole
@@ -1703,6 +1778,27 @@ impl Render for Workspace {
                                             Icon::PanelLeftOpen,
                                             px(16.0),
                                             th.text_muted,
+                                        )),
+                                )
+                            }),
+                            )
+                            // The file pane is the canvas's sibling, not
+                            // something floating over it: both are views of
+                            // the same schema and each gives the other room.
+                            .when(self.file_panel_open, |el| {
+                                el.child(
+                                    div()
+                                        .flex_none()
+                                        .h_full()
+                                        .w(px(self.file_panel_width))
+                                        .relative()
+                                        .child(self.file_panel.clone())
+                                        .child(splitter(
+                                            "split-file",
+                                            Splitter::File,
+                                            th,
+                                            self.resizing == Some(Splitter::File),
+                                            cx,
                                         )),
                                 )
                             }),
