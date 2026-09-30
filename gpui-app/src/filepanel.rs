@@ -119,17 +119,9 @@ impl FilePanel {
 
     /// Every case-insensitive hit for the find box, in byte ranges.
     fn refind(&mut self, cx: &mut Context<Self>) {
-        let needle = self.find.text.to_lowercase();
         self.matches.clear();
-        if !needle.is_empty() {
-            let hay = self.editor.read(cx).text().to_lowercase();
-            let mut from = 0usize;
-            while let Some(i) = hay[from..].find(&needle) {
-                let s = from + i;
-                self.matches.push((s, s + needle.len()));
-                // Overlapping hits would stack bands on the same glyphs.
-                from = s + needle.len().max(1);
-            }
+        if !self.find.text.is_empty() {
+            self.matches = find_all(self.editor.read(cx).text(), &self.find.text);
         }
         self.active = self.active.min(self.matches.len().saturating_sub(1));
         let (m, a) = (self.matches.clone(), self.active);
@@ -346,6 +338,36 @@ impl FilePanel {
     }
 }
 
+/// Case-insensitive hits, as byte ranges into `hay` itself.
+///
+/// Lowercasing the whole buffer first and searching that is the obvious way
+/// and a trap: `to_lowercase` can change a string's length (`İ` is two bytes,
+/// its lowercase is three), and every offset past such a character then
+/// points somewhere else in the original. Painting one slices a character in
+/// half, which is a panic, which is the whole window gone. Comparing in
+/// place keeps the offsets honest.
+fn find_all(hay: &str, needle: &str) -> Vec<(usize, usize)> {
+    let n = needle.len();
+    let mut out = Vec::new();
+    if n == 0 || n > hay.len() {
+        return out;
+    }
+    let mut i = 0usize;
+    while i + n <= hay.len() {
+        if hay.is_char_boundary(i)
+            && hay.is_char_boundary(i + n)
+            && hay[i..i + n].eq_ignore_ascii_case(needle)
+        {
+            out.push((i, i + n));
+            // Overlapping hits would stack bands on the same glyphs.
+            i += n;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
 impl Focusable for FilePanel {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus.clone()
@@ -396,5 +418,35 @@ impl Render for FilePanel {
                 )
             })
             .child(div().flex_1().min_h_0().p_1().child(self.editor.clone()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn find_all_reports_ranges_into_the_original_text() {
+        let hay = "type Post { post: Post }";
+        assert_eq!(find_all(hay, "post"), vec![(5, 9), (12, 16), (18, 22)]);
+        for (s, e) in find_all(hay, "post") {
+            assert_eq!(hay[s..e].to_lowercase(), "post");
+        }
+        assert!(find_all(hay, "").is_empty());
+        assert!(find_all("", "post").is_empty());
+    }
+
+    #[test]
+    fn find_all_never_cuts_a_character_in_half() {
+        // The lowercase of `İ` is longer than `İ` itself, so a search over a
+        // lowercased copy would hand back offsets that land mid-character in
+        // this string. Every range here has to be sliceable as it stands.
+        let hay = "İstanbul 한글 type User { İd: ID }";
+        for needle in ["d", "한", "type", "İ", "user"] {
+            for (s, e) in find_all(hay, needle) {
+                assert!(hay.is_char_boundary(s) && hay.is_char_boundary(e), "{needle}");
+                let _ = &hay[s..e];
+            }
+        }
     }
 }

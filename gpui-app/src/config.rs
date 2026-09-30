@@ -111,6 +111,11 @@ pub fn settings_path() -> Option<PathBuf> {
     Some(dir()?.join("settings.json"))
 }
 
+/// Where panics are appended, for a crash nobody was watching a terminal for.
+pub fn panic_log_path() -> Option<PathBuf> {
+    Some(dir()?.join("panic.log"))
+}
+
 pub fn load_settings() -> Settings {
     read_json("settings.json").unwrap_or_default()
 }

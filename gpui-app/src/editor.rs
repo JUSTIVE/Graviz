@@ -678,7 +678,9 @@ fn paint_editor(p: Painted, bounds: Bounds<Pixels>, window: &mut Window, cx: &mu
                 if let Some((s, e)) = selection {
                     let ls = s.max(byte);
                     let le = e.min(byte + line_len);
-                    if ls < le || (s <= byte && e > byte + line_len) {
+                    let safe = text.is_char_boundary(ls.max(byte))
+                        && text.is_char_boundary(le.max(ls));
+                    if safe && (ls < le || (s <= byte && e > byte + line_len)) {
                         // Cells, not characters: a Hangul or CJK glyph is two
                         // columns wide, so counting characters puts the
                         // selection box and the caret in the wrong place on
@@ -709,7 +711,11 @@ fn paint_editor(p: Painted, bounds: Bounds<Pixels>, window: &mut Window, cx: &mu
                 };
                 for (mi, &(ms, me)) in matches.iter().enumerate() {
                     let (s0, e0) = (ms.max(byte), me.min(byte + line_len));
-                    if s0 >= e0 {
+                    // A range from before the last edit can point anywhere,
+                    // including into the middle of a character. Slicing one
+                    // panics, and a panic in a paint takes the window with
+                    // it, so an impossible band is simply not drawn.
+                    if s0 >= e0 || !text.is_char_boundary(s0) || !text.is_char_boundary(e0) {
                         continue;
                     }
                     let (x0, w) = cell_x(s0, e0);
@@ -778,7 +784,11 @@ fn paint_editor(p: Painted, bounds: Bounds<Pixels>, window: &mut Window, cx: &mu
                     );
                 }
                 // caret
-                if focused && cursor >= byte && cursor <= byte + line_len {
+                if focused
+                    && cursor >= byte
+                    && cursor <= byte + line_len
+                    && text.is_char_boundary(cursor)
+                {
                     let cols = crate::model::mono_cells(&text[byte..cursor]);
                     let x = ox + cols * FONT_PX * crate::model::MONO_ADVANCE;
                     window.paint_quad(fill(

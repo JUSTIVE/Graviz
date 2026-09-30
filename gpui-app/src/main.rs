@@ -28,6 +28,41 @@ use gpui::{
 use root::Root;
 
 actions!(graviz, [Quit]);
+
+/// Append panics to `panic.log` beside the settings, with a backtrace.
+fn install_panic_log() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let at = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "?".into());
+        let trace = std::backtrace::Backtrace::force_capture();
+        let line = format!(
+            "\n=== {} panic at {at}\n{info}\n{trace}\n",
+            chrono_stamp()
+        );
+        if let Some(path) = config::panic_log_path() {
+            use std::io::Write;
+            if let Ok(mut f) =
+                std::fs::OpenOptions::new().create(true).append(true).open(path)
+            {
+                let _ = f.write_all(line.as_bytes());
+            }
+        }
+        eprintln!("{line}");
+        prev(info);
+    }));
+}
+
+/// Seconds since the epoch. A real clock would mean a dependency, and what
+/// this has to answer is only "which run was this".
+fn chrono_stamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 use std::path::PathBuf;
 
 fn main() {
@@ -64,6 +99,12 @@ fn main() {
         );
         (loaded, path, overlay_text)
     });
+
+    // A panic inside a GUI process leaves nothing behind: no terminal is
+    // watching stderr, and an unwind out of the render loop takes the window
+    // with it. Write it next to the settings so the next report comes with
+    // the reason attached.
+    install_panic_log();
 
     #[cfg(target_os = "macos")]
     selfshot::arm_if_requested();
