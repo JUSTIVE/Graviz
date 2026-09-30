@@ -403,9 +403,10 @@ impl Workspace {
             palette,
             file_panel,
             sketch: None,
-            // Debug: GRAVIZ_FILE=<query> opens the pane on that search.
-            file_panel_open: settings.file_panel_open
-                || std::env::var("GRAVIZ_FILE").is_ok(),
+            // Every launch starts with the graph alone. The pane is for a
+            // question you are asking now, not a shape the window keeps.
+            // Debug: GRAVIZ_FILE=<query> opens it on that search.
+            file_panel_open: std::env::var("GRAVIZ_FILE").is_ok(),
             file_panel_loaded: false,
             file_panel_width: settings.file_panel_width.clamp(config::FILE_MIN_W, config::FILE_MAX_W),
             palette_open: std::env::var("GRAVIZ_PALETTE").is_ok(),
@@ -493,7 +494,6 @@ impl Workspace {
             hide_relay: self.hide_relay,
             sidebar_open: self.sidebar_open,
             sidebar_width: self.sidebar_width,
-            file_panel_open: self.file_panel_open,
             file_panel_width: self.file_panel_width,
             dock_height: self.dock_height,
             // Both of these live in the settings page, not on this toolbar.

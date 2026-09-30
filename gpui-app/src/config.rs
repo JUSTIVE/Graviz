@@ -40,7 +40,8 @@ pub struct Settings {
     pub hide_relay: bool,
     pub sidebar_open: bool,
     pub sidebar_width: f32,
-    pub file_panel_open: bool,
+    /// Only the width is remembered. Whether the pane was up is not a
+    /// layout choice but a thing you were doing, and it is over.
     pub file_panel_width: f32,
     pub dock_height: f32,
     pub theme_mode: crate::theme::ThemeMode,
@@ -68,7 +69,6 @@ impl Default for Settings {
             hide_relay: true,
             sidebar_open: true,
             sidebar_width: SIDEBAR_DEFAULT_W,
-            file_panel_open: false,
             file_panel_width: FILE_DEFAULT_W,
             dock_height: DOCK_DEFAULT_H,
             theme_mode: crate::theme::ThemeMode::System,
