@@ -131,6 +131,11 @@ pub struct TextArea {
     /// Refuse every edit. The file panel opens this way: the buffer is
     /// somebody's schema on disk, and a stray keypress should not rewrite it.
     pub read_only: bool,
+    /// Paint it as a surface rather than a field: the page's own background,
+    /// flush to its pane, with no rounded box around it. A full-height code
+    /// view is a place you look at, not a control you fill in, and the
+    /// deepest colour is what makes the syntax colours carry.
+    pub surface: bool,
     /// Byte ranges the in-file search found, and which of them is current.
     matches: Vec<(usize, usize)>,
     active_match: usize,
@@ -149,6 +154,7 @@ impl TextArea {
             placeholder: "",
             gutter: false,
             read_only: false,
+            surface: false,
             matches: Vec::new(),
             active_match: 0,
         }
@@ -568,10 +574,13 @@ impl Render for TextArea {
 
         div()
             .size_full()
-            .rounded_md()
-            .border_1()
-            .border_color(if focused { th.accent } else { th.card_border })
-            .bg(th.input_bg)
+            .when(!self.surface, |el| {
+                el.rounded_md()
+                    .border_1()
+                    .border_color(if focused { th.accent } else { th.card_border })
+                    .bg(th.input_bg)
+            })
+            .when(self.surface, |el| el.bg(th.bg))
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))

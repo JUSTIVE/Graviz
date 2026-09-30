@@ -48,6 +48,7 @@ impl FilePanel {
             let mut e = TextArea::new(cx);
             e.gutter = true;
             e.read_only = true;
+            e.surface = true;
             e.placeholder = "No file open.";
             e
         });
@@ -417,7 +418,7 @@ impl Render for FilePanel {
                         .child(SharedString::from(e)),
                 )
             })
-            .child(div().flex_1().min_h_0().p_1().child(self.editor.clone()))
+            .child(div().flex_1().min_h_0().child(self.editor.clone()))
     }
 }
 
