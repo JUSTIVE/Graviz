@@ -577,12 +577,6 @@ fn char_cells(c: char) -> f32 {
     }
 }
 
-/// Monospace cells `text` occupies — the same measure `mono_w` scales, for
-/// callers that work in columns rather than pixels.
-pub fn mono_cells(text: &str) -> f32 {
-    text.chars().map(char_cells).sum()
-}
-
 /// Width of `text` at `font_px` in the card's monospace face.
 pub fn mono_w(text: &str, font_px: f32) -> f32 {
     text.chars().map(char_cells).sum::<f32>() * font_px * MONO_ADVANCE

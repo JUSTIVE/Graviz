@@ -270,28 +270,6 @@ impl TextArea {
         (line, line_start, col)
     }
 
-    /// Byte offset of the glyph nearest `cells` columns into `line`.
-    fn offset_for_line_cells(&self, line: usize, cells: f32) -> usize {
-        let mut start = 0usize;
-        for (i, l) in self.text.split('\n').enumerate() {
-            if i == line {
-                let mut off = start;
-                let mut acc = 0.0f32;
-                for c in l.chars() {
-                    let w = crate::model::mono_cells(&c.to_string());
-                    if acc + w / 2.0 >= cells {
-                        return off;
-                    }
-                    acc += w;
-                    off += c.len_utf8();
-                }
-                return off;
-            }
-            start += l.len() + 1;
-        }
-        self.text.len()
-    }
-
     fn offset_for_line_col(&self, line: usize, col: usize) -> usize {
         let mut start = 0usize;
         for (i, l) in self.text.split('\n').enumerate() {
@@ -336,16 +314,32 @@ impl TextArea {
         self.scroll_y = self.scroll_y.max(0.0);
     }
 
-    fn offset_at(&self, pos: Point<Pixels>) -> usize {
+    fn offset_at(&self, pos: Point<Pixels>, window: &Window) -> usize {
         let (ox, oy, _h) = self.origin.get();
         let x = (f32::from(pos.x) - ox - PAD - self.gutter_w()).max(0.0);
         let y = f32::from(pos.y) - oy - PAD + self.scroll_y;
         let line = ((y / LINE_H).floor().max(0.0)) as usize;
         let line = line.min(self.line_count().saturating_sub(1));
-        // Walk the line accumulating cell widths so a click lands on the
-        // glyph under the cursor, not `x / advance` characters along.
-        let want = x / (FONT_PX * crate::model::MONO_ADVANCE);
-        self.offset_for_line_cells(line, want)
+        // Ask the same shaping that drew the line where `x` falls, so the
+        // click and the caret agree about which glyph that is. Measuring in
+        // monospace cells disagrees with them on any text Menlo cannot draw.
+        let start = self.offset_for_line_col(line, 0);
+        let text = self.text.split('\n').nth(line).unwrap_or("");
+        if text.is_empty() {
+            return start;
+        }
+        let run = TextRun {
+            len: text.len(),
+            font: gpui::font("Menlo"),
+            color: gpui::black(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let shaped =
+            window.text_system().shape_line(SharedString::from(text.to_string()), px(FONT_PX), &[run], None);
+        let within = shaped.index_for_x(px(x)).unwrap_or(text.len());
+        start + within
     }
 
     fn on_key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -523,24 +517,24 @@ impl TextArea {
 
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus, cx);
-        let off = self.offset_at(ev.position);
+        let off = self.offset_at(ev.position, window);
         self.anchor = None;
         self.cursor = off;
         self.dragging = true;
         cx.notify();
     }
 
-    fn on_right_click(&mut self, ev: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_right_click(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         cx.emit(EditorEvent::RightClick {
-            offset: self.offset_at(ev.position),
+            offset: self.offset_at(ev.position, window),
             x: f32::from(ev.position.x),
             y: f32::from(ev.position.y),
         });
     }
 
-    fn on_mouse_move(&mut self, ev: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_move(&mut self, ev: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.dragging {
-            let off = self.offset_at(ev.position);
+            let off = self.offset_at(ev.position, window);
             if self.anchor.is_none() {
                 self.anchor = Some(self.cursor);
             }
@@ -703,6 +697,37 @@ fn paint_editor(p: Painted, bounds: Bounds<Pixels>, window: &mut Window, cx: &mu
             let line_len = l.len();
             if top + LINE_H >= f32::from(bounds.origin.y) && top <= f32::from(bounds.origin.y) + vh
             {
+                // Shape the line once, then ask the shaped line where each
+                // byte sits. Counting monospace cells was close enough while
+                // every glyph came out of Menlo, but Menlo has no Hangul:
+                // those fall back to another face whose advance is its own
+                // business, and the caret drifted a little further right with
+                // every syllable.
+                let runs: Vec<TextRun> = highlight(l, th)
+                    .into_iter()
+                    .map(|(len, color)| TextRun {
+                        len,
+                        font: font.clone(),
+                        color,
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    })
+                    .collect();
+                let shaped = (!l.is_empty()).then(|| {
+                    text_system.shape_line(
+                        SharedString::from(l.to_string()),
+                        px(FONT_PX),
+                        &runs,
+                        None,
+                    )
+                });
+                let x_at = |byte_in_line: usize| -> f32 {
+                    shaped
+                        .as_ref()
+                        .map(|s| ox + f32::from(s.x_for_index(byte_in_line.min(line_len))))
+                        .unwrap_or(ox)
+                };
                 // selection band for this line
                 if let Some((s, e)) = selection {
                     let ls = s.max(byte);
@@ -710,14 +735,8 @@ fn paint_editor(p: Painted, bounds: Bounds<Pixels>, window: &mut Window, cx: &mu
                     let safe = text.is_char_boundary(ls.max(byte))
                         && text.is_char_boundary(le.max(ls));
                     if safe && (ls < le || (s <= byte && e > byte + line_len)) {
-                        // Cells, not characters: a Hangul or CJK glyph is two
-                        // columns wide, so counting characters puts the
-                        // selection box and the caret in the wrong place on
-                        // any line that is not pure ASCII.
-                        let cols_before = crate::model::mono_cells(&text[byte..ls.max(byte)]);
-                        let cols_sel = crate::model::mono_cells(&text[ls.max(byte)..le.max(ls)]);
-                        let x0 = ox + cols_before * FONT_PX * crate::model::MONO_ADVANCE;
-                        let w = (cols_sel * FONT_PX * crate::model::MONO_ADVANCE).max(4.0);
+                        let x0 = x_at(ls.max(byte) - byte);
+                        let w = (x_at(le.max(ls) - byte) - x0).max(4.0);
                         window.paint_quad(fill(
                             Bounds {
                                 origin: point(px(x0), px(top)),
@@ -731,12 +750,8 @@ fn paint_editor(p: Painted, bounds: Bounds<Pixels>, window: &mut Window, cx: &mu
                 // so the eye can see where it is among them without losing
                 // the others.
                 let cell_x = |from: usize, to: usize| {
-                    let before = crate::model::mono_cells(&text[byte..from]);
-                    let w = crate::model::mono_cells(&text[from..to]);
-                    (
-                        ox + before * FONT_PX * crate::model::MONO_ADVANCE,
-                        (w * FONT_PX * crate::model::MONO_ADVANCE).max(2.0),
-                    )
+                    let x0 = x_at(from - byte);
+                    (x0, (x_at(to - byte) - x0).max(2.0))
                 };
                 for (mi, &(ms, me)) in matches.iter().enumerate() {
                     let (s0, e0) = (ms.max(byte), me.min(byte + line_len));
@@ -761,24 +776,7 @@ fn paint_editor(p: Painted, bounds: Bounds<Pixels>, window: &mut Window, cx: &mu
                         color,
                     ));
                 }
-                if !l.is_empty() {
-                    let runs: Vec<TextRun> = highlight(l, th)
-                        .into_iter()
-                        .map(|(len, color)| TextRun {
-                            len,
-                            font: font.clone(),
-                            color,
-                            background_color: None,
-                            underline: None,
-                            strikethrough: None,
-                        })
-                        .collect();
-                    let line = text_system.shape_line(
-                        SharedString::from(l.to_string()),
-                        px(FONT_PX),
-                        &runs,
-                        None,
-                    );
+                if let Some(line) = shaped.as_ref() {
                     let _ = line.paint(
                         point(px(ox), px(top)),
                         px(LINE_H),
@@ -818,8 +816,7 @@ fn paint_editor(p: Painted, bounds: Bounds<Pixels>, window: &mut Window, cx: &mu
                     && cursor <= byte + line_len
                     && text.is_char_boundary(cursor)
                 {
-                    let cols = crate::model::mono_cells(&text[byte..cursor]);
-                    let x = ox + cols * FONT_PX * crate::model::MONO_ADVANCE;
+                    let x = x_at(cursor - byte);
                     window.paint_quad(fill(
                         Bounds {
                             origin: point(px(x), px(top + 1.0)),
@@ -837,15 +834,6 @@ fn paint_editor(p: Painted, bounds: Bounds<Pixels>, window: &mut Window, cx: &mu
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_click_lands_on_the_glyph_under_it_in_a_cjk_line() {
-        // "가나다" is three glyphs but six columns. A click four columns in
-        // belongs on the third glyph, not the fifth character (there is none).
-        let cells = |s: &str| crate::model::mono_cells(s);
-        assert_eq!(cells("가나다"), 6.0);
-        assert_eq!(cells("abc"), 3.0);
-    }
 
     fn th() -> Theme {
         crate::theme::theme(gpui::WindowAppearance::Dark)

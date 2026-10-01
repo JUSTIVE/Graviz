@@ -290,7 +290,8 @@ impl Render for Palette {
                                     line_h: LINE_H,
                                     origin: self.origin.clone(),
                                 },
-                                cx,
+                                window,
+                        cx,
                                 |this, offset, cx| {
                                     this.query.move_cursor(offset, false);
                                     cx.notify();

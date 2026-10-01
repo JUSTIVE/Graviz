@@ -12,7 +12,7 @@
 
 use crate::field::{self, FieldKey};
 use crate::icons::{icon, Icon};
-use crate::model::{mono_w, Model, RowKind};
+use crate::model::{Model, RowKind};
 use crate::textedit::TextEdit;
 use crate::theme::Theme;
 use crate::workspace::kind_badge;
@@ -361,7 +361,13 @@ impl TreePanel {
 
     // ---- 1. search input -------------------------------------------------
 
-    fn render_search(&self, th: Theme, focused: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn render_search(
+        &self,
+        th: Theme,
+        focused: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let query = self.search.text.clone();
         let empty = query.is_empty();
         let text: SharedString = if empty {
@@ -369,12 +375,32 @@ impl TreePanel {
         } else {
             query.clone().into()
         };
-        // The caret and the selection band are placed by measuring the text
-        // to their left, which is exact because the box is monospaced.
-        let caret_x = mono_w(&query[..self.search.cursor], SEARCH_FONT_PX);
-        let selection = self.search.selection().map(|(s, e)| {
-            (mono_w(&query[..s], SEARCH_FONT_PX), mono_w(&query[s..e], SEARCH_FONT_PX))
+        // Measured by the text system, not counted in monospace cells: a
+        // Korean query is drawn in a fallback face whose advance is not
+        // Menlo's, and the caret used to drift off the text it belongs to.
+        let shaped = (!empty).then(|| {
+            let run = gpui::TextRun {
+                len: query.len(),
+                font: gpui::font(MONO),
+                color: th.text,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            window.text_system().shape_line(
+                SharedString::from(query.clone()),
+                px(SEARCH_FONT_PX),
+                &[run],
+                None,
+            )
         });
+        let x_at = |i: usize| -> f32 {
+            shaped.as_ref().map(|s| f32::from(s.x_for_index(i.min(query.len())))).unwrap_or(0.0)
+        };
+        let caret_x = x_at(self.search.cursor);
+        let selection = self.search.selection().map(|(s, e)| (x_at(s), x_at(e) - x_at(s)));
+        let hit_shaped = shaped.clone();
+        let hit_len = query.len();
         let origin = self.search_origin.clone();
         div()
             .flex_none()
@@ -428,9 +454,14 @@ impl TreePanel {
                             )
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(|this, ev: &gpui::MouseDownEvent, _, cx| {
+                                cx.listener(move |this, ev: &gpui::MouseDownEvent, _, cx| {
                                     let x = f32::from(ev.position.x) - this.search_origin.get();
-                                    let to = field::offset_for_x(&this.search.text, x, SEARCH_FONT_PX);
+                                    let to = hit_shaped
+                                        .as_ref()
+                                        .map(|s| {
+                                            s.index_for_x(px(x.max(0.0))).unwrap_or(hit_len)
+                                        })
+                                        .unwrap_or(0);
                                     this.search.move_cursor(to, false);
                                     cx.notify();
                                 }),
@@ -1493,7 +1524,7 @@ impl Render for TreePanel {
                     }
                 }),
             )
-            .child(self.render_search(th, focused, cx));
+            .child(self.render_search(th, focused, window, cx));
 
         if show_history {
             root = root.child(self.render_history(th, cx));

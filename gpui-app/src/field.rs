@@ -7,10 +7,9 @@
 //! caret and selection over monospaced text. Both surfaces need exactly that
 //! and nothing else, so it lives here rather than twice.
 
-use crate::model::mono_w;
 use crate::textedit::TextEdit;
 use crate::theme::Theme;
-use gpui::{div, prelude::*, px, ClipboardItem, KeyDownEvent, MouseButton, SharedString};
+use gpui::{div, prelude::*, px, ClipboardItem, KeyDownEvent, MouseButton, SharedString, Window};
 use std::cell::Cell;
 use std::rc::Rc;
 
@@ -172,21 +171,6 @@ pub fn key<T: 'static>(
     }
 }
 
-/// Byte offset whose caret position sits closest to `x`, measured in pixels
-/// from the start of the text. Only char boundaries are candidates, so the
-/// caret can never land inside a multi-byte glyph.
-pub fn offset_for_x(text: &str, x: f32, font_px: f32) -> usize {
-    text.char_indices()
-        .map(|(i, _)| i)
-        .chain(std::iter::once(text.len()))
-        .min_by(|&a, &b| {
-            let da = (mono_w(&text[..a], font_px) - x).abs();
-            let db = (mono_w(&text[..b], font_px) - x).abs();
-            da.total_cmp(&db)
-        })
-        .unwrap_or(0)
-}
-
 pub struct InputProps<'a> {
     pub th: Theme,
     pub edit: &'a TextEdit,
@@ -205,6 +189,7 @@ pub struct InputProps<'a> {
 /// expected to move the owner's caret there.
 pub fn input<T: 'static>(
     props: InputProps,
+    window: &Window,
     cx: &mut gpui::Context<T>,
     on_click: impl Fn(&mut T, usize, &mut gpui::Context<T>) + 'static,
 ) -> impl IntoElement {
@@ -213,15 +198,36 @@ pub fn input<T: 'static>(
     let empty = query.is_empty();
     let text: SharedString =
         if empty { placeholder.into() } else { query.clone().into() };
-    // The caret and the selection band are placed by measuring the text to
-    // their left, which is exact because the box is monospaced.
-    let caret_x = mono_w(&query[..edit.cursor], font_px);
-    let selection = edit
-        .selection()
-        .map(|(s, e)| (mono_w(&query[..s], font_px), mono_w(&query[s..e], font_px)));
+    // The caret and the selection band are placed by asking the text system
+    // where each byte landed. Measuring monospace cells was close enough
+    // until the text stopped being monospace: Menlo has no Hangul, those
+    // glyphs come from a fallback face with its own advance, and the caret
+    // drifted further off with every syllable.
+    let shaped = (!empty).then(|| {
+        let run = gpui::TextRun {
+            len: query.len(),
+            font: gpui::font(MONO),
+            color: th.text,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        window.text_system().shape_line(
+            SharedString::from(query.clone()),
+            px(font_px),
+            &[run],
+            None,
+        )
+    });
+    let x_at = |i: usize| -> f32 {
+        shaped.as_ref().map(|s| f32::from(s.x_for_index(i.min(query.len())))).unwrap_or(0.0)
+    };
+    let caret_x = x_at(edit.cursor);
+    let selection = edit.selection().map(|(s, e)| (x_at(s), x_at(e) - x_at(s)));
     let measure = origin.clone();
     let hit = origin;
-    let hit_text = query.clone();
+    let hit_shaped = shaped.clone();
+    let hit_len = query.len();
     div()
         .id("field-text")
         .flex_1()
@@ -247,7 +253,13 @@ pub fn input<T: 'static>(
             MouseButton::Left,
             cx.listener(move |this, ev: &gpui::MouseDownEvent, _, cx| {
                 let x = f32::from(ev.position.x) - hit.get();
-                on_click(this, offset_for_x(&hit_text, x, font_px), cx);
+                // The same shaping the caret is drawn from, so a click and
+                // the caret agree about which glyph was meant.
+                let offset = hit_shaped
+                    .as_ref()
+                    .map(|s| s.index_for_x(px(x.max(0.0))).unwrap_or(hit_len))
+                    .unwrap_or(0);
+                on_click(this, offset, cx);
             }),
         )
         // Painted before the glyphs so it sits behind them.
@@ -277,43 +289,4 @@ pub fn input<T: 'static>(
                     .bg(th.accent),
             )
         })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The size the sidebar's box uses; the palette's is larger, and the
-    /// rule is the same either way.
-    const FONT: f32 = 12.0;
-
-    fn offset_for_x2(text: &str, x: f32) -> usize {
-        offset_for_x(text, x, FONT)
-    }
-
-    /// Clicking maps an x offset back to a caret position, snapping to the
-    /// nearer boundary so the caret lands where the pointer looks.
-    #[test]
-    fn click_maps_x_to_the_nearest_caret_offset() {
-        let w = |s: &str| mono_w(s, FONT);
-        assert_eq!(offset_for_x2("user", 0.0), 0);
-        assert_eq!(offset_for_x2("user", w("user")), 4, "past the end clamps to the end");
-        assert_eq!(offset_for_x2("user", w("user") + 999.0), 4);
-        assert_eq!(offset_for_x2("user", w("us")), 2);
-        // Just past a glyph's midpoint rounds on to the next boundary.
-        assert_eq!(offset_for_x2("user", w("us") + w("e") * 0.6), 3);
-        assert_eq!(offset_for_x2("", 42.0), 0, "empty text has only offset 0");
-    }
-
-    /// Byte offsets again: a click inside a multi-byte glyph has to resolve
-    /// to one of its edges, never into the middle.
-    #[test]
-    fn click_never_lands_inside_a_multibyte_glyph() {
-        let text = "한글";
-        for step in 0..40 {
-            let off = offset_for_x2(text, step as f32 * 2.0);
-            assert!(text.is_char_boundary(off), "offset {off} splits a glyph");
-        }
-    }
-
 }

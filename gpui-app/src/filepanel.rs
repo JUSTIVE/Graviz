@@ -389,6 +389,7 @@ impl FilePanel {
                             line_h: 16.0,
                             origin: self.find_origin.clone(),
                         },
+                        window,
                         cx,
                         |this, offset, cx| {
                             this.find.move_cursor(offset, false);
