@@ -7,10 +7,11 @@ version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-gpui = { git = "https://github.com/zed-industries/zed" }
+gpui = { git = "https://github.com/zed-industries/zed", rev = "a7d74150ac7a663fdaa01ec5177e303baaf6c331" }
+base-gpui = { git = "https://github.com/LukeTandjung/base-gpui" }
 # font-kit is NOT in gpui_platform's default features — without it macOS falls
 # back to a placeholder text system that lays out text but renders no glyphs.
-gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "a7d74150ac7a663fdaa01ec5177e303baaf6c331", features = ["font-kit"] }
 graviz-core = { path = "core" }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
@@ -29,3 +30,15 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 2
+
+# base-gpui pins an older gpui (2026-08-09) than this app uses (08-18), and two
+# revisions of the same repo are two unrelated crates to Cargo: an `Element`
+# from one is not an `Element` to the other. The newer revision is a superset
+# for what base-gpui touches, so everything is pulled onto ours rather than
+# giving up the spring animations that landed in between.
+# A git patch pointing at the same repository is ambiguous to Cargo ("resolved
+# to more than one candidate"), so the override points at the checkout Cargo
+# already made of that revision. Experimental by nature: it is a local path,
+# and it only holds while that checkout is on this machine.
+[patch."https://github.com/zed-industries/zed"]
+gpui = { path = "/Users/biscuit/.cargo/git/checkouts/zed-a70e2ad075855582/a7d7415/crates/gpui" }

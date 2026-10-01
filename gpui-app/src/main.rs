@@ -110,6 +110,8 @@ fn main() {
     selfshot::arm_if_requested();
 
     gpui_platform::application().with_assets(icons::Assets).run(move |cx: &mut App| {
+        // base-gpui registers its components' actions and key bindings here.
+        base_gpui::init(cx);
         workspace::init(cx);
         // The window has no system titlebar, but the app still needs the
         // standard menu: without it macOS gives ⌘Q to nothing.

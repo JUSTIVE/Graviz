@@ -10,6 +10,8 @@
 use crate::config::ScrollMode;
 use crate::icons::{icon, Icon};
 use crate::theme::{Theme, ThemeMode};
+use base_gpui::toggle::Toggle;
+use base_gpui::toggle_group::ToggleGroup;
 use gpui::{div, prelude::*, px, MouseButton, SharedString, Window};
 
 /// One card in a picker. The label doubles as the element id, so the labels
@@ -49,39 +51,67 @@ const SCROLLING: &[Choice<ScrollMode>] = &[
 
 /// The options side by side rather than behind a button that cycles: a
 /// settings page should show what the alternatives are.
-fn picker<T: 'static, V: Copy + PartialEq + 'static>(
+///
+/// Built on base-gpui's `ToggleGroup`, which is a segmented control the way
+/// Base UI means one: the group owns the value and the roving focus, so the
+/// keyboard works (tab in, arrows across, space to pick) and the pressed
+/// state is a fact the group holds rather than a colour each tile guesses at.
+/// The look is entirely ours; the component ships no styling.
+fn picker<T: 'static, V: Copy + Eq + 'static>(
     th: Theme,
     current: V,
     options: &'static [Choice<V>],
-    on_pick: impl Fn(&mut T, V, &mut Window, &mut gpui::Context<T>) + 'static + Clone,
+    group_id: &'static str,
+    on_pick: impl Fn(&mut T, V, &mut Window, &mut gpui::Context<T>) + 'static,
     cx: &mut gpui::Context<T>,
 ) -> impl IntoElement {
-    let mut row = div().flex().gap_3();
-    for choice in options {
+    let owner = cx.entity();
+    let pick = std::rc::Rc::new(on_pick);
+    let mut group = ToggleGroup::<usize>::new()
+        .id(group_id)
+        .value(vec![options.iter().position(|c| c.value == current).unwrap_or(0)])
+        .style_with_state(|_, el| el.flex().gap_3())
+        .on_value_change(move |values, _, window, cx| {
+            // The group hands back the whole pressed set; this one is single
+            // choice, so the first entry is the answer. An empty set is the
+            // user pressing the tile that was already on, which is not a
+            // change of mind and leaves the setting where it is.
+            let Some(&ix) = values.first() else { return };
+            let Some(choice) = options.get(ix) else { return };
+            let value = choice.value;
+            let pick = pick.clone();
+            owner.update(cx, |this, cx| pick(this, value, window, cx));
+        });
+    for (ix, choice) in options.iter().enumerate() {
         let active = choice.value == current;
-        let pick = on_pick.clone();
-        let value = choice.value;
-        row = row.child(
-            div()
+        group = group.child(
+            Toggle::new()
                 .id(choice.label)
-                .flex_1()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .px_4()
-                .py_3()
-                .rounded_lg()
-                .border_1()
-                .cursor_pointer()
-                .when(active, |el| {
-                    el.border_color(th.primary).bg(th.active_bg).text_color(th.text)
+                .value(ix)
+                .aria_label(choice.label)
+                .style_with_state(move |state, el| {
+                    let on = state.pressed;
+                    el.flex_1()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .px_4()
+                        .py_3()
+                        .rounded_lg()
+                        .border_1()
+                        .cursor_pointer()
+                        .when(on, |el| {
+                            el.border_color(th.primary).bg(th.active_bg).text_color(th.text)
+                        })
+                        .when(!on, |el| {
+                            el.border_color(th.card_border)
+                                .text_color(th.text_muted)
+                                .hover(|el| el.bg(th.hover_bg).text_color(th.text))
+                        })
+                        // Focus is the group's to move, so it has to be visible
+                        // when it lands here.
+                        .when(state.focused, |el| el.border_color(th.accent))
                 })
-                .when(!active, |el| {
-                    el.border_color(th.card_border)
-                        .text_color(th.text_muted)
-                        .hover(|el| el.bg(th.hover_bg).text_color(th.text))
-                })
-                .on_click(cx.listener(move |this, _, window, cx| pick(this, value, window, cx)))
                 .child(
                     div()
                         .flex()
@@ -97,17 +127,19 @@ fn picker<T: 'static, V: Copy + PartialEq + 'static>(
                                 .text_sm()
                                 .font_weight(gpui::FontWeight::MEDIUM)
                                 .child(SharedString::from(choice.label)),
-                        ),
+                        )
+                        .into_any_element(),
                 )
                 .child(
                     div()
                         .text_xs()
                         .text_color(th.text_faint)
-                        .child(SharedString::from(choice.blurb)),
+                        .child(SharedString::from(choice.blurb))
+                        .into_any_element(),
                 ),
         );
     }
-    row
+    group
 }
 
 fn section_title(th: Theme, text: &'static str) -> impl IntoElement {
@@ -171,10 +203,10 @@ pub fn view<T: 'static>(
                 )
                 .child(section_title(th, "Appearance"))
                 .child(setting_label(th, "Theme"))
-                .child(picker(th, theme_mode, THEMES, on_theme, cx))
+                .child(picker(th, theme_mode, THEMES, "theme-picker", on_theme, cx))
                 .child(section_title(th, "Canvas"))
                 .child(setting_label(th, "Scrolling"))
-                .child(picker(th, scroll_mode, SCROLLING, on_scroll, cx))
+                .child(picker(th, scroll_mode, SCROLLING, "scroll-picker", on_scroll, cx))
                 .child(
                     div()
                         .mt_2()
