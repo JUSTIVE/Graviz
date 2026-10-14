@@ -10,6 +10,7 @@
 //! a real caret and selection, but no IME; results come from
 //! `graviz_core::search::search_graph`.
 
+use crate::copymenu::{self, CopyMenu, HasCopyMenu};
 use crate::field::{self, FieldKey};
 use crate::icons::{icon, Icon};
 use crate::model::{Model, RowKind};
@@ -19,10 +20,9 @@ use crate::workspace::kind_badge;
 use graviz_core::graph::NodeKind;
 use graviz_core::search::{search_graph, SearchResult, SnippetKind};
 use gpui::{
-    anchored, deferred, div, prelude::*, px, transparent_black, uniform_list, AnyElement, App,
-    Context, EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle, Hsla,
-    KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, ScrollHandle, SharedString,
-    StyledText, Window,
+    div, prelude::*, px, transparent_black, uniform_list, AnyElement, App, Context,
+    EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle, Hsla, KeyDownEvent,
+    MouseButton, ScrollHandle, SharedString, StyledText, Window,
 };
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -47,16 +47,6 @@ const LIST_ROW_H: f32 = 24.0;
 const LIST_MAX_H: f32 = 192.0;
 
 const MONO: &str = "Menlo";
-
-/// A right-click menu over any row naming a type or a field. A type row
-/// offers its name; a field row offers the bare field and `Type.field`.
-#[derive(Clone)]
-struct CopyMenu {
-    /// Window position of the click; the menu opens there.
-    at: Point<Pixels>,
-    type_name: SharedString,
-    field: Option<SharedString>,
-}
 
 /// The search box is monospaced so the caret can be placed by measuring the
 /// text to its left rather than round-tripping through the text system.
@@ -314,92 +304,6 @@ impl TreePanel {
         self.recompute_sections(card);
         cx.emit(TreeEvent::Select { node_index: card as usize, row });
         cx.notify();
-    }
-
-    /// A right-button listener that opens the copy menu for `type_name`
-    /// (and `field`, on a field row) at the click.
-    fn menu_opener(
-        type_name: SharedString,
-        field: Option<SharedString>,
-        cx: &mut Context<Self>,
-    ) -> impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static {
-        // `cx.listener` would tie the closure to `cx`'s borrow; a weak handle
-        // does the same job without it.
-        let this = cx.entity().downgrade();
-        move |ev: &MouseDownEvent, _: &mut Window, cx: &mut App| {
-            let _ = this.update(cx, |this, cx| {
-                this.context_menu = Some(CopyMenu {
-                    at: ev.position,
-                    type_name: type_name.clone(),
-                    field: field.clone(),
-                });
-                cx.notify();
-            });
-        }
-    }
-
-    fn copy_to_clipboard(&mut self, text: String, cx: &mut Context<Self>) {
-        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
-        self.context_menu = None;
-        cx.notify();
-    }
-
-    fn render_copy_menu(&self, th: Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let menu = self.context_menu.clone()?;
-        // A field row's own name, not whatever it targets.
-        let copies: Vec<String> = match &menu.field {
-            Some(f) => vec![f.to_string(), format!("{}.{}", menu.type_name, f)],
-            None => vec![menu.type_name.to_string()],
-        };
-        let items = copies.into_iter().enumerate().map(|(i, text)| {
-            let label = SharedString::from(format!("Copy \"{text}\""));
-            div()
-                .id(("tree-ctx-copy", i))
-                .px_3()
-                .py(px(6.0))
-                .whitespace_nowrap()
-                .cursor_pointer()
-                .hover(|el| el.bg(th.hover_bg))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.copy_to_clipboard(text.clone(), cx)
-                }))
-                .child(label)
-        });
-        Some(
-            deferred(
-                anchored().position(menu.at).snap_to_window().child(
-                    div()
-                        .id("tree-ctx-menu")
-                        .occlude()
-                        .min_w(px(180.0))
-                        .rounded_lg()
-                        .border_1()
-                        .border_color(th.card_border)
-                        .bg(th.chrome_bg)
-                        .shadow_lg()
-                        .py_1()
-                        .font_family(MONO)
-                        .text_size(px(12.0))
-                        .text_color(th.text)
-                        // See the same trick in canvas.rs's node context
-                        // menu: without this a click on an item also lands on
-                        // the row underneath and navigates instead of copying.
-                        .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
-                        .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .on_mouse_up(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-                        // The panel's own handler only hears presses inside
-                        // the panel; this one also closes it from the canvas.
-                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                            if this.context_menu.take().is_some() {
-                                cx.notify();
-                            }
-                        }))
-                        .children(items),
-                ),
-            )
-            .with_priority(1)
-            .into_any_element(),
-        )
     }
 
     /// Commit search result `ix` (an index into `filtered`) — the web's
@@ -811,7 +715,7 @@ impl TreePanel {
     ) -> AnyElement {
         let r = &self.results[ri];
         let selected = ix == self.active;
-        let open_menu = Self::menu_opener(
+        let open_menu = copymenu::opener(
             r.type_name.clone().into(),
             r.field_name.clone().map(SharedString::from),
             cx,
@@ -1175,7 +1079,7 @@ impl TreePanel {
                 el.text_color(th.text).hover(|el| el.bg(th.hover_bg))
             })
             .on_click(cx.listener(move |this, _, _, cx| this.select_card(card, None, cx)))
-            .on_mouse_down(MouseButton::Right, Self::menu_opener(c.name.clone(), None, cx))
+            .on_mouse_down(MouseButton::Right, copymenu::opener(c.name.clone(), None, cx))
             .child(badge)
             .child(
                 div()
@@ -1294,7 +1198,7 @@ impl TreePanel {
                                 .text_color(th.text)
                                 .on_mouse_down(
                                     MouseButton::Right,
-                                    Self::menu_opener(c.name.clone(), None, cx),
+                                    copymenu::opener(c.name.clone(), None, cx),
                                 )
                                 .child(c.name.clone()),
                         ),
@@ -1444,9 +1348,9 @@ impl TreePanel {
 
         // A union member names a type, so it gets the type menu.
         let open_menu = if is_member {
-            Self::menu_opener(row.left.clone(), None, cx)
+            copymenu::opener(row.left.clone(), None, cx)
         } else {
-            Self::menu_opener(c.name.clone(), Some(row.left.clone()), cx)
+            copymenu::opener(c.name.clone(), Some(row.left.clone()), cx)
         };
 
         div()
@@ -1545,6 +1449,12 @@ fn declares_root(model: &Model, name: Option<&str>) -> bool {
     name.is_some_and(|name| root_names(model).iter().any(|r| r.as_ref() == name))
 }
 
+impl HasCopyMenu for TreePanel {
+    fn copy_menu(&mut self) -> &mut Option<CopyMenu> {
+        &mut self.context_menu
+    }
+}
+
 impl EventEmitter<TreeEvent> for TreePanel {}
 
 impl Focusable for TreePanel {
@@ -1609,7 +1519,8 @@ impl Render for TreePanel {
                 .children(self.render_sections(th, cx))
                 .child(self.render_detail(th, cx));
         }
-        root.children(self.render_copy_menu(th, cx))
+        let menu = copymenu::render(self, th, cx);
+        root.children(menu)
     }
 }
 

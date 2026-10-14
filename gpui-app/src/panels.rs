@@ -12,6 +12,7 @@
 // compiler sees the whole public surface as unreachable.
 #![allow(dead_code)]
 
+use crate::copymenu::{self, CopyMenu, HasCopyMenu};
 use crate::model::{today_string, Model};
 use crate::theme::Theme;
 use graviz_core::graph::{
@@ -19,7 +20,7 @@ use graviz_core::graph::{
 };
 use gpui::{
     div, prelude::*, px, uniform_list, AnyElement, Context, EventEmitter, FontWeight, Hsla,
-    SharedString, UniformListScrollHandle, Window,
+    MouseButton, SharedString, UniformListScrollHandle, Window,
 };
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -108,12 +109,19 @@ pub struct OrphanPanel {
     /// Card index of the last clicked type (the web's `focusId`).
     selected: Option<u32>,
     scroll: UniformListScrollHandle,
+    copy_menu: Option<CopyMenu>,
 }
 
 impl OrphanPanel {
     pub fn new(model: Rc<Model>, _cx: &mut Context<Self>) -> Self {
         let (rows, total) = build_orphan_rows(&model);
-        Self { rows, total, selected: None, scroll: UniformListScrollHandle::new() }
+        Self {
+            rows,
+            total,
+            selected: None,
+            scroll: UniformListScrollHandle::new(),
+            copy_menu: None,
+        }
     }
 
     /// Swap in a different slice of the schema (mode change).
@@ -122,6 +130,7 @@ impl OrphanPanel {
         self.rows = rows;
         self.total = total;
         self.selected = None;
+        self.copy_menu = None;
         cx.notify();
     }
 
@@ -159,6 +168,7 @@ impl OrphanPanel {
                     .when(self.selected == Some(card), |el| el.bg(th.active_bg))
                     .hover(|el| el.bg(th.hover_bg))
                     .on_click(cx.listener(move |this, _, _, cx| this.select(card, cx)))
+                    .on_mouse_down(MouseButton::Right, copymenu::opener(name.clone(), None, cx))
                     .child(kind_badge(th, *kind))
                     .child(
                         div()
@@ -257,6 +267,7 @@ impl Render for OrphanPanel {
         }
 
         let total = self.total;
+        let menu = copymenu::render(self, th, cx);
         base.child(
             div()
                 .px_3()
@@ -280,6 +291,13 @@ impl Render for OrphanPanel {
             .flex_1()
             .track_scroll(&self.scroll),
         )
+        .children(menu)
+    }
+}
+
+impl HasCopyMenu for OrphanPanel {
+    fn copy_menu(&mut self) -> &mut Option<CopyMenu> {
+        &mut self.copy_menu
     }
 }
 
@@ -347,6 +365,8 @@ enum UntilRow {
         card: u32,
         row: usize,
         name: SharedString,
+        /// Owning type, for the `Type.field` copy.
+        type_name: SharedString,
         date: Option<SharedString>,
         meta: SharedString,
     },
@@ -369,6 +389,7 @@ pub struct UntilPanel {
     /// tints every row belonging to that type).
     selected: Option<u32>,
     scroll: UniformListScrollHandle,
+    copy_menu: Option<CopyMenu>,
 }
 
 impl UntilPanel {
@@ -377,6 +398,7 @@ impl UntilPanel {
             rows: build_until_rows(&model, &today_string()),
             selected: None,
             scroll: UniformListScrollHandle::new(),
+            copy_menu: None,
         }
     }
 
@@ -384,6 +406,7 @@ impl UntilPanel {
     pub fn set_model(&mut self, model: Rc<Model>, cx: &mut Context<Self>) {
         self.rows = build_until_rows(&model, &today_string());
         self.selected = None;
+        self.copy_menu = None;
         cx.notify();
     }
 
@@ -420,6 +443,7 @@ impl UntilPanel {
                     .into_any_element()
             }
             UntilRow::Group { kind, name, count } => div()
+                .on_mouse_down(MouseButton::Right, copymenu::opener(name.clone(), None, cx))
                 .w_full()
                 .h(px(UNTIL_ROW_H))
                 .flex()
@@ -452,7 +476,7 @@ impl UntilPanel {
                         ),
                 )
                 .into_any_element(),
-            UntilRow::Field { variant, card, row, name, date, meta } => {
+            UntilRow::Field { variant, card, row, name, type_name, date, meta } => {
                 let (variant, card, row) = (*variant, *card, *row);
                 div()
                     .id(ix)
@@ -467,6 +491,10 @@ impl UntilPanel {
                     .when(self.selected == Some(card), |el| el.bg(variant.focus(th)))
                     .hover(|el| el.bg(th.hover_bg))
                     .on_click(cx.listener(move |this, _, _, cx| this.select(card, row, cx)))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        copymenu::opener(type_name.clone(), Some(name.clone()), cx),
+                    )
                     .child(
                         div()
                             .w_full()
@@ -606,6 +634,7 @@ fn push_section(rows: &mut Vec<UntilRow>, variant: Variant, entries: Vec<Entry>,
                 card: entry.card,
                 row: entry.row,
                 name: entry.name,
+                type_name: entry.type_name,
                 date: entry.until.map(SharedString::from),
                 meta: SharedString::from(meta),
             });
@@ -751,9 +780,16 @@ fn skip_whitespace(s: &str, from: usize) -> usize {
 
 impl EventEmitter<PanelEvent> for UntilPanel {}
 
+impl HasCopyMenu for UntilPanel {
+    fn copy_menu(&mut self) -> &mut Option<CopyMenu> {
+        &mut self.copy_menu
+    }
+}
+
 impl Render for UntilPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let th = crate::theme::current(cx, window.appearance());
+        let menu = copymenu::render(self, th, cx);
         div()
             .flex()
             .flex_col()
@@ -761,6 +797,7 @@ impl Render for UntilPanel {
             .bg(th.panel)
             .border_r_1()
             .border_color(th.panel_border)
+            .children(menu)
             .child(
                 uniform_list(
                     "until-items",

@@ -1,6 +1,7 @@
 mod about;
 mod canvas;
 mod config;
+mod copymenu;
 mod editor;
 mod field;
 mod filepanel;
