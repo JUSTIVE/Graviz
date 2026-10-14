@@ -61,8 +61,8 @@ fn desc_alpha(k: f32, lod: f32) -> f32 {
 }
 
 thread_local! {
-    /// `GOMPASS_LOD_DESC` overrides the threshold for A/B measurement.
-    static LOD_DESC_AT: f32 = std::env::var("GOMPASS_LOD_DESC")
+    /// `GRAVIZ_LOD_DESC` overrides the threshold for A/B measurement.
+    static LOD_DESC_AT: f32 = std::env::var("GRAVIZ_LOD_DESC")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(LOD_DESC);
@@ -153,7 +153,7 @@ pub struct GraphCanvas {
     pane_offset_x: f32,
     /// Right-click menu on a card, if one is open.
     context_menu: Option<ContextMenu>,
-    /// Scripted camera sweep for frame-time measurement (`GOMPASS_BENCH=1`).
+    /// Scripted camera sweep for frame-time measurement (`GRAVIZ_BENCH=1`).
     bench: Option<Bench>,
 }
 
@@ -251,8 +251,8 @@ impl GraphCanvas {
             focus_changed_at: None,
             pane_offset_x: 340.0,
             context_menu: None,
-            // Debug: GOMPASS_BENCH=1 runs the camera sweep and exits.
-            bench: std::env::var("GOMPASS_BENCH").is_ok().then(|| Bench {
+            // Debug: GRAVIZ_BENCH=1 runs the camera sweep and exits.
+            bench: std::env::var("GRAVIZ_BENCH").is_ok().then(|| Bench {
                 samples: Rc::new(std::cell::RefCell::new(Vec::new())),
                 frame: 0,
             }),
@@ -1037,8 +1037,8 @@ const CURVE_TOL: f32 = 0.35;
 const SEG_BUDGET: usize = 38_000;
 
 thread_local! {
-    /// `GOMPASS_SEGS` overrides the budget for A/B measurement.
-    static SEG_BUDGET_AT: usize = std::env::var("GOMPASS_SEGS")
+    /// `GRAVIZ_SEGS` overrides the budget for A/B measurement.
+    static SEG_BUDGET_AT: usize = std::env::var("GRAVIZ_SEGS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(SEG_BUDGET);
@@ -1078,8 +1078,8 @@ fn cubic_steps(
 /// zoom most of their length is off screen, and flattening it costs segments
 /// that tessellate into triangles nobody sees.
 fn cubic_visible(
-    p0: gompass_core::layout::Point,
-    c: &gompass_core::layout::CubicSeg,
+    p0: graviz_core::layout::Point,
+    c: &graviz_core::layout::CubicSeg,
     cull: [f32; 4],
 ) -> bool {
     let minx = p0.x.min(c.c1.x).min(c.c2.x).min(c.end.x);
@@ -2068,7 +2068,7 @@ fn paint_scene(
     // re-shaping every visible glyph run each frame.
     let kt = 2f32.powf((k.log2() * 8.0).round() / 8.0);
     let mut text_errors = 0usize;
-    // GOMPASS_PERF=1 reports what a frame actually costs.
+    // GRAVIZ_PERF=1 reports what a frame actually costs.
     let probe = PROBE.with(|p| p.get());
     let mut n_cards = 0usize;
     let mut n_rows = 0usize;
@@ -2633,7 +2633,7 @@ thread_local! {
     static SHAPES: Cell<usize> = const { Cell::new(0) };
     /// Whether the per-line timers are armed, read once instead of hitting the
     /// environment on every line.
-    static PROBE: Cell<bool> = Cell::new(std::env::var("GOMPASS_PERF").is_ok());
+    static PROBE: Cell<bool> = Cell::new(std::env::var("GRAVIZ_PERF").is_ok());
     /// Seconds spent in `shape_line` vs in `ShapedLine::paint`, for the probe.
     static SHAPE_NS: Cell<f32> = const { Cell::new(0.0) };
     static GLYPH_NS: Cell<f32> = const { Cell::new(0.0) };
@@ -2722,8 +2722,8 @@ thread_local! {
 const TEXT_BUDGET_MS: f32 = 5.5;
 
 thread_local! {
-    /// `GOMPASS_TEXT_BUDGET` overrides the budget for A/B measurement.
-    static TEXT_BUDGET_AT: f32 = std::env::var("GOMPASS_TEXT_BUDGET")
+    /// `GRAVIZ_TEXT_BUDGET` overrides the budget for A/B measurement.
+    static TEXT_BUDGET_AT: f32 = std::env::var("GRAVIZ_TEXT_BUDGET")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(TEXT_BUDGET_MS);
