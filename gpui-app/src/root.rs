@@ -22,7 +22,6 @@ pub struct Root {
     show_about: bool,
     show_settings: bool,
     editor: Entity<TextArea>,
-    recents_open: bool,
     warnings: Vec<String>,
     dragging: bool,
     schema_name: Option<String>,
@@ -73,8 +72,6 @@ impl Root {
             // Debug: GRAVIZ_SETTINGS=1 opens on Settings, for selfshots.
             show_settings: std::env::var("GRAVIZ_SETTINGS").is_ok(),
             editor,
-            // Debug: GRAVIZ_RECENTS=1 opens the list, for selfshots.
-            recents_open: std::env::var("GRAVIZ_RECENTS").is_ok(),
             warnings: Vec::new(),
             dragging: false,
             schema_name: None,
@@ -284,7 +281,6 @@ impl Render for Root {
                     th,
                     editor: &self.editor,
                     recents: &self.recents,
-                    recents_open: self.recents_open,
                     schema_name: self.schema_name.as_deref(),
                     error: self.error.as_deref(),
                     warnings: &self.warnings,
@@ -299,10 +295,6 @@ impl Render for Root {
                     cx.notify();
                 },
                 |this: &mut Self, _w, cx| this.visualize(cx),
-                |this: &mut Self, _w, cx| {
-                    this.recents_open = !this.recents_open;
-                    cx.notify();
-                },
                 |this: &mut Self, _w, cx| {
                     config::write_recents(&[]);
                     this.recents = config::recents();
