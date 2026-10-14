@@ -541,6 +541,40 @@ fn relay_boilerplate_is_folded_away_by_default() {
 }
 
 #[test]
+fn a_connection_with_extra_fields_stays_on_the_graph() {
+    let g = graph(
+        r#"
+  type Query { users(first: Int): UserConnection }
+  type UserConnection { edges: [UserEdge!]! pageInfo: PageInfo! totalCount: Int! }
+  type UserEdge { node: User! cursor: String! }
+  type PageInfo { hasNextPage: Boolean! hasPreviousPage: Boolean! }
+  type User { id: ID! }
+"#,
+    );
+    let names: HashSet<&str> = g.nodes.iter().map(|n| n.name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["Query", "UserConnection", "User"].into_iter().collect::<HashSet<_>>()
+    );
+
+    // The field leads to the Connection, not past it.
+    let users = field(node(&g, "Query"), "users");
+    assert_eq!(users.type_name, "UserConnection");
+    assert!(!users.is_relay_connection);
+
+    // Its own `edges` still skips the Edge wrapper.
+    let conn = node(&g, "UserConnection");
+    assert_eq!(field(conn, "totalCount").type_, "Int!");
+    let edges = field(conn, "edges");
+    assert_eq!(edges.type_name, "User");
+    assert!(edges.is_relay_connection);
+
+    let ids = edge_ids(&g);
+    assert!(ids.contains(&"Query.users->UserConnection"), "{ids:?}");
+    assert!(ids.contains(&"UserConnection.edges->User"), "{ids:?}");
+}
+
+#[test]
 fn relay_types_survive_when_the_boilerplate_is_shown() {
     let g = sdl_to_graph(
         RELAY_SDL,
