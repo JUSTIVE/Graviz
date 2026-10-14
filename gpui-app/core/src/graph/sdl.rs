@@ -570,20 +570,9 @@ fn is_relay_boilerplate(node: &GraphNodeData) -> bool {
         }
         NodeKind::Object if node.name == "PageInfo" => has("hasNextPage") && has("hasPreviousPage"),
         NodeKind::Object if node.name.ends_with("Edge") => has("node") && has("cursor"),
-        NodeKind::Object if node.name.ends_with("Connection") => {
-            has("edges") && has("pageInfo") && !connection_has_extras(fields)
-        }
+        NodeKind::Object if node.name.ends_with("Connection") => has("edges") && has("pageInfo"),
         _ => false,
     }
-}
-
-/// A Connection that carries more than the spec's `edges` / `pageInfo` /
-/// `nodes` (typically `totalCount`) is kept as a node: folding it away would
-/// take those fields off the graph with it.
-fn connection_has_extras(fields: &[GraphField]) -> bool {
-    fields
-        .iter()
-        .any(|f| !matches!(f.name.as_str(), "edges" | "pageInfo" | "nodes"))
 }
 
 /// Resolves Relay Connection/Edge types to their underlying node type.
@@ -615,7 +604,7 @@ fn unwrap_relay(nodes: &mut [GraphNodeData]) {
         }
         let Some(fields) = &n.fields else { continue };
         let has = |name: &str| fields.iter().any(|f| f.name == name);
-        if !(has("edges") && has("pageInfo")) || connection_has_extras(fields) {
+        if !(has("edges") && has("pageInfo")) {
             continue;
         }
         let Some(edges_field) = fields.iter().find(|f| f.name == "edges") else { continue };
