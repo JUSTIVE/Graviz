@@ -1680,7 +1680,7 @@ impl Render for Workspace {
             self.focused_once = true;
             if self.palette_open {
                 self.palette.update(cx, |p, cx| {
-                    p.debug_query();
+                    p.debug_query(cx);
                     p.reopen_keeping_query(window, cx);
                 });
             } else {

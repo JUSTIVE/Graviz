@@ -26,7 +26,7 @@ use graviz_core::graph::ParsedGraph;
 use graviz_core::search::{search_graph, SearchResult};
 use gpui::{
     div, prelude::*, px, App, Context, EventEmitter, FocusHandle, Focusable, KeyDownEvent,
-    MouseButton, ScrollHandle, SharedString, Window,
+    point, MouseButton, ScrollHandle, SharedString, Window,
 };
 use std::cell::Cell;
 use std::collections::HashSet;
@@ -39,6 +39,8 @@ const ROW_H: f32 = 44.0;
 const VISIBLE_ROWS: f32 = 8.0;
 /// A root's group header.
 const HEADER_H: f32 = 26.0;
+/// The results list's top padding (`py_1`), before the first child.
+const LIST_PAD: f32 = 4.0;
 
 pub enum PaletteEvent {
     /// `node_index` indexes into the slice of the `root` it was found under;
@@ -91,10 +93,28 @@ impl Palette {
 
     /// Debug: GRAVIZ_PALETTE=<query> opens on the palette holding that
     /// search, so a selfshot can reproduce it.
-    pub fn debug_query(&mut self) -> bool {
+    /// GRAVIZ_PALETTE_STEP=<n> then moves the active row down n times once
+    /// the list has laid out, to show the pinned header mid-list.
+    pub fn debug_query(&mut self, cx: &mut Context<Self>) -> bool {
         let Ok(q) = std::env::var("GRAVIZ_PALETTE") else { return false };
         self.query.set_text(q);
         self.refresh();
+        let steps: usize = std::env::var("GRAVIZ_PALETTE_STEP")
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0);
+        if steps > 0 {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(std::time::Duration::from_secs(2)).await;
+                let _ = this.update(cx, |this: &mut Self, cx| {
+                    for _ in 0..steps {
+                        this.step(1);
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
         true
     }
 
@@ -128,7 +148,7 @@ impl Palette {
             .filter(|h| seen.insert((h.result.type_name.clone(), h.result.field_name.clone())))
             .collect();
         self.active = 0;
-        self.scroll.scroll_to_item(0);
+        self.scroll.set_offset(point(px(0.0), px(0.0)));
     }
 
     /// Whether result `ix` opens a new group, and so is drawn under a header.
@@ -137,9 +157,64 @@ impl Palette {
             && (ix == 0 || self.results[ix - 1].source != self.results[ix].source)
     }
 
-    /// Child index of result `ix` in the list, counting the headers above it.
-    fn child_index(&self, ix: usize) -> usize {
-        ix + (0..=ix).filter(|&i| self.starts_group(i)).count()
+    fn grouped(&self) -> bool {
+        self.sources.iter().any(|s| s.root.is_some())
+    }
+
+    /// Top of result `ix` in the list's content, below every header above
+    /// it. Rows and headers have fixed heights, so this is exact.
+    fn row_top(&self, ix: usize) -> f32 {
+        let headers = (0..=ix).filter(|&i| self.starts_group(i)).count();
+        LIST_PAD + ix as f32 * ROW_H + headers as f32 * HEADER_H
+    }
+
+    /// How far the list is scrolled, as a positive distance.
+    fn scroll_top(&self) -> f32 {
+        let max = f32::from(self.scroll.max_offset().y).max(0.0);
+        (-f32::from(self.scroll.offset().y)).clamp(0.0, max)
+    }
+
+    /// The header pinned to the top of the list: the group of the topmost
+    /// row, with how far it is pushed up by the next group's header. None
+    /// while the group's own header is still in view.
+    fn sticky(&self) -> Option<(SharedString, f32)> {
+        if !self.grouped() {
+            return None;
+        }
+        let top = self.scroll_top();
+        let starts: Vec<usize> = (0..self.results.len()).filter(|&i| self.starts_group(i)).collect();
+        let header_top = |i: usize| self.row_top(i) - HEADER_H;
+        let cur = starts.iter().rposition(|&i| header_top(i) <= top)?;
+        if header_top(starts[cur]) >= top {
+            return None;
+        }
+        let root = self.sources[self.results[starts[cur]].source].root.clone()?;
+        let shift = starts
+            .get(cur + 1)
+            .map(|&next| (header_top(next) - top - HEADER_H).min(0.0))
+            .unwrap_or(0.0);
+        Some((root, shift))
+    }
+
+    /// Scroll just enough to show the active row, keeping it out from under
+    /// the pinned header.
+    fn reveal_active(&self) {
+        let view = f32::from(self.scroll.bounds().size.height);
+        if view <= 0.0 {
+            return;
+        }
+        let top = self.scroll_top();
+        let row = self.row_top(self.active);
+        let cover = if self.grouped() { HEADER_H } else { 0.0 };
+        let next = if row - cover < top {
+            row - cover
+        } else if row + ROW_H > top + view {
+            row + ROW_H - view + LIST_PAD
+        } else {
+            return;
+        };
+        let max = f32::from(self.scroll.max_offset().y).max(0.0);
+        self.scroll.set_offset(point(px(0.0), px(-next.clamp(0.0, max))));
     }
 
     fn choose(&mut self, ix: usize, cx: &mut Context<Self>) {
@@ -161,7 +236,7 @@ impl Palette {
             d if d < 0 => self.active.saturating_sub(1),
             _ => (self.active + 1).min(last),
         };
-        self.scroll.scroll_to_item(self.child_index(self.active));
+        self.reveal_active();
     }
 
     fn on_key_down(&mut self, ev: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -260,6 +335,19 @@ impl Palette {
     }
 }
 
+fn group_header(th: Theme, root: Option<SharedString>) -> gpui::Div {
+    div()
+        .h(px(HEADER_H))
+        .flex()
+        .items_end()
+        .px_3()
+        .pb(px(4.0))
+        .font_family(MONO)
+        .text_size(px(10.0))
+        .text_color(th.text_muted)
+        .children(root)
+}
+
 impl Focusable for Palette {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus.clone()
@@ -276,19 +364,7 @@ impl Render for Palette {
         for ix in 0..self.results.len() {
             if self.starts_group(ix) {
                 let root = self.sources[self.results[ix].source].root.clone();
-                rows.push(
-                    div()
-                        .h(px(HEADER_H))
-                        .flex()
-                        .items_end()
-                        .px_3()
-                        .pb(px(4.0))
-                        .font_family(MONO)
-                        .text_size(px(10.0))
-                        .text_color(th.text_muted)
-                        .children(root)
-                        .into_any_element(),
-                );
+                rows.push(group_header(th, root).into_any_element());
             }
             rows.push(self.row(ix, th, cx));
         }
@@ -386,14 +462,37 @@ impl Render for Palette {
                             })
                             .into_any_element()
                     } else {
+                        // gpui has no `position: sticky`; the pinned header
+                        // is drawn over the list's top edge instead, from
+                        // the scroll offset this render sees.
+                        let sticky = self.sticky().map(|(root, shift)| {
+                            group_header(th, Some(root))
+                                .id("palette-sticky")
+                                .absolute()
+                                .top(px(shift))
+                                .left_0()
+                                .right_0()
+                                .bg(th.panel)
+                                .occlude()
+                        });
                         div()
-                            .id("palette-results")
+                            .relative()
                             .flex_1()
                             .min_h_0()
-                            .overflow_y_scroll()
-                            .track_scroll(&self.scroll)
-                            .py_1()
-                            .children(rows)
+                            .flex()
+                            .flex_col()
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .id("palette-results")
+                                    .flex_1()
+                                    .min_h_0()
+                                    .overflow_y_scroll()
+                                    .track_scroll(&self.scroll)
+                                    .py(px(LIST_PAD))
+                                    .children(rows),
+                            )
+                            .children(sticky)
                             .into_any_element()
                     }),
             )
