@@ -100,6 +100,7 @@ pub fn view<T: 'static>(
 ) -> impl IntoElement {
     let th = p.th;
     let recents = p.recents.to_vec();
+    let home = std::env::var("HOME").ok();
     let recents_open = p.recents_open;
 
     div()
@@ -263,6 +264,10 @@ pub fn view<T: 'static>(
                                                 let path = PathBuf::from(r.path.clone());
                                                 let rp = r.path.clone();
                                                 let (stamp, stats) = entry_meta(&r);
+                                                let (_, dir) = crate::shell::file_label(
+                                                    &path,
+                                                    home.as_deref(),
+                                                );
                                                 div()
                                                     .flex()
                                                     .items_center()
@@ -290,19 +295,48 @@ pub fn view<T: 'static>(
                                                                     )
                                                                 },
                                                             ))
+                                                            // Every entry is a path re-read on
+                                                            // open: the web's linked-file case.
                                                             .child(
                                                                 div()
-                                                                    .text_sm()
-                                                                    .font_weight(
-                                                                        gpui::FontWeight::MEDIUM,
-                                                                    )
-                                                                    .text_color(th.text)
-                                                                    .whitespace_nowrap()
-                                                                    .overflow_hidden()
-                                                                    .child(SharedString::from(
-                                                                        r.name.clone(),
-                                                                    )),
+                                                                    .flex()
+                                                                    .items_center()
+                                                                    .gap_1()
+                                                                    .min_w_0()
+                                                                    .child(icon(
+                                                                        Icon::Link2,
+                                                                        px(12.0),
+                                                                        th.accent,
+                                                                    ))
+                                                                    .child(
+                                                                        div()
+                                                                            .min_w_0()
+                                                                            .text_sm()
+                                                                            .font_weight(
+                                                                                gpui::FontWeight::MEDIUM,
+                                                                            )
+                                                                            .text_color(th.text)
+                                                                            .whitespace_nowrap()
+                                                                            .overflow_hidden()
+                                                                            .child(SharedString::from(
+                                                                                r.name.clone(),
+                                                                            )),
+                                                                    ),
                                                             )
+                                                            // Two schemas can share a file
+                                                            // name; the folder tells them apart.
+                                                            .when_some(dir, |el, dir| {
+                                                                el.child(
+                                                                    div()
+                                                                        .min_w_0()
+                                                                        .overflow_hidden()
+                                                                        .whitespace_nowrap()
+                                                                        .text_ellipsis_start()
+                                                                        .text_size(px(11.0))
+                                                                        .text_color(th.text_muted)
+                                                                        .child(dir),
+                                                                )
+                                                            })
                                                             .child(
                                                                 div()
                                                                     .text_size(px(11.0))

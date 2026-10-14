@@ -149,8 +149,19 @@ pub fn set_search_history(list: &[String]) {
     write_json("searches.json", &list.to_vec());
 }
 
+/// Entries whose file is gone are dropped and the pruned list written back:
+/// a path that no longer opens is only noise in the landing list.
 pub fn recents() -> Vec<RecentEntry> {
-    read_json("recent.json").unwrap_or_default()
+    let list: Vec<RecentEntry> = read_json("recent.json").unwrap_or_default();
+    let before = list.len();
+    let list: Vec<RecentEntry> = list
+        .into_iter()
+        .filter(|e| Path::new(&e.path).exists())
+        .collect();
+    if list.len() != before {
+        write_recents(&list);
+    }
+    list
 }
 
 pub fn push_recent(path: &Path) {
