@@ -211,6 +211,34 @@ fn tab_counts(graph: &ParsedGraph) -> (usize, usize) {
     (orphans, deprecated)
 }
 
+/// What the ⌘K palette searches. On the Reachable tab that is every root's
+/// slice, in Query, Mutation, Subscription order, cut exactly as `rebuild`
+/// cuts the canvas's so a hit's index is a card index once that root is
+/// showing. Elsewhere it is the one slice on screen, ungrouped.
+fn palette_sources(
+    full: &ParsedGraph,
+    mode: Mode,
+    hide_custom_scalars: bool,
+    shown: &ParsedGraph,
+) -> Vec<crate::palette::Source> {
+    let rt = &full.root_types;
+    let roots: Vec<&String> =
+        [&rt.query, &rt.mutation, &rt.subscription].into_iter().flatten().collect();
+    if mode != Mode::Reachable || roots.is_empty() {
+        return vec![crate::palette::Source { root: None, graph: shown.clone() }];
+    }
+    roots
+        .into_iter()
+        .map(|root| {
+            let mut graph = slice_graph(full, Mode::Reachable, Some(root));
+            if hide_custom_scalars {
+                crate::model::drop_custom_scalars(&mut graph);
+            }
+            crate::palette::Source { root: Some(root.clone().into()), graph }
+        })
+        .collect()
+}
+
 impl Workspace {
     pub fn new(
         loaded: loader::LoadedSchema,
@@ -257,7 +285,9 @@ impl Workspace {
             );
         }
         let tree = cx.new(|cx| TreePanel::new(model.clone(), cx));
-        let palette = cx.new(|cx| crate::palette::Palette::new(model.clone(), cx));
+        let sources =
+            palette_sources(&loaded.graph, mode, options.hide_custom_scalars, &model.graph);
+        let palette = cx.new(|cx| crate::palette::Palette::new(sources, cx));
         let file_panel = cx.new(|cx| {
             let mut p = crate::filepanel::FilePanel::new(cx);
             p.set_model(model.clone());
@@ -318,10 +348,19 @@ impl Workspace {
         .detach();
         cx.subscribe(&palette, |this: &mut Self, _, event: &crate::palette::PaletteEvent, cx| {
             match event {
-                crate::palette::PaletteEvent::Select { node_index, row } => {
+                crate::palette::PaletteEvent::Select { root, node_index, row } => {
                     let (node_index, row) = (*node_index, *row);
                     this.palette_open = false;
                     this.reclaim_focus = true;
+                    // A hit under another root indexes into that root's
+                    // slice, so the canvas has to be showing it first.
+                    if let Some(root) = root.clone() {
+                        if this.shown_root().as_deref() != Some(root.as_str()) {
+                            this.root_override = Some(root.clone());
+                            this.tree.update(cx, |t, cx| t.set_root_pick(root.into(), cx));
+                            this.rebuild(cx);
+                        }
+                    }
                     this.canvas.update(cx, |canvas, cx| {
                         canvas.navigate_to(node_index as u32, row, cx);
                     });
@@ -514,7 +553,13 @@ impl Workspace {
         let model = Rc::new(build_model(sliced, self.schema_name.clone(), &self.options));
         self.model = model.clone();
         self.tree.update(cx, |tree, cx| tree.set_model(model.clone(), cx));
-        self.palette.update(cx, |p, _| p.set_model(model.clone()));
+        let sources = palette_sources(
+            &self.full_graph,
+            self.mode,
+            self.options.hide_custom_scalars,
+            &model.graph,
+        );
+        self.palette.update(cx, |p, _| p.set_sources(sources));
         self.file_panel.update(cx, |p, _| p.set_model(model.clone()));
         let list_opts = ModelOptions { skip_layout: true, ..self.options.clone() };
         let full_model = Rc::new(build_model(
@@ -530,6 +575,17 @@ impl Workspace {
             canvas.set_investigate(self.investigate, cx);
         });
         cx.notify();
+    }
+
+    /// The root the Reachable canvas is drawn from: the picked one, else the
+    /// first declared, as `slice_graph` falls back.
+    fn shown_root(&self) -> Option<String> {
+        let rt = &self.full_graph.root_types;
+        self.root_override
+            .clone()
+            .or_else(|| rt.query.clone())
+            .or_else(|| rt.mutation.clone())
+            .or_else(|| rt.subscription.clone())
     }
 
     /// Path of the schema this workspace has open, for the titlebar.

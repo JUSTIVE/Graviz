@@ -10,19 +10,26 @@
 //! The sidebar's search stays as it is. It is the one you leave open while
 //! reading, with its kind chips and its history; this is the one you hit
 //! mid-thought to jump.
+//!
+//! The sidebar searches the root it is showing. The palette searches every
+//! root at once, since "find me a type" should not first need the right root
+//! picked, and lists the hits under the root that reaches them, in Query,
+//! Mutation, Subscription order. A type more than one root reaches is listed
+//! once, under the first.
 
 use crate::field::{self, FieldKey, MONO};
-use crate::model::Model;
 use crate::textedit::TextEdit;
 use crate::theme::Theme;
 use crate::tree::{highlighted, kind_label};
 use crate::workspace::kind_badge;
+use graviz_core::graph::ParsedGraph;
 use graviz_core::search::{search_graph, SearchResult};
 use gpui::{
     div, prelude::*, px, App, Context, EventEmitter, FocusHandle, Focusable, KeyDownEvent,
     MouseButton, ScrollHandle, SharedString, Window,
 };
 use std::cell::Cell;
+use std::collections::HashSet;
 use std::rc::Rc;
 
 const FONT_PX: f32 = 14.0;
@@ -30,16 +37,33 @@ const LINE_H: f32 = 22.0;
 const ROW_H: f32 = 44.0;
 /// Rows on screen before the list scrolls.
 const VISIBLE_ROWS: f32 = 8.0;
+/// A root's group header.
+const HEADER_H: f32 = 26.0;
 
 pub enum PaletteEvent {
-    Select { node_index: usize, row: Option<usize> },
+    /// `node_index` indexes into the slice of the `root` it was found under;
+    /// the workspace switches to that root first when it is not showing it.
+    Select { root: Option<String>, node_index: usize, row: Option<usize> },
     Dismiss,
 }
 
+/// What one group searches: a root's slice of the schema, cut the same way
+/// the canvas cuts it so hit indices line up with its cards. `root` is unset
+/// for the single, ungrouped source outside the Reachable tab.
+pub struct Source {
+    pub root: Option<SharedString>,
+    pub graph: ParsedGraph,
+}
+
+struct Hit {
+    source: usize,
+    result: SearchResult,
+}
+
 pub struct Palette {
-    model: Rc<Model>,
+    sources: Vec<Source>,
     query: TextEdit,
-    results: Vec<SearchResult>,
+    results: Vec<Hit>,
     active: usize,
     focus: FocusHandle,
     scroll: ScrollHandle,
@@ -47,9 +71,9 @@ pub struct Palette {
 }
 
 impl Palette {
-    pub fn new(model: Rc<Model>, cx: &mut Context<Self>) -> Self {
+    pub fn new(sources: Vec<Source>, cx: &mut Context<Self>) -> Self {
         Palette {
-            model,
+            sources,
             query: TextEdit::default(),
             results: Vec::new(),
             active: 0,
@@ -60,8 +84,8 @@ impl Palette {
     }
 
     /// A rebuilt graph invalidates every hit, which indexes into it.
-    pub fn set_model(&mut self, model: Rc<Model>) {
-        self.model = model;
+    pub fn set_sources(&mut self, sources: Vec<Source>) {
+        self.sources = sources;
         self.refresh();
     }
 
@@ -89,18 +113,43 @@ impl Palette {
     }
 
     fn refresh(&mut self) {
-        self.results = search_graph(&self.model.graph, &self.query.text);
+        // Sources come in root order, so the first root to reach a hit keeps
+        // it and the groups come out in that order too.
+        let mut seen: HashSet<(String, Option<String>)> = HashSet::new();
+        self.results = self
+            .sources
+            .iter()
+            .enumerate()
+            .flat_map(|(source, src)| {
+                search_graph(&src.graph, &self.query.text)
+                    .into_iter()
+                    .map(move |result| Hit { source, result })
+            })
+            .filter(|h| seen.insert((h.result.type_name.clone(), h.result.field_name.clone())))
+            .collect();
         self.active = 0;
         self.scroll.scroll_to_item(0);
     }
 
+    /// Whether result `ix` opens a new group, and so is drawn under a header.
+    fn starts_group(&self, ix: usize) -> bool {
+        self.sources[self.results[ix].source].root.is_some()
+            && (ix == 0 || self.results[ix - 1].source != self.results[ix].source)
+    }
+
+    /// Child index of result `ix` in the list, counting the headers above it.
+    fn child_index(&self, ix: usize) -> usize {
+        ix + (0..=ix).filter(|&i| self.starts_group(i)).count()
+    }
+
     fn choose(&mut self, ix: usize, cx: &mut Context<Self>) {
-        let Some(r) = self.results.get(ix) else { return };
-        let (node_index, row) = (r.node_index, r.row_index);
+        let Some(h) = self.results.get(ix) else { return };
+        let root = self.sources[h.source].root.as_ref().map(|r| r.to_string());
+        let (node_index, row) = (h.result.node_index, h.result.row_index);
         if !self.query.text.trim().is_empty() {
             crate::config::push_search(&self.query.text);
         }
-        cx.emit(PaletteEvent::Select { node_index, row });
+        cx.emit(PaletteEvent::Select { root, node_index, row });
     }
 
     fn step(&mut self, delta: isize) {
@@ -112,7 +161,7 @@ impl Palette {
             d if d < 0 => self.active.saturating_sub(1),
             _ => (self.active + 1).min(last),
         };
-        self.scroll.scroll_to_item(self.active);
+        self.scroll.scroll_to_item(self.child_index(self.active));
     }
 
     fn on_key_down(&mut self, ev: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -135,7 +184,7 @@ impl Palette {
     }
 
     fn row(&self, ix: usize, th: Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let r = &self.results[ix];
+        let r = &self.results[ix].result;
         let active = ix == self.active;
         let name = match &r.field_name {
             Some(field) => div()
@@ -223,8 +272,26 @@ impl Render for Palette {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let th = crate::theme::current(cx, window.appearance());
         let focused = self.focus.is_focused(window);
-        let rows: Vec<gpui::AnyElement> =
-            (0..self.results.len()).map(|ix| self.row(ix, th, cx)).collect();
+        let mut rows: Vec<gpui::AnyElement> = Vec::new();
+        for ix in 0..self.results.len() {
+            if self.starts_group(ix) {
+                let root = self.sources[self.results[ix].source].root.clone();
+                rows.push(
+                    div()
+                        .h(px(HEADER_H))
+                        .flex()
+                        .items_end()
+                        .px_3()
+                        .pb(px(4.0))
+                        .font_family(MONO)
+                        .text_size(px(10.0))
+                        .text_color(th.text_muted)
+                        .children(root)
+                        .into_any_element(),
+                );
+            }
+            rows.push(self.row(ix, th, cx));
+        }
         let empty = self.query.text.trim().is_empty();
 
         div()

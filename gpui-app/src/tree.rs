@@ -324,6 +324,13 @@ impl TreePanel {
         self.refresh();
     }
 
+    /// Follow a root switch made elsewhere (the palette), without emitting
+    /// `RootPicked` back: the caller rebuilds itself.
+    pub fn set_root_pick(&mut self, name: SharedString, cx: &mut Context<Self>) {
+        self.root_pick = Some(name);
+        cx.notify();
+    }
+
     fn pick_root(&mut self, name: SharedString, cx: &mut Context<Self>) {
         self.root_pick = Some(name.clone());
         cx.emit(TreeEvent::RootPicked(name.to_string()));
