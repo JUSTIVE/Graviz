@@ -265,6 +265,33 @@ fn parse_deprecated(directives: &[Positioned<ConstDirective>]) -> Deprecation {
     Deprecation { is_deprecated: true, reason, until }
 }
 
+fn string_arg(d: &ConstDirective, name: &str) -> Option<String> {
+    d.arguments
+        .iter()
+        .find(|(n, _)| n.node.as_str() == name)
+        .and_then(|(_, value)| match &value.node {
+            ConstValue::String(s) => Some(s.clone()),
+            _ => None,
+        })
+}
+
+fn parse_reserved(directives: &[Positioned<ConstDirective>]) -> Option<Reserved> {
+    let d = directives.iter().find(|d| d.node.name.node.as_str() == "reserved")?;
+    let until = string_arg(&d.node, "until")
+        .map(|u| u.trim().to_string())
+        .filter(|u| is_iso_date(u));
+    Some(Reserved { reason: string_arg(&d.node, "reason"), until })
+}
+
+/// `\d{4}-\d{2}-\d{2}`, shape only.
+fn is_iso_date(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b.iter().enumerate().all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
+}
+
 /// Builds the graph-level field list for an object/interface definition or
 /// extension. Shared so `extend type` blocks produce identical fields.
 fn build_fields(defs: &[Positioned<FieldDefinition>]) -> Vec<GraphField> {
@@ -296,6 +323,7 @@ fn build_fields(defs: &[Positioned<FieldDefinition>]) -> Vec<GraphField> {
                 is_deprecated: dep.is_deprecated,
                 deprecation_reason: dep.reason,
                 until: dep.until,
+                reserved: parse_reserved(&f.node.directives),
                 is_overlay: false,
                 line: f.pos.line as u32,
             }
@@ -321,6 +349,7 @@ fn build_input_fields(defs: &[Positioned<InputValueDefinition>]) -> Vec<GraphFie
                 is_deprecated: dep.is_deprecated,
                 deprecation_reason: dep.reason,
                 until: dep.until,
+                reserved: parse_reserved(&f.node.directives),
                 is_overlay: false,
                 line: f.pos.line as u32,
             }
@@ -338,6 +367,7 @@ fn build_enum_values(defs: &[Positioned<EnumValueDefinition>]) -> Vec<EnumValue>
                 is_deprecated: dep.is_deprecated,
                 deprecation_reason: dep.reason,
                 until: dep.until,
+                reserved: parse_reserved(&v.node.directives),
                 is_overlay: false,
                 line: v.pos.line as u32,
             }

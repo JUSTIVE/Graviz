@@ -5,8 +5,8 @@
 //! `Card::row_at` are the single source of truth.
 
 use graviz_core::graph::{
-    all_reachable_ids, default_root_ops, is_until_expired, reachable_from, EdgeKind, NodeKind,
-    ParsedGraph,
+    all_reachable_ids, default_root_ops, is_until_expired, reachable_from, EdgeKind, EnumValue,
+    GraphField, NodeKind, ParsedGraph,
 };
 use graviz_core::layout::{self, LayoutConfig, LayoutEdge, LayoutNode};
 use std::collections::{HashMap, HashSet};
@@ -428,6 +428,9 @@ pub enum Mode {
     Orphaned,
     /// Types owning deprecated members, plus the targets of those members.
     Deprecated,
+    /// The same cut for `@reserved` members. Opened from the Investigate
+    /// card, not from a sidebar tab.
+    Reserved,
 }
 
 impl Mode {
@@ -436,6 +439,7 @@ impl Mode {
             Mode::Reachable => "Reachable",
             Mode::Orphaned => "Orphaned",
             Mode::Deprecated => "Deprecated",
+            Mode::Reserved => "Reserved",
         }
     }
 }
@@ -490,15 +494,21 @@ pub fn slice_graph(full: &ParsedGraph, mode: Mode, root_override: Option<&str>) 
                 .collect();
             (nodes, edges)
         }
-        Mode::Deprecated => {
+        Mode::Deprecated | Mode::Reserved => {
+            let (marked, value_marked): (fn(&GraphField) -> bool, fn(&EnumValue) -> bool) =
+                if mode == Mode::Deprecated {
+                    (|f| f.is_deprecated, |v| v.is_deprecated)
+                } else {
+                    (|f| f.reserved.is_some(), |v| v.reserved.is_some())
+                };
             let mut keep: HashSet<String> = HashSet::new();
             for n in &full.nodes {
                 let fields = n.fields.as_deref().unwrap_or(&[]);
-                let has_deprecated = fields.iter().any(|f| f.is_deprecated)
-                    || n.values.as_deref().unwrap_or(&[]).iter().any(|v| v.is_deprecated);
-                if has_deprecated {
+                let has_marked = fields.iter().any(marked)
+                    || n.values.as_deref().unwrap_or(&[]).iter().any(value_marked);
+                if has_marked {
                     keep.insert(n.id.clone());
-                    for f in fields.iter().filter(|f| f.is_deprecated) {
+                    for f in fields.iter().filter(|f| marked(f)) {
                         keep.insert(f.type_name.clone());
                     }
                 }
@@ -521,10 +531,10 @@ pub fn slice_graph(full: &ParsedGraph, mode: Mode, root_override: Option<&str>) 
                     if e.kind != EdgeKind::Field {
                         return true;
                     }
-                    // keep only edges leaving a deprecated field
+                    // keep only edges leaving a marked field
                     e.source_field_index
                         .and_then(|i| by_id.get(e.source.as_str())?.fields.as_deref()?.get(i))
-                        .is_some_and(|f| f.is_deprecated)
+                        .is_some_and(marked)
                 })
                 .cloned()
                 .collect();

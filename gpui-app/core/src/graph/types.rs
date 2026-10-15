@@ -59,6 +59,15 @@ pub struct GraphArg {
     pub type_name: String,
 }
 
+/// A `@reserved` mark: a coordinate added ahead of any client, kept apart
+/// from dead schema until `until`, when someone re-evaluates it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Reserved {
+    pub reason: Option<String>,
+    /// `YYYY-MM-DD` as written; `None` when absent or not that shape.
+    pub until: Option<String>,
+}
+
 /// A field row on an Object / Interface / Input node.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GraphField {
@@ -79,6 +88,9 @@ pub struct GraphField {
     /// Sunset date (`YYYY-MM-DD`) parsed from a `[until …]` marker in the
     /// deprecation reason, when present.
     pub until: Option<String>,
+    /// Set by `@reserved(reason:, until:)`: working, but no client reads it
+    /// yet.
+    pub reserved: Option<Reserved>,
     /// Set when this field came from the temporary overlay SDL rather than
     /// the loaded schema.
     pub is_overlay: bool,
@@ -96,6 +108,8 @@ pub struct EnumValue {
     pub deprecation_reason: Option<String>,
     /// See [`GraphField::until`].
     pub until: Option<String>,
+    /// See [`GraphField::reserved`].
+    pub reserved: Option<Reserved>,
     /// See [`GraphField::is_overlay`].
     pub is_overlay: bool,
     /// See [`GraphField::line`].

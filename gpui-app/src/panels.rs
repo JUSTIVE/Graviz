@@ -1,5 +1,6 @@
 //! The two non-tree sidebar bodies: `OrphanPanel` (Orphaned tab) and
-//! `UntilPanel` (Deprecated tab).
+//! `UntilPanel` (Deprecated tab, and the Reserved list the Investigate card
+//! opens).
 //!
 //! Ports of the components of the same name in the web app's
 //! `src/routes/View.tsx`. The orphan list groups types no root operation can
@@ -13,7 +14,7 @@
 #![allow(dead_code)]
 
 use crate::copymenu::{self, CopyMenu, HasCopyMenu};
-use crate::model::{today_string, Model};
+use crate::model::{today_string, Model, RowKind};
 use crate::theme::Theme;
 use graviz_core::graph::{
     all_reachable_ids, default_root_ops, is_until_expired, parse_until, NodeKind,
@@ -25,10 +26,11 @@ use gpui::{
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-/// A row click. `row` is a graph-space member index (field, then enum value),
-/// which the workspace maps through `Card::display_row`.
+/// A row click. Panels may list a different slice than the canvas shows,
+/// so the type goes by name. `row` is a graph-space member index (field,
+/// then enum value), which the workspace maps through `Card::display_row`.
 pub enum PanelEvent {
-    Select { node_index: usize, row: Option<usize> },
+    Select { type_name: SharedString, row: Option<usize> },
 }
 
 /// The web's `KIND_ORDER` — the fixed order kind groups are listed in.
@@ -134,9 +136,9 @@ impl OrphanPanel {
         cx.notify();
     }
 
-    fn select(&mut self, card: u32, cx: &mut Context<Self>) {
+    fn select(&mut self, card: u32, type_name: SharedString, cx: &mut Context<Self>) {
         self.selected = Some(card);
-        cx.emit(PanelEvent::Select { node_index: card as usize, row: None });
+        cx.emit(PanelEvent::Select { type_name, row: None });
         cx.notify();
     }
 
@@ -156,6 +158,7 @@ impl OrphanPanel {
                 .into_any_element(),
             OrphanRow::Type { card, kind, name, fields } => {
                 let card = *card;
+                let type_name = name.clone();
                 div()
                     .id(ix)
                     .w_full()
@@ -167,7 +170,9 @@ impl OrphanPanel {
                     .cursor_pointer()
                     .when(self.selected == Some(card), |el| el.bg(th.active_bg))
                     .hover(|el| el.bg(th.hover_bg))
-                    .on_click(cx.listener(move |this, _, _, cx| this.select(card, cx)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select(card, type_name.clone(), cx)
+                    }))
                     .on_mouse_down(MouseButton::Right, copymenu::opener(name.clone(), None, cx))
                     .child(kind_badge(th, *kind))
                     .child(
@@ -303,6 +308,20 @@ impl HasCopyMenu for OrphanPanel {
 
 // ------------------------------------------------------------ deprecated tab
 
+/// Which mark an until list collects. Both split by an until date the same
+/// way; they differ in where the date lives and in how the rows read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Track {
+    /// `@deprecated`, dated by a `[until …]` marker in its reason.
+    Deprecated,
+    /// `@reserved(reason:, until:)`.
+    Reserved,
+    /// Types and members with no description, in the canvas's own slice:
+    /// the list behind the Investigate card's Missing descriptions. Undated,
+    /// so it is a single section.
+    Undocumented,
+}
+
 /// The web's `UntilVariant` — one per section of the deprecated list.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Variant {
@@ -313,11 +332,16 @@ enum Variant {
 
 impl Variant {
     /// Section title, already uppercased (the web applies `uppercase` in CSS).
-    fn title(self) -> &'static str {
-        match self {
-            Variant::Expired => "EXPIRED",
-            Variant::Upcoming => "UPCOMING",
-            Variant::Undated => "DEPRECATED",
+    /// A reserved mark past its date is not gone, only due for a decision.
+    fn title(self, track: Track) -> &'static str {
+        match (track, self) {
+            (Track::Deprecated, Variant::Expired) => "EXPIRED",
+            (Track::Deprecated, Variant::Upcoming) => "UPCOMING",
+            (Track::Deprecated, Variant::Undated) => "DEPRECATED",
+            (Track::Reserved, Variant::Expired) => "RE-EVALUATE",
+            (Track::Reserved, Variant::Upcoming) => "RESERVED",
+            (Track::Reserved, Variant::Undated) => "RESERVED · NO DATE",
+            (Track::Undocumented, _) => "MISSING DESCRIPTIONS",
         }
     }
 
@@ -363,7 +387,8 @@ enum UntilRow {
     Field {
         variant: Variant,
         card: u32,
-        row: usize,
+        /// `None` on a row standing for the type itself.
+        row: Option<usize>,
         name: SharedString,
         /// Owning type, for the `Type.field` copy.
         type_name: SharedString,
@@ -372,7 +397,7 @@ enum UntilRow {
     },
 }
 
-/// One deprecated member, before it is grouped into sections.
+/// One marked member, before it is grouped into sections.
 struct Entry {
     card: u32,
     row: usize,
@@ -384,6 +409,7 @@ struct Entry {
 }
 
 pub struct UntilPanel {
+    track: Track,
     rows: Vec<UntilRow>,
     /// Card index of the last clicked field's type (the web's `focusId`, which
     /// tints every row belonging to that type).
@@ -393,9 +419,10 @@ pub struct UntilPanel {
 }
 
 impl UntilPanel {
-    pub fn new(model: Rc<Model>, _cx: &mut Context<Self>) -> Self {
+    pub fn new(model: Rc<Model>, track: Track, _cx: &mut Context<Self>) -> Self {
         Self {
-            rows: build_until_rows(&model, &today_string()),
+            track,
+            rows: build_rows(&model, track),
             selected: None,
             scroll: UniformListScrollHandle::new(),
             copy_menu: None,
@@ -404,15 +431,15 @@ impl UntilPanel {
 
     /// Swap in a different slice of the schema (mode change).
     pub fn set_model(&mut self, model: Rc<Model>, cx: &mut Context<Self>) {
-        self.rows = build_until_rows(&model, &today_string());
+        self.rows = build_rows(&model, self.track);
         self.selected = None;
         self.copy_menu = None;
         cx.notify();
     }
 
-    fn select(&mut self, card: u32, row: usize, cx: &mut Context<Self>) {
+    fn select(&mut self, card: u32, type_name: SharedString, row: Option<usize>, cx: &mut Context<Self>) {
         self.selected = Some(card);
-        cx.emit(PanelEvent::Select { node_index: card as usize, row: Some(row) });
+        cx.emit(PanelEvent::Select { type_name, row });
         cx.notify();
     }
 
@@ -437,7 +464,7 @@ impl UntilPanel {
                             .text_size(px(10.0))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(variant.text(th))
-                            .child(SharedString::from(variant.title()))
+                            .child(SharedString::from(variant.title(self.track)))
                             .child(div().opacity(0.7).child(count.clone())),
                     )
                     .into_any_element()
@@ -478,6 +505,7 @@ impl UntilPanel {
                 .into_any_element(),
             UntilRow::Field { variant, card, row, name, type_name, date, meta } => {
                 let (variant, card, row) = (*variant, *card, *row);
+                let owner = type_name.clone();
                 div()
                     .id(ix)
                     .w_full()
@@ -490,7 +518,9 @@ impl UntilPanel {
                     .cursor_pointer()
                     .when(self.selected == Some(card), |el| el.bg(variant.focus(th)))
                     .hover(|el| el.bg(th.hover_bg))
-                    .on_click(cx.listener(move |this, _, _, cx| this.select(card, row, cx)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select(card, owner.clone(), row, cx)
+                    }))
                     .on_mouse_down(
                         MouseButton::Right,
                         copymenu::opener(type_name.clone(), Some(name.clone()), cx),
@@ -508,7 +538,7 @@ impl UntilPanel {
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
-                                    .line_through()
+                                    .when(self.track == Track::Deprecated, |el| el.line_through())
                                     .text_color(variant.text(th))
                                     .child(name.clone()),
                             )
@@ -537,34 +567,131 @@ impl UntilPanel {
     }
 }
 
-/// Scans every type for deprecated members and splits them into the three
+fn build_rows(model: &Model, track: Track) -> Vec<UntilRow> {
+    match track {
+        Track::Undocumented => build_undocumented_rows(model),
+        _ => build_until_rows(model, track, &today_string()),
+    }
+}
+
+/// Every card that is not fully documented, by the same test the canvas
+/// highlights with: the type's own description, then each field or enum
+/// value it shows. Rows a filter hides are not listed, as they are not
+/// counted.
+fn build_undocumented_rows(model: &Model) -> Vec<UntilRow> {
+    let variant = Variant::Undated;
+    let mut body = Vec::new();
+    let mut total = 0usize;
+    for card in &model.cards {
+        let mut rows = Vec::new();
+        if card.description.is_none() {
+            rows.push(UntilRow::Field {
+                variant,
+                card: card.index,
+                row: None,
+                name: card.name.clone(),
+                type_name: card.name.clone(),
+                date: None,
+                meta: SharedString::from(format!("{} · no description", card.kind.sdl_keyword())),
+            });
+        }
+        for (graph_row, display) in card.row_map.iter().enumerate() {
+            let Some(r) = display.and_then(|d| card.rows.get(d as usize)) else { continue };
+            if !matches!(r.kind, RowKind::Field | RowKind::EnumValue) || r.is_documented() {
+                continue;
+            }
+            rows.push(UntilRow::Field {
+                variant,
+                card: card.index,
+                row: Some(graph_row),
+                name: r.left.clone(),
+                type_name: card.name.clone(),
+                date: None,
+                meta: if r.right.is_empty() {
+                    SharedString::from("no description")
+                } else {
+                    SharedString::from(format!("{} · no description", r.right))
+                },
+            });
+        }
+        if rows.is_empty() {
+            continue;
+        }
+        total += rows.len();
+        body.push(UntilRow::Group {
+            kind: card.kind,
+            name: card.name.clone(),
+            count: SharedString::from(format!("({})", rows.len())),
+        });
+        body.extend(rows);
+    }
+    if body.is_empty() {
+        return body;
+    }
+    let mut out = vec![UntilRow::Banner {
+        variant,
+        count: SharedString::from(format!("({total})")),
+    }];
+    out.extend(body);
+    out
+}
+
+/// One member's mark on `track`: its until date and reason, or `None` when
+/// it carries no such mark.
+type Mark = Option<(Option<String>, Option<String>)>;
+
+fn deprecated_mark(reason: Option<&str>, is_deprecated: bool) -> Mark {
+    let until = parse_until(reason);
+    (until.is_some() || is_deprecated).then(|| (until, reason.map(str::to_string)))
+}
+
+fn reserved_mark(r: Option<&graviz_core::graph::Reserved>) -> Mark {
+    r.map(|r| (r.until.clone(), r.reason.clone()))
+}
+
+/// Scans every type for marked members and splits them into the three
 /// sections, each grouped by owning type (the web's `expiredFields` /
 /// `upcomingFields` / `deprecatedFields` plus `groupByType`).
-fn build_until_rows(model: &Model, today: &str) -> Vec<UntilRow> {
+fn build_until_rows(model: &Model, track: Track, today: &str) -> Vec<UntilRow> {
     let (mut expired, mut upcoming, mut undated) = (Vec::new(), Vec::new(), Vec::new());
     for (i, node) in model.graph.nodes.iter().enumerate() {
-        // Enums carry their deprecations on values, everything else on fields.
+        // Enums carry their marks on values, everything else on fields.
         // Both are addressed by the same graph-space row index.
-        let members: Vec<(&str, Option<&str>, bool)> = if node.kind == NodeKind::Enum {
+        let members: Vec<(&str, Mark)> = if node.kind == NodeKind::Enum {
             node.values
                 .as_deref()
                 .unwrap_or(&[])
                 .iter()
-                .map(|v| (v.name.as_str(), v.deprecation_reason.as_deref(), v.is_deprecated))
+                .map(|v| {
+                    let mark = match track {
+                        Track::Deprecated => {
+                            deprecated_mark(v.deprecation_reason.as_deref(), v.is_deprecated)
+                        }
+                        Track::Reserved => reserved_mark(v.reserved.as_ref()),
+                        Track::Undocumented => None,
+                    };
+                    (v.name.as_str(), mark)
+                })
                 .collect()
         } else {
             node.fields
                 .as_deref()
                 .unwrap_or(&[])
                 .iter()
-                .map(|f| (f.name.as_str(), f.deprecation_reason.as_deref(), f.is_deprecated))
+                .map(|f| {
+                    let mark = match track {
+                        Track::Deprecated => {
+                            deprecated_mark(f.deprecation_reason.as_deref(), f.is_deprecated)
+                        }
+                        Track::Reserved => reserved_mark(f.reserved.as_ref()),
+                        Track::Undocumented => None,
+                    };
+                    (f.name.as_str(), mark)
+                })
                 .collect()
         };
-        for (row, (name, reason, is_deprecated)) in members.into_iter().enumerate() {
-            let until = parse_until(reason);
-            if until.is_none() && !is_deprecated {
-                continue;
-            }
+        for (row, (name, mark)) in members.into_iter().enumerate() {
+            let Some((until, reason)) = mark else { continue };
             let entry = Entry {
                 card: i as u32,
                 row,
@@ -572,7 +699,7 @@ fn build_until_rows(model: &Model, today: &str) -> Vec<UntilRow> {
                 type_name: model.cards[i].name.clone(),
                 kind: node.kind,
                 until: until.clone(),
-                reason: reason.map(str::to_string),
+                reason,
             };
             match until {
                 None => undated.push(entry),
@@ -591,15 +718,21 @@ fn build_until_rows(model: &Model, today: &str) -> Vec<UntilRow> {
     });
 
     let mut rows = Vec::new();
-    push_section(&mut rows, Variant::Expired, expired, today);
-    push_section(&mut rows, Variant::Upcoming, upcoming, today);
-    push_section(&mut rows, Variant::Undated, undated, today);
+    push_section(&mut rows, track, Variant::Expired, expired, today);
+    push_section(&mut rows, track, Variant::Upcoming, upcoming, today);
+    push_section(&mut rows, track, Variant::Undated, undated, today);
     rows
 }
 
 /// Appends one section: its banner, then a header + field rows per owning
 /// type, in first-seen order.
-fn push_section(rows: &mut Vec<UntilRow>, variant: Variant, entries: Vec<Entry>, today: &str) {
+fn push_section(
+    rows: &mut Vec<UntilRow>,
+    track: Track,
+    variant: Variant,
+    entries: Vec<Entry>,
+    today: &str,
+) {
     if entries.is_empty() {
         return;
     }
@@ -628,11 +761,12 @@ fn push_section(rows: &mut Vec<UntilRow>, variant: Variant, entries: Vec<Entry>,
             count: SharedString::from(format!("({})", group.len())),
         });
         for entry in group {
-            let meta = meta_line(variant, entry.until.as_deref(), entry.reason.as_deref(), today);
+            let meta =
+                meta_line(track, variant, entry.until.as_deref(), entry.reason.as_deref(), today);
             rows.push(UntilRow::Field {
                 variant,
                 card: entry.card,
-                row: entry.row,
+                row: Some(entry.row),
                 name: entry.name,
                 type_name: entry.type_name,
                 date: entry.until.map(SharedString::from),
@@ -644,9 +778,16 @@ fn push_section(rows: &mut Vec<UntilRow>, variant: Variant, entries: Vec<Entry>,
 
 /// The second line of a field row: how far past (or short of) the sunset date
 /// the field is, joined with its deprecation reason.
-fn meta_line(variant: Variant, until: Option<&str>, reason: Option<&str>, today: &str) -> String {
+fn meta_line(
+    track: Track,
+    variant: Variant,
+    until: Option<&str>,
+    reason: Option<&str>,
+    today: &str,
+) -> String {
     if variant == Variant::Undated {
-        return reason.unwrap_or("deprecated").to_string();
+        let word = if track == Track::Deprecated { "deprecated" } else { "reserved" };
+        return reason.unwrap_or(word).to_string();
     }
     let days = days_from_now(until.unwrap_or_default(), today);
     let when = if variant == Variant::Expired {
@@ -860,19 +1001,19 @@ mod tests {
     #[test]
     fn meta_line_reads_the_day_count_per_section() {
         let today = "2026-08-19";
-        assert_eq!(meta_line(Variant::Expired, Some("2026-08-17"), None, today), "1d overdue");
-        assert_eq!(meta_line(Variant::Expired, Some("2026-08-18"), None, today), "overdue");
+        assert_eq!(meta_line(Track::Deprecated, Variant::Expired, Some("2026-08-17"), None, today), "1d overdue");
+        assert_eq!(meta_line(Track::Deprecated, Variant::Expired, Some("2026-08-18"), None, today), "overdue");
         assert_eq!(
-            meta_line(Variant::Expired, Some("1970-01-01"), None, today),
+            meta_line(Track::Deprecated, Variant::Expired, Some("1970-01-01"), None, today),
             "20,683d overdue"
         );
-        assert_eq!(meta_line(Variant::Upcoming, Some("2026-08-29"), None, today), "in 11d");
+        assert_eq!(meta_line(Track::Deprecated, Variant::Upcoming, Some("2026-08-29"), None, today), "in 11d");
         assert_eq!(
-            meta_line(Variant::Expired, Some("2026-08-17"), Some("[until 2026-08-17] gone"), today),
+            meta_line(Track::Deprecated, Variant::Expired, Some("2026-08-17"), Some("[until 2026-08-17] gone"), today),
             "1d overdue · gone"
         );
-        assert_eq!(meta_line(Variant::Undated, None, Some("use v2"), today), "use v2");
-        assert_eq!(meta_line(Variant::Undated, None, None, today), "deprecated");
+        assert_eq!(meta_line(Track::Deprecated, Variant::Undated, None, Some("use v2"), today), "use v2");
+        assert_eq!(meta_line(Track::Deprecated, Variant::Undated, None, None, today), "deprecated");
     }
 
     #[test]

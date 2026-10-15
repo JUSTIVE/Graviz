@@ -9,7 +9,7 @@ use crate::config;
 use crate::editor::{EditorEvent, TextArea};
 use crate::loader;
 use crate::model::{build_model, slice_graph, Mode, Model, ModelOptions};
-use crate::panels::{OrphanPanel, PanelEvent, UntilPanel};
+use crate::panels::{OrphanPanel, PanelEvent, Track, UntilPanel};
 use crate::icons::{icon, Icon};
 use crate::theme::Theme;
 use crate::tree::{TreeEvent, TreePanel};
@@ -143,6 +143,10 @@ pub struct Workspace {
     reclaim_focus: bool,
     orphan_panel: Entity<OrphanPanel>,
     until_panel: Entity<UntilPanel>,
+    reserved_panel: Entity<UntilPanel>,
+    /// Missing descriptions, over the canvas's own slice. Takes the sidebar
+    /// while `investigate` is on.
+    docs_panel: Entity<UntilPanel>,
     canvas: Entity<GraphCanvas>,
     overlay_editor: Entity<TextArea>,
     /// The workspace's own focus. Actions dispatch along the focus path, so
@@ -172,6 +176,7 @@ pub struct Workspace {
     highlight_overlay: bool,
     orphan_count: usize,
     deprecated_count: usize,
+    reserved_count: usize,
     /// Hover state of the three floating canvas-overlay cards, each faded to
     /// 0.4 opacity at rest and animated to 1.0 on hover.
     controls_hovered: bool,
@@ -196,9 +201,10 @@ fn hover_fade<E: IntoElement + gpui::Styled + 'static>(
     )
 }
 
-/// Types no root operation can reach, and deprecated members — the two tab
-/// badges the web shows next to Orphaned / Deprecated.
-fn tab_counts(graph: &ParsedGraph) -> (usize, usize) {
+/// Types no root operation can reach, deprecated members and reserved
+/// members: the Orphaned / Deprecated tab badges and the Investigate card's
+/// Reserved count.
+fn tab_counts(graph: &ParsedGraph) -> (usize, usize, usize) {
     let orphans = slice_graph(graph, Mode::Orphaned, None).nodes.len();
     let deprecated = graph
         .nodes
@@ -208,7 +214,15 @@ fn tab_counts(graph: &ParsedGraph) -> (usize, usize) {
                 + n.values.as_deref().unwrap_or(&[]).iter().filter(|v| v.is_deprecated).count()
         })
         .sum();
-    (orphans, deprecated)
+    let reserved = graph
+        .nodes
+        .iter()
+        .map(|n| {
+            n.fields.as_deref().unwrap_or(&[]).iter().filter(|f| f.reserved.is_some()).count()
+                + n.values.as_deref().unwrap_or(&[]).iter().filter(|v| v.reserved.is_some()).count()
+        })
+        .sum();
+    (orphans, deprecated, reserved)
 }
 
 /// What the ⌘K palette searches. On the Reachable tab that is every root's
@@ -251,6 +265,7 @@ impl Workspace {
         let mode = match std::env::var("GRAVIZ_MODE").as_deref() {
             Ok("orphaned") => Mode::Orphaned,
             Ok("deprecated") => Mode::Deprecated,
+            Ok("reserved") => Mode::Reserved,
             _ => Mode::Reachable,
         };
         let settings = config::load_settings();
@@ -299,7 +314,9 @@ impl Workspace {
         let full_model =
             Rc::new(build_model(loaded.graph.clone(), loaded.name.clone(), &list_opts));
         let orphan_panel = cx.new(|cx| OrphanPanel::new(full_model.clone(), cx));
-        let until_panel = cx.new(|cx| UntilPanel::new(full_model, cx));
+        let until_panel = cx.new(|cx| UntilPanel::new(full_model.clone(), Track::Deprecated, cx));
+        let reserved_panel = cx.new(|cx| UntilPanel::new(full_model, Track::Reserved, cx));
+        let docs_panel = cx.new(|cx| UntilPanel::new(model.clone(), Track::Undocumented, cx));
         let canvas = cx.new(|cx| {
             let mut c = GraphCanvas::new(model.clone());
             c.set_investigate(investigate, cx);
@@ -394,6 +411,12 @@ impl Workspace {
             cx.subscribe(&until_panel, |this: &mut Self, _, e: &PanelEvent, cx| {
                 this.on_panel_select(e, cx)
             }),
+            cx.subscribe(&reserved_panel, |this: &mut Self, _, e: &PanelEvent, cx| {
+                this.on_panel_select(e, cx)
+            }),
+            cx.subscribe(&docs_panel, |this: &mut Self, _, e: &PanelEvent, cx| {
+                this.on_panel_select(e, cx)
+            }),
         ] {
             sub.detach();
         }
@@ -452,6 +475,8 @@ impl Workspace {
             reclaim_focus: false,
             orphan_panel,
             until_panel,
+            reserved_panel,
+            docs_panel,
             canvas,
             overlay_editor,
             focus: cx.focus_handle(),
@@ -470,6 +495,7 @@ impl Workspace {
             highlight_overlay: false,
             orphan_count: counts.0,
             deprecated_count: counts.1,
+            reserved_count: counts.2,
             controls_hovered: false,
             investigate_hovered: false,
             recent_hovered: false,
@@ -478,11 +504,9 @@ impl Workspace {
 
     /// A row click in the Orphaned / Deprecated tab focuses that type.
     fn on_panel_select(&mut self, event: &PanelEvent, cx: &mut Context<Self>) {
-        let PanelEvent::Select { node_index, row } = event;
-        let (node_index, row) = (*node_index, *row);
-        // Panels index the full graph; map the id into the current slice.
-        let name = self.model.graph.nodes.get(node_index).map(|n| n.id.clone());
-        let card = name.and_then(|n| self.model.index_of.get(&n).copied());
+        let PanelEvent::Select { type_name, row } = event;
+        let row = *row;
+        let card = self.model.index_of.get(type_name.as_ref()).copied();
         if let Some(card) = card {
             self.canvas
                 .update(cx, |c, cx| c.navigate_to(card, row, cx));
@@ -569,7 +593,9 @@ impl Workspace {
         ));
         self.orphan_panel
             .update(cx, |p, cx| p.set_model(full_model.clone(), cx));
-        self.until_panel.update(cx, |p, cx| p.set_model(full_model, cx));
+        self.until_panel.update(cx, |p, cx| p.set_model(full_model.clone(), cx));
+        self.reserved_panel.update(cx, |p, cx| p.set_model(full_model, cx));
+        self.docs_panel.update(cx, |p, cx| p.set_model(model.clone(), cx));
         self.canvas.update(cx, |canvas, cx| {
             canvas.set_model(model, cx);
             canvas.set_investigate(self.investigate, cx);
@@ -637,6 +663,7 @@ impl Workspace {
                 let counts = tab_counts(&self.full_graph);
                 self.orphan_count = counts.0;
                 self.deprecated_count = counts.1;
+                self.reserved_count = counts.2;
                 self.schema_name = loaded.name;
                 self.overlay_diff = loaded.diff;
                 self.overlay_error = None;
@@ -718,6 +745,9 @@ impl Workspace {
     }
 
     fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
+        // Picking a list puts the missing-descriptions list away, even when
+        // the pick is the mode already showing under it.
+        self.set_investigate(false, cx);
         if mode == self.mode {
             return;
         }
@@ -725,6 +755,17 @@ impl Workspace {
         self.rebuild(cx);
     }
 
+
+    /// Missing descriptions: outline the gaps on the canvas and list them in
+    /// the sidebar.
+    fn set_investigate(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.investigate == on {
+            return;
+        }
+        self.investigate = on;
+        self.canvas.update(cx, |canvas, cx| canvas.set_investigate(on, cx));
+        cx.notify();
+    }
 
     /// One mode tab, styled like the web's `ModeTab`: icon always keeps its
     /// tone, the label collapses away when inactive, active tab grows.
@@ -1073,11 +1114,12 @@ impl Render for Workspace {
                             .when(!self.investigate, |el| {
                                 el.border_color(th.card_border).text_color(th.text_muted)
                             })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.investigate = !this.investigate;
-                                let on = this.investigate;
-                                this.canvas
-                                    .update(cx, |canvas, cx| canvas.set_investigate(on, cx));
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let on = !this.investigate;
+                                if on && !this.sidebar_open {
+                                    window.dispatch_action(Box::new(ToggleSidebar), cx);
+                                }
+                                this.set_investigate(on, cx);
                             }))
                             .child("Missing descriptions"),
                     )
@@ -1094,7 +1136,60 @@ impl Render for Workspace {
                                 (coverage * 100.0).round() as i32
                             ))),
                     ),
-            ), "investigate", investigate_hovered);
+            )
+            // Reserved: collects every `@reserved` member into the sidebar,
+            // the way the Deprecated tab collects deprecations. A second
+            // click goes back to the Reachable view.
+            .when(self.reserved_count > 0, |el| {
+                let on = self.mode == Mode::Reserved;
+                let tone = th.accent;
+                el.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(
+                            div()
+                                .id("investigate-reserved")
+                                .rounded_full()
+                                .border_1()
+                                .px_2()
+                                .py(px(2.0))
+                                .text_size(px(10.0))
+                                .cursor_pointer()
+                                .when(on, |el| {
+                                    el.border_color(tone).bg(tone.opacity(0.1)).text_color(tone)
+                                })
+                                .when(!on, |el| {
+                                    el.border_color(th.card_border).text_color(th.text_muted)
+                                })
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    let next = if this.mode == Mode::Reserved {
+                                        Mode::Reachable
+                                    } else {
+                                        Mode::Reserved
+                                    };
+                                    // The list lives in the sidebar; opening
+                                    // it shut would show nothing.
+                                    if next == Mode::Reserved && !this.sidebar_open {
+                                        window.dispatch_action(Box::new(ToggleSidebar), cx);
+                                    }
+                                    this.set_mode(next, cx);
+                                }))
+                                .child("Reserved"),
+                        )
+                        .child(
+                            div()
+                                .rounded_full()
+                                .px(px(6.0))
+                                .py(px(2.0))
+                                .text_size(px(10.0))
+                                .bg(tone.opacity(0.1))
+                                .text_color(tone)
+                                .child(SharedString::from(self.reserved_count.to_string())),
+                        ),
+                )
+            }), "investigate", investigate_hovered);
 
         // ---- overlay dock (web: collapsed strip by default) ----
         let counts = self.overlay_diff.as_ref().map(|d| {
@@ -1823,6 +1918,11 @@ impl Render for Workspace {
                             .flex_col()
                             .child(tab_row)
                             .child(div().flex_1().min_h_0().child(match self.mode {
+                                _ if self.investigate => self
+                                    .docs_panel
+                                    .clone()
+                                    .cached(StyleRefinement::default().size_full())
+                                    .into_any_element(),
                                 Mode::Reachable => self
                                     .tree
                                     .clone()
@@ -1830,6 +1930,11 @@ impl Render for Workspace {
                                     .into_any_element(),
                                 Mode::Orphaned => self
                                     .orphan_panel
+                                    .clone()
+                                    .cached(StyleRefinement::default().size_full())
+                                    .into_any_element(),
+                                Mode::Reserved => self
+                                    .reserved_panel
                                     .clone()
                                     .cached(StyleRefinement::default().size_full())
                                     .into_any_element(),

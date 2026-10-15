@@ -25,7 +25,7 @@ pub use reachable::{
 pub use sdl::sdl_to_graph;
 pub use types::{
     EdgeKind, EnumValue, GraphArg, GraphEdgeData, GraphField, GraphNodeData, NodeKind, ParsedGraph,
-    RootTypeMap, SchemaRemoval, SdlToGraphOptions,
+    Reserved, RootTypeMap, SchemaRemoval, SdlToGraphOptions,
 };
 pub use until::{is_until_expired, parse_until};
 

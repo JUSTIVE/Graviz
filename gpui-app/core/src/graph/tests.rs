@@ -778,3 +778,27 @@ fn parses_the_production_schema() {
     assert!(g.root_types.query.is_some());
     assert!(g.edges.len() > 1000);
 }
+
+#[test]
+fn reserved_marks_are_read_from_fields_and_enum_values() {
+    let g = graph(
+        r#"directive @reserved(reason: String!, until: String!) on FIELD_DEFINITION | ENUM_VALUE | INPUT_FIELD_DEFINITION
+           type Query { a: Int @reserved(reason: "DEV-1", until: "2026-12-31") b: Int }
+           input In { x: Int @reserved(reason: "DEV-2", until: "soon") }
+           enum E { ON @reserved(reason: "DEV-3", until: "2027-01-01") OFF }"#,
+    );
+    assert!(g.error.is_none(), "{:?}", g.error);
+    let node = |n: &str| g.nodes.iter().find(|x| x.name == n).unwrap();
+    let q = node("Query").fields.as_ref().unwrap();
+    assert_eq!(
+        q[0].reserved,
+        Some(Reserved { reason: Some("DEV-1".into()), until: Some("2026-12-31".into()) })
+    );
+    assert_eq!(q[1].reserved, None);
+    // A date that is not YYYY-MM-DD keeps the mark but drops the date.
+    let x = &node("In").fields.as_ref().unwrap()[0];
+    assert_eq!(x.reserved, Some(Reserved { reason: Some("DEV-2".into()), until: None }));
+    let v = node("E").values.as_ref().unwrap();
+    assert_eq!(v[0].reserved.as_ref().unwrap().until.as_deref(), Some("2027-01-01"));
+    assert_eq!(v[1].reserved, None);
+}
