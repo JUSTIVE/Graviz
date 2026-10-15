@@ -377,6 +377,10 @@ impl Render for Palette {
             // A dimmed backdrop says the rest of the window is not listening,
             // and gives the click that dismisses somewhere to land.
             .bg(gpui::black().opacity(0.35))
+            // The canvas's wheel and hover handlers only fire when its
+            // hitbox is hovered; occluding it here keeps a scroll over the
+            // palette, or one that runs past the list's end, off the canvas.
+            .occlude()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|_, _, _, cx| cx.emit(PaletteEvent::Dismiss)),
