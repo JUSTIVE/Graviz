@@ -38,6 +38,20 @@ const KIND_ORDER: [(NodeKind, &str); 6] = [
     (NodeKind::Input, "input"),
 ];
 
+/// What a hit names: a type itself, or one of its fields. Filtered apart
+/// from the kind, which a field hit takes from its owning type.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Target {
+    Type,
+    Field,
+}
+
+const TARGET_ORDER: [(Target, &str); 2] = [(Target::Type, "types"), (Target::Field, "fields")];
+
+fn target(r: &SearchResult) -> Target {
+    if r.field_name.is_some() { Target::Field } else { Target::Type }
+}
+
 /// Scalars that are never navigable (web `BUILTIN`).
 const BUILTIN: [&str; 5] = ["String", "Int", "Float", "Boolean", "ID"];
 
@@ -73,10 +87,14 @@ pub struct TreePanel {
     search: TextEdit,
     /// Unfiltered hits — the kind chips count over these.
     results: Vec<SearchResult>,
-    /// Indices into `results` surviving `kind_filter`.
+    /// Indices into `results` surviving both filters.
     filtered: Vec<usize>,
+    /// Each chip counts the hits the other filter lets through, so a count
+    /// says how many rows clicking it would leave.
     kind_counts: HashMap<NodeKind, usize>,
     kind_filter: HashSet<NodeKind>,
+    target_counts: HashMap<Target, usize>,
+    target_filter: Option<Target>,
     /// Alphabetical card indices for the "All types" list.
     all_sorted: Vec<u32>,
     /// Index into `filtered` for keyboard navigation.
@@ -116,6 +134,8 @@ impl TreePanel {
             results: Vec::new(),
             filtered: Vec::new(),
             kind_counts: HashMap::new(),
+            target_counts: HashMap::new(),
+            target_filter: None,
             kind_filter: HashSet::new(),
             all_sorted,
             active: 0,
@@ -137,6 +157,12 @@ impl TreePanel {
         // on a query or a selected type so selfshots can verify both states.
         if let Ok(q) = std::env::var("GRAVIZ_TREE") {
             this.search.set_text(q);
+            // GRAVIZ_TREE_TARGET=types|fields: with the target chip on.
+            this.target_filter = match std::env::var("GRAVIZ_TREE_TARGET").as_deref() {
+                Ok("types") => Some(Target::Type),
+                Ok("fields") => Some(Target::Field),
+                _ => None,
+            };
             this.refresh();
         }
         if let Ok(name) = std::env::var("GRAVIZ_TREE_SEL") {
@@ -175,6 +201,7 @@ impl TreePanel {
         self.model = model;
         self.search.clear();
         self.kind_filter.clear();
+        self.target_filter = None;
         self.selected = None;
         self.pinned = None;
         self.implementers.clear();
@@ -191,15 +218,25 @@ impl TreePanel {
         } else {
             search_graph(&self.model.graph, &self.search.text)
         };
+        let kind_ok = |r: &SearchResult| {
+            self.kind_filter.is_empty() || self.kind_filter.contains(&r.type_kind)
+        };
+        let target_ok = |r: &SearchResult| self.target_filter.is_none_or(|t| t == target(r));
         self.kind_counts.clear();
+        self.target_counts.clear();
         for r in &self.results {
-            *self.kind_counts.entry(r.type_kind).or_insert(0) += 1;
+            if target_ok(r) {
+                *self.kind_counts.entry(r.type_kind).or_insert(0) += 1;
+            }
+            if kind_ok(r) {
+                *self.target_counts.entry(target(r)).or_insert(0) += 1;
+            }
         }
         self.filtered = self
             .results
             .iter()
             .enumerate()
-            .filter(|(_, r)| self.kind_filter.is_empty() || self.kind_filter.contains(&r.type_kind))
+            .filter(|(_, r)| kind_ok(r) && target_ok(r))
             .map(|(i, _)| i)
             .collect();
         self.active = 0;
@@ -220,8 +257,15 @@ impl TreePanel {
         cx.notify();
     }
 
+    fn toggle_target(&mut self, t: Target, cx: &mut Context<Self>) {
+        self.target_filter = if self.target_filter == Some(t) { None } else { Some(t) };
+        self.refresh();
+        cx.notify();
+    }
+
     fn clear_kind_filter(&mut self, cx: &mut Context<Self>) {
         self.kind_filter.clear();
+        self.target_filter = None;
         self.refresh();
         cx.notify();
     }
@@ -605,6 +649,36 @@ impl TreePanel {
     // ---- 3. kind filter chips --------------------------------------------
 
     fn render_kind_chips(&self, th: Theme, cx: &mut Context<Self>) -> AnyElement {
+        // Types or fields first, apart from the kinds by a rule: the two
+        // filters answer different questions.
+        let targets = TARGET_ORDER.into_iter().map(|(t, label)| {
+            let active = self.target_filter == Some(t);
+            let count = self.target_counts.get(&t).copied().unwrap_or(0);
+            div()
+                .id(label)
+                .flex()
+                .items_center()
+                .gap_1()
+                .rounded_full()
+                .border_1()
+                .px_2()
+                .py(px(2.0))
+                .text_size(px(10.0))
+                .cursor_pointer()
+                .border_color(if active { transparent_black() } else { th.card_border })
+                .when(active, |el| el.bg(th.active_bg).text_color(th.text))
+                .when(!active, |el| el.text_color(th.text_muted))
+                .on_click(cx.listener(move |this, _, _, cx| this.toggle_target(t, cx)))
+                .child(SharedString::from(label))
+                .child(
+                    div()
+                        .font_family(MONO)
+                        .text_size(px(9.0))
+                        .text_color(if active { th.text } else { th.text_muted.opacity(0.7) })
+                        .child(SharedString::from(count.to_string())),
+                )
+        });
+        let rule = div().w(px(1.0)).h(px(14.0)).mx_1().bg(th.panel_border);
         let chips = KIND_ORDER
             .into_iter()
             .filter(|(k, _)| self.kind_counts.get(k).copied().unwrap_or(0) > 0)
@@ -647,8 +721,10 @@ impl TreePanel {
             .py(px(6.0))
             .border_b_1()
             .border_color(th.panel_border)
+            .children(targets)
+            .child(rule)
             .children(chips)
-            .when(!self.kind_filter.is_empty(), |el| {
+            .when(!self.kind_filter.is_empty() || self.target_filter.is_some(), |el| {
                 el.child(
                     div()
                         .id("kind-clear")
