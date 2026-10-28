@@ -1,7 +1,7 @@
 //! Two-pane workspace: tree sidebar + graph canvas, with a mode tab bar,
 //! view toggles, the in-app overlay editor dock, file watching, and global
 //! shortcuts (⌘K search, ⌘B sidebar, ⌘D descriptions, ⌘E bundling,
-//! ⌘I investigate, ⌘P primitives, ⌘R relay, ⌘U overlay dock, ⌘O open,
+//! ⌘I investigate, ⌘P primitives, ⌘⇧I interface fields, ⌘R relay, ⌘U overlay dock, ⌘O open,
 //! ⌘⇧O load overlay file, ⌘[ back, ⌘↵ apply overlay).
 
 use crate::canvas::GraphCanvas;
@@ -37,6 +37,7 @@ actions!(
         ToggleCustomScalars,
         ToggleInvestigate,
         TogglePrimitives,
+        ToggleInterfaceFields,
         ToggleRelay,
         ToggleOverlayDock,
         OpenSchema,
@@ -56,6 +57,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-shift-s", ToggleCustomScalars, None),
         KeyBinding::new("cmd-i", ToggleInvestigate, None),
         KeyBinding::new("cmd-p", TogglePrimitives, None),
+        KeyBinding::new("cmd-shift-i", ToggleInterfaceFields, None),
         KeyBinding::new("cmd-r", ToggleRelay, None),
         KeyBinding::new("cmd-u", ToggleOverlayDock, None),
         KeyBinding::new("cmd-o", OpenSchema, None),
@@ -274,6 +276,7 @@ impl Workspace {
             bundle_edges: settings.bundle_edges,
             hide_custom_scalars: settings.hide_custom_scalars,
             hide_primitive_fields: settings.hide_primitive_fields,
+            hide_interface_fields: settings.hide_interface_fields,
             ..Default::default()
         };
         let sidebar_open = settings.sidebar_open;
@@ -290,7 +293,7 @@ impl Workspace {
         if options.hide_custom_scalars {
             crate::model::drop_custom_scalars(&mut sliced);
         }
-        let model = Rc::new(build_model(sliced, loaded.name.clone(), &options));
+        let model = Rc::new(build_model(sliced, loaded.name.clone(), &options.for_mode(mode)));
         if std::env::var("GRAVIZ_PERF").is_ok() {
             eprintln!(
                 "perf: layout+model {}ms — {} cards, {} edges",
@@ -554,6 +557,7 @@ impl Workspace {
             bundle_edges: self.options.bundle_edges,
             hide_custom_scalars: self.options.hide_custom_scalars,
             hide_primitive_fields: self.options.hide_primitive_fields,
+            hide_interface_fields: self.options.hide_interface_fields,
             hide_relay: self.hide_relay,
             sidebar_open: self.sidebar_open,
             sidebar_width: self.sidebar_width,
@@ -574,7 +578,8 @@ impl Workspace {
         if self.options.hide_custom_scalars {
             crate::model::drop_custom_scalars(&mut sliced);
         }
-        let model = Rc::new(build_model(sliced, self.schema_name.clone(), &self.options));
+        let model =
+            Rc::new(build_model(sliced, self.schema_name.clone(), &self.options.for_mode(self.mode)));
         self.model = model.clone();
         self.tree.update(cx, |tree, cx| tree.set_model(model.clone(), cx));
         let sources = palette_sources(
@@ -995,6 +1000,18 @@ impl Render for Workspace {
                 self.options.hide_primitive_fields,
                 |this, _, cx| {
                     this.options.hide_primitive_fields = !this.options.hide_primitive_fields;
+                    this.rebuild(cx);
+                    this.save_settings(cx);
+                },
+                cx,
+            ))
+            .child(self.chip(
+                th,
+                "hide-interface-fields",
+                "Hide interface fields",
+                self.options.hide_interface_fields,
+                |this, _, cx| {
+                    this.options.hide_interface_fields = !this.options.hide_interface_fields;
                     this.rebuild(cx);
                     this.save_settings(cx);
                 },
@@ -1869,6 +1886,11 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &TogglePrimitives, _, cx| {
                 this.options.hide_primitive_fields = !this.options.hide_primitive_fields;
+                this.rebuild(cx);
+                this.save_settings(cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleInterfaceFields, _, cx| {
+                this.options.hide_interface_fields = !this.options.hide_interface_fields;
                 this.rebuild(cx);
                 this.save_settings(cx);
             }))

@@ -120,6 +120,7 @@ const TIPS: &[&str] = &[
     "⌘K focuses the search box. Use Type.field syntax for two-phase matching.",
     "Click an edge to pin it — everything else dims and a card names both ends. Esc clears it.",
     "⌘P hides scalar fields and ⌘R hides the Relay boilerplate, to cut visual noise.",
+    "⌘⇧I hides the fields a type inherits from its interfaces — the interface card still lists them.",
     "⌘D renders SDL descriptions inline; ⌘E collapses parallel field edges into one arrow.",
     "⌘I highlights types and fields with no description, with a coverage figure in the corner.",
     "The Orphaned tab lists types no root operation can reach.",

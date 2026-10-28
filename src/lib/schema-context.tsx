@@ -1,4 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import { filterFields } from "./field-filter";
 import { markOverlay, prepareOverlay, type OverlayDiff } from "./overlay";
 import { allReachableIds, reachableFrom } from "./reachable";
 import { sdlToGraph, type GraphEdgeData, type GraphNodeData, type NodeKind, type ParsedGraph } from "./sdl-to-graph";
@@ -72,6 +73,10 @@ interface SchemaContextValue {
 
   hidePrimitiveFields: boolean;
   setHidePrimitiveFields: (v: boolean) => void;
+  /** Hide fields an object (or interface) inherits from the interfaces it
+   *  implements. */
+  hideInterfaceFields: boolean;
+  setHideInterfaceFields: (v: boolean) => void;
   hideRelayBoilerplate: boolean;
   setHideRelayBoilerplate: (v: boolean) => void;
 
@@ -99,7 +104,6 @@ const EMPTY_DIFF: OverlayDiff = {
 };
 const EMPTY_WARNINGS: string[] = [];
 const STORAGE_KEY = "gompassql:current";
-const BUILTIN_SCALARS = new Set(["String", "Int", "Float", "Boolean", "ID"]);
 
 const SchemaContext = createContext<SchemaContextValue | null>(null);
 
@@ -129,6 +133,7 @@ export function SchemaProvider({ children }: { children: React.ReactNode }) {
   const [rootType, setRootTypeState] = useState<string | null>(null);
   const [focusStack, setFocusStack] = useState<string[]>([]);
   const [hidePrimitiveFields, setHidePrimitiveFields] = useState(false);
+  const [hideInterfaceFields, setHideInterfaceFields] = useState(false);
   const [hideRelayBoilerplate, setHideRelayBoilerplate] = useState(true);
   const [pinnedField, setPinnedField] = useState<
     SchemaContextValue["pinnedField"]
@@ -234,40 +239,24 @@ export function SchemaProvider({ children }: { children: React.ReactNode }) {
   }, [graph, effectiveRoot, rootOps]);
 
   const { visibleNodes, visibleEdges } = useMemo(() => {
-    if (!hidePrimitiveFields) {
-      return { visibleNodes: visible.nodes, visibleEdges: visible.edges };
-    }
-
-    // Build per-node old-index → new-index maps for fields that survive the filter.
-    const indexRemap = new Map<string, Map<number, number>>();
-    const nodes = visible.nodes.map((n) => {
-      if (!n.fields) return n;
-      let newIdx = 0;
-      const remap = new Map<number, number>();
-      const fields = n.fields.filter((f, oldIdx) => {
-        if (BUILTIN_SCALARS.has(f.typeName)) return false;
-        remap.set(oldIdx, newIdx++);
-        return true;
-      });
-      if (fields.length === n.fields.length) return n;
-      indexRemap.set(n.id, remap);
-      return { ...n, fields };
+    const { nodes, edges } = filterFields(visible.nodes, visible.edges, graph.nodes, {
+      hidePrimitiveFields,
+      hideInterfaceFields,
     });
-
-    // Remap sourceFieldIndex on edges whose source node had fields removed.
-    const edges = visible.edges.map((e) => {
-      if (e.sourceFieldIndex == null) return e;
-      const remap = indexRemap.get(e.source);
-      if (!remap) return e;
-      const newIdx = remap.get(e.sourceFieldIndex);
-      if (newIdx === e.sourceFieldIndex) return e;
-      // newIdx undefined means the field itself was removed — keep edge as-is
-      // (primitive-typed fields never produce edges, so this shouldn't happen)
-      return newIdx != null ? { ...e, sourceFieldIndex: newIdx } : e;
-    });
-
     return { visibleNodes: nodes, visibleEdges: edges };
-  }, [visible.nodes, visible.edges, hidePrimitiveFields]);
+  }, [visible.nodes, visible.edges, graph.nodes, hidePrimitiveFields, hideInterfaceFields]);
+
+  // A field filter can hide the pinned row. The canvas resolves a pin by
+  // name and falls back to its index, which would land on whichever row
+  // moved up into that slot — so unpin a field that is no longer shown.
+  useEffect(() => {
+    setPinnedField((prev) => {
+      if (!prev) return prev;
+      const node = visibleNodes.find((n) => n.id === prev.typeId);
+      if (!node || node.kind === "Enum") return prev;
+      return node.fields?.some((f) => f.name === prev.fieldName) ? prev : null;
+    });
+  }, [visibleNodes]);
 
   const { orphanedNodes, orphanedEdges } = useMemo(() => {
     // Use reachability from ALL root operations so that types reachable
@@ -284,31 +273,12 @@ export function SchemaProvider({ children }: { children: React.ReactNode }) {
       (e) => orphanIds.has(e.source) && orphanIds.has(e.target),
     );
 
-    if (!hidePrimitiveFields) return { orphanedNodes: rawNodes, orphanedEdges: rawEdges };
-
-    const indexRemap = new Map<string, Map<number, number>>();
-    const nodes = rawNodes.map((n) => {
-      if (!n.fields) return n;
-      let newIdx = 0;
-      const remap = new Map<number, number>();
-      const fields = n.fields.filter((f, oldIdx) => {
-        if (BUILTIN_SCALARS.has(f.typeName)) return false;
-        remap.set(oldIdx, newIdx++);
-        return true;
-      });
-      if (fields.length === n.fields.length) return n;
-      indexRemap.set(n.id, remap);
-      return { ...n, fields };
-    });
-    const edges = rawEdges.map((e) => {
-      if (e.sourceFieldIndex == null) return e;
-      const remap = indexRemap.get(e.source);
-      if (!remap) return e;
-      const newIdx = remap.get(e.sourceFieldIndex);
-      return newIdx != null ? { ...e, sourceFieldIndex: newIdx } : e;
+    const { nodes, edges } = filterFields(rawNodes, rawEdges, graph.nodes, {
+      hidePrimitiveFields,
+      hideInterfaceFields,
     });
     return { orphanedNodes: nodes, orphanedEdges: edges };
-  }, [graph.nodes, graph.edges, effectiveRoot, hidePrimitiveFields, rootOps]);
+  }, [graph.nodes, graph.edges, effectiveRoot, hidePrimitiveFields, hideInterfaceFields, rootOps]);
 
   // Scan the entire schema (not just the reachable subset) for fields
   // and enum values whose `[until …]` sunset date has already passed.
@@ -445,6 +415,8 @@ export function SchemaProvider({ children }: { children: React.ReactNode }) {
       popTo,
       hidePrimitiveFields,
       setHidePrimitiveFields,
+      hideInterfaceFields,
+      setHideInterfaceFields,
       hideRelayBoilerplate,
       setHideRelayBoilerplate,
       pinnedField,
@@ -475,6 +447,7 @@ export function SchemaProvider({ children }: { children: React.ReactNode }) {
       pushFocus,
       popTo,
       hidePrimitiveFields,
+      hideInterfaceFields,
       hideRelayBoilerplate,
       pinnedField,
     ],

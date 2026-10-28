@@ -353,6 +353,9 @@ pub struct ModelOptions {
     pub bundle_edges: bool,
     /// Hide fields whose return type is a builtin scalar (String/Int/…).
     pub hide_primitive_fields: bool,
+    /// Hide fields a type declares only because an interface it implements
+    /// does. The interface's own card still lists them.
+    pub hide_interface_fields: bool,
     /// Drop declared-scalar nodes from the graph (and the edges to them).
     /// Fields that return one still show — just as a plain type, with
     /// nothing to navigate to.
@@ -364,12 +367,26 @@ pub struct ModelOptions {
     pub today: String,
 }
 
+impl ModelOptions {
+    /// The options a mode's canvas is built with. The Deprecated and Reserved
+    /// tabs exist to show particular fields, and their slices keep only some
+    /// interfaces, so hiding inherited fields there would hide arbitrarily.
+    pub fn for_mode(&self, mode: Mode) -> ModelOptions {
+        let mut o = self.clone();
+        if matches!(mode, Mode::Deprecated | Mode::Reserved) {
+            o.hide_interface_fields = false;
+        }
+        o
+    }
+}
+
 impl Default for ModelOptions {
     fn default() -> Self {
         ModelOptions {
             show_descriptions: false,
             bundle_edges: true,
             hide_primitive_fields: false,
+            hide_interface_fields: false,
             hide_custom_scalars: false,
             skip_layout: false,
             today: today_string(),
@@ -628,11 +645,48 @@ pub fn drop_custom_scalars(g: &mut ParsedGraph) {
     g.edges.retain(|e| !scalars.contains(&e.source) && !scalars.contains(&e.target));
 }
 
+/// Field names each type inherits from the interfaces it implements,
+/// following interface → interface chains.
+///
+/// Looked up within the slice being built. That loses nothing on the
+/// Reachable and Orphaned tabs — an implements edge runs from the interface,
+/// so a type and its interfaces always land in the same slice. The
+/// Deprecated and Reserved slices drop interfaces, which is why the
+/// workspace turns the filter off there (see `ModelOptions::for_mode`).
+fn inherited_field_names(graph: &ParsedGraph) -> HashMap<&str, HashSet<&str>> {
+    let by_id: HashMap<&str, &graviz_core::graph::GraphNodeData> =
+        graph.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+    let mut out = HashMap::new();
+    for n in &graph.nodes {
+        let Some(ifaces) = n.interfaces.as_deref().filter(|i| !i.is_empty()) else {
+            continue;
+        };
+        let mut names = HashSet::new();
+        let mut seen = HashSet::new();
+        let mut stack: Vec<&str> = ifaces.iter().map(String::as_str).collect();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let Some(iface) = by_id.get(id) else { continue };
+            names.extend(iface.fields.as_deref().unwrap_or(&[]).iter().map(|f| f.name.as_str()));
+            stack.extend(iface.interfaces.as_deref().unwrap_or(&[]).iter().map(String::as_str));
+        }
+        out.insert(n.id.as_str(), names);
+    }
+    out
+}
+
 pub fn build_model(graph: ParsedGraph, schema_name: String, options: &ModelOptions) -> Model {
     let mut index_of: HashMap<String, u32> = HashMap::with_capacity(graph.nodes.len());
     for (i, n) in graph.nodes.iter().enumerate() {
         index_of.insert(n.id.clone(), i as u32);
     }
+    let inherited = if options.hide_interface_fields {
+        inherited_field_names(&graph)
+    } else {
+        HashMap::new()
+    };
 
     // ---- cards ----
     let mut cards: Vec<Card> = Vec::with_capacity(graph.nodes.len());
@@ -661,9 +715,11 @@ pub fn build_model(graph: ParsedGraph, schema_name: String, options: &ModelOptio
         let mut rows: Vec<Row> = Vec::new();
         let mut row_map: Vec<Option<u32>> = Vec::new();
         let mut hidden_rows = 0usize;
+        let from_ifaces = inherited.get(n.id.as_str());
         for f in n.fields.as_deref().unwrap_or(&[]) {
-            let hidden =
-                options.hide_primitive_fields && BUILTIN_SCALARS.contains(&f.type_name.as_str());
+            let hidden = (options.hide_primitive_fields
+                && BUILTIN_SCALARS.contains(&f.type_name.as_str()))
+                || from_ifaces.is_some_and(|names| names.contains(f.name.as_str()));
             if hidden {
                 hidden_rows += 1;
                 row_map.push(None);
@@ -908,6 +964,14 @@ pub fn build_model(graph: ParsedGraph, schema_name: String, options: &ModelOptio
             continue;
         };
         if from == to {
+            continue;
+        }
+        // The interface card already draws an inherited field's edge. A
+        // hidden primitive field's edge (`del(input: X): Boolean` → `X`)
+        // stays, anchored to the card's middle by `port_y`.
+        if e.source_field.as_deref().is_some_and(|f| {
+            inherited.get(e.source.as_str()).is_some_and(|names| names.contains(f))
+        }) {
             continue;
         }
         let label: gpui::SharedString = match e.kind {
@@ -1224,6 +1288,59 @@ mod tests {
         assert_eq!(c.rows.len(), 1, "String field hidden");
         assert_eq!(c.display_row(0), None, "hidden field maps to nothing");
         assert_eq!(c.display_row(1), Some(0), "second field moved up");
+    }
+
+    /// An inherited field hides on the implementor, through an interface
+    /// chain, and takes its edge with it; the interface keeps both.
+    #[test]
+    fn hiding_interface_fields_hides_inherited_rows_and_their_edges() {
+        let m = model_of(
+            "interface Entity { id: ID! owner: Account }
+             interface Named implements Entity { id: ID! owner: Account name: String }
+             type User implements Named & Entity { id: ID! owner: Account name: String posts: [Post] }
+             type Account { id: ID! }
+             type Post { id: ID! }
+             type Query { me: User }",
+            ModelOptions {
+                hide_interface_fields: true,
+                today: "2020-01-01".into(),
+                ..Default::default()
+            },
+        );
+        let row_names = |id: &str| -> Vec<String> {
+            m.cards[m.index_of[id] as usize].rows.iter().map(|r| r.left.to_string()).collect()
+        };
+        assert_eq!(row_names("User"), ["posts"]);
+        assert_eq!(row_names("Named"), ["name"]);
+        assert_eq!(row_names("Entity"), ["id", "owner"], "the interface keeps its own");
+        let user = &m.cards[m.index_of["User"] as usize];
+        assert_eq!(user.hidden_rows, 3);
+        assert_eq!(user.display_row(3), Some(0), "posts moved up");
+        let account = m.index_of["Account"];
+        assert!(
+            !m.edges.iter().any(|e| e.from == user.index && e.to == account),
+            "the hidden owner field draws no edge"
+        );
+        assert!(
+            m.edges.iter().any(|e| e.from == m.index_of["Entity"] && e.to == account),
+            "the interface still does"
+        );
+    }
+
+    /// A field hidden as primitive can still point somewhere through an
+    /// input argument; that edge must survive.
+    #[test]
+    fn hiding_primitives_keeps_the_edge_to_an_input_argument() {
+        let m = model_of(
+            "input DeleteInput { id: ID! } type Mutation { del(input: DeleteInput!): Boolean }",
+            ModelOptions {
+                hide_primitive_fields: true,
+                today: "2020-01-01".into(),
+                ..Default::default()
+            },
+        );
+        let (from, to) = (m.index_of["Mutation"], m.index_of["DeleteInput"]);
+        assert!(m.edges.iter().any(|e| e.from == from && e.to == to));
     }
 
     /// "Hide custom scalars" declutters the graph's edges by dropping the
