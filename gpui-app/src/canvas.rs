@@ -809,6 +809,18 @@ fn card_is_documented(card: &crate::model::Card) -> bool {
         })
 }
 
+/// Does the overlay highlight keep this card lit? A new type, or an
+/// existing type that gained an overlay field.
+fn card_is_overlay_lit(card: &crate::model::Card) -> bool {
+    card.is_overlay || card.rows.iter().any(|r| r.is_overlay)
+}
+
+/// Under the overlay highlight, an edge stays lit when either end is lit.
+fn edge_touches_lit(from: u32, to: u32, lit: &[bool]) -> bool {
+    let at = |i: u32| lit.get(i as usize).copied().unwrap_or(false);
+    at(from) || at(to)
+}
+
 /// Should this card be drawn dimmed?
 ///
 /// With an edge pinned only its two endpoints stay lit. With a card focused,
@@ -1723,12 +1735,21 @@ fn paint_scene(
     // builder silently drops geometry. Flush in batches well under that cap
     // (the web app hit the same wall and batched for the same reason).
     const SEGS_PER_BATCH: usize = 900;
+    // Overlay highlight lights the cards the overlay touched; an edge stays
+    // lit only when one of its ends is such a card. Otherwise the untouched
+    // schema's edges keep full strength and bury the handful that matter.
+    let overlay_lit: Option<Vec<bool>> = highlight_overlay
+        .then(|| model.cards.iter().map(card_is_overlay_lit).collect());
     for (group, dim_pass) in groups.iter().flat_map(|&g| [(g, false), (g, true)]) {
         let color = if dim_pass {
             // With a focus of any kind the dimmed edges have to recede hard;
             // without one this pass is only the hub fading, which should stay
             // legible.
-            let a = if focused_edge.is_some() || focus.is_some() || investigate {
+            let a = if focused_edge.is_some()
+                || focus.is_some()
+                || investigate
+                || overlay_lit.is_some()
+            {
                 FOCUS_DIM_ALPHA
             } else {
                 0.35
@@ -1782,6 +1803,9 @@ fn paint_scene(
             // actually needs the prose. The web dims every edge here too.
             if investigate {
                 dimmed = true;
+            }
+            if let Some(lit) = &overlay_lit {
+                dimmed = !edge_touches_lit(e.from, e.to, lit);
             }
             if dimmed != dim_pass {
                 continue;
@@ -1880,10 +1904,7 @@ fn paint_scene(
         }
         n_cards += 1;
         let ci = i as u32;
-        let dim = if highlight_overlay
-            && !card.is_overlay
-            && !card.rows.iter().any(|r| r.is_overlay)
-        {
+        let dim = if highlight_overlay && !card_is_overlay_lit(card) {
             DIM_ALPHA
         } else if investigate && card_is_documented(card) {
             // Investigate is a search for what is missing; a fully documented
@@ -2554,6 +2575,11 @@ mod tests {
 
     #[test]
     fn with_no_focus_at_all_only_hub_edges_fade() {
+        let lit = [false, true, false];
+        assert!(edge_touches_lit(1, 2, &lit));
+        assert!(edge_touches_lit(0, 1, &lit));
+        assert!(!edge_touches_lit(0, 2, &lit));
+        assert!(!edge_touches_lit(0, 9, &lit));
         assert!(edge_is_dimmed(8, 3, 4, true, None, None));
         assert!(!edge_is_dimmed(8, 3, 4, false, None, None));
         assert!(!card_is_dimmed(4, None, None, &|_| false));
