@@ -17,6 +17,7 @@ mod selfshot;
 mod textedit;
 mod theme;
 mod tree;
+mod tween;
 mod update_check;
 mod workspace;
 
@@ -67,39 +68,43 @@ fn main() {
     #[cfg(target_os = "macos")]
     selfshot::arm_if_requested();
 
-    gpui_platform::application().with_assets(icons::Assets).run(move |cx: &mut App| {
-        workspace::init(cx);
-        // The window has no system titlebar, but the app still needs the
-        // standard menu: without it macOS gives ⌘Q to nothing.
-        cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
-        cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
-        cx.set_menus(vec![Menu {
-            name: "Graviz".into(),
-            items: vec![
-                MenuItem::action("Settings…", workspace::OpenSettings),
-                MenuItem::separator(),
-                MenuItem::action("Quit Graviz", Quit),
-            ],
-            disabled: false,
-        }]);
-        let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(gpui::TitlebarOptions {
-                    title: Some("Graviz".into()),
-                    appears_transparent: true,
-                    // Centred in the title strip: (strip - 12pt button) / 2.
-                    traffic_light_position: Some(gpui::point(
-                        px(10.0),
-                        px((shell::TITLEBAR_H - 12.0) / 2.0),
-                    )),
-                }),
-                ..Default::default()
-            },
-            |_, cx| cx.new(|cx| Root::new(initial, cx)),
-        )
-        .unwrap();
-        cx.activate(true);
-    });
+    gpui_platform::application()
+        .with_assets(gpui_metro::Assets::with_fallback(icons::Assets))
+        .run(move |cx: &mut App| {
+            gpui_metro::init(cx);
+            theme::set_accent(cx, theme::accent_from_name(&config::load_settings().accent));
+            workspace::init(cx);
+            // The window has no system titlebar, but the app still needs the
+            // standard menu: without it macOS gives ⌘Q to nothing.
+            cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+            cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
+            cx.set_menus(vec![Menu {
+                name: "Graviz".into(),
+                items: vec![
+                    MenuItem::action("Settings…", workspace::OpenSettings),
+                    MenuItem::separator(),
+                    MenuItem::action("Quit Graviz", Quit),
+                ],
+                disabled: false,
+            }]);
+            let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: Some(gpui::TitlebarOptions {
+                        title: Some("Graviz".into()),
+                        appears_transparent: true,
+                        // Centred in the title strip: (strip - 12pt button) / 2.
+                        traffic_light_position: Some(gpui::point(
+                            px(10.0),
+                            px((shell::TITLEBAR_H - 12.0) / 2.0),
+                        )),
+                    }),
+                    ..Default::default()
+                },
+                |_, cx| cx.new(|cx| Root::new(initial, cx)),
+            )
+            .unwrap();
+            cx.activate(true);
+        });
 }

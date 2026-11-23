@@ -57,79 +57,136 @@ impl Theme {
     }
 }
 
-// Base palette mirrors the web app's shadcn OKLCH variables converted to
-// sRGB (Tailwind `neutral`): --background/--card/--muted/--border/…
-fn dark() -> Theme {
+// Metro grounds: pure black / pure white, one accent, no gradients. The
+// chrome layer is WP's `PhoneChromeBrush` (#1F1F1F / #DDDDDD); borders are
+// faint so the type, not boxes, carries the structure.
+//
+// Kind colours are the closest WP8 accents to the web's -500 series, so the
+// graph keeps its semantics but reads as the same system as the chrome.
+fn dark(accent: Hsla) -> Theme {
     Theme {
-        bg: rgb(0x0a0a0a).into(),          // --background
-        panel: rgb(0x171717).into(),       // --sidebar / --card
-        panel_border: rgba(0xffffff1a).into(), // --border: white/10%
-        card_bg: rgb(0x171717).into(),     // --card
-        card_border: rgba(0xffffff1a).into(),
-        text: rgb(0xfafafa).into(),        // --foreground
-        text_muted: rgb(0xa1a1a1).into(),  // --muted-foreground
-        text_faint: rgb(0x737373).into(),
-        hover_bg: rgb(0x262626).into(),    // --accent
-        active_bg: rgb(0x262626).into(),   // --secondary
-        input_bg: rgba(0xffffff26).into(), // --input: white/15%
-        chrome_bg: rgba(0x171717f0).into(), // --popover, translucent
-        type_amber: rgb(0xf59e0b).into(),
-        red: rgb(0xff6467).into(),         // --destructive
-        overlay_green: rgb(0x10b981).into(),
-        arg_orange: rgb(0xe08a4a).into(),
-        accent: rgb(0x0ea5e9).into(),
-        primary: rgb(0xe5e5e5).into(),
-        primary_fg: rgb(0x171717).into(),
-        type_builtin: rgb(0xb08c5a).into(),
-        relay_orange: rgb(0xf26a03).into(),
-        investigate: rgb(0xf97316).into(),
-        pin: rgb(0xf97316).into(),
-        expired: rgb(0xef4444).into(),
-        shadow: gpui::black().opacity(0.35),
-        kind_object: rgb(0x0ea5e9).into(),
-        kind_interface: rgb(0x8b5cf6).into(),
-        kind_union: rgb(0xf59e0b).into(),
-        kind_enum: rgb(0x10b981).into(),
-        kind_input: rgb(0xd946ef).into(),
-        kind_scalar: rgb(0xf43f5e).into(),
+        bg: rgb(0x000000).into(),
+        panel: rgb(0x0f0f0f).into(),
+        panel_border: rgba(0xffffff26).into(),
+        card_bg: rgb(0x1f1f1f).into(),
+        card_border: rgba(0xffffff33).into(),
+        text: rgb(0xffffff).into(),
+        text_muted: rgba(0xffffff99).into(), // PhoneSubtleBrush
+        text_faint: rgba(0xffffff66).into(), // PhoneDisabledBrush
+        hover_bg: rgba(0xffffff1a).into(),
+        active_bg: accent.opacity(0.22),
+        input_bg: rgba(0xffffff1f).into(),
+        chrome_bg: rgba(0x1f1f1ff2).into(),  // PhoneChromeBrush
+        type_amber: rgb(0xf0a30a).into(),    // amber
+        red: rgb(0xe51400).into(),           // red
+        overlay_green: rgb(0x60a917).into(), // green
+        arg_orange: rgb(0xfa6800).into(),    // orange
+        accent,
+        primary: accent,
+        primary_fg: gpui::white(),
+        type_builtin: rgb(0x87794e).into(), // taupe
+        relay_orange: rgb(0xfa6800).into(),
+        investigate: rgb(0xfa6800).into(),
+        pin: rgb(0xfa6800).into(),
+        expired: rgb(0xe51400).into(),
+        shadow: gpui::black().opacity(0.0),
+        kind_object: rgb(0x1ba1e2).into(),    // cyan
+        kind_interface: rgb(0xaa00ff).into(), // violet
+        kind_union: rgb(0xf0a30a).into(),     // amber
+        kind_enum: rgb(0x60a917).into(),      // green
+        kind_input: rgb(0xd80073).into(),     // magenta
+        kind_scalar: rgb(0xe51400).into(),    // red
     }
 }
 
-fn light() -> Theme {
+fn light(accent: Hsla) -> Theme {
     Theme {
-        bg: rgb(0xfafaf9).into(),          // --background
-        panel: rgb(0xfafafa).into(),       // --sidebar
-        panel_border: rgb(0xe5e5e5).into(), // --border
-        card_bg: rgb(0xffffff).into(),     // --card
-        card_border: rgb(0xe5e5e5).into(),
-        text: rgb(0x0a0a0a).into(),        // --foreground
-        text_muted: rgb(0x737373).into(),  // --muted-foreground
-        text_faint: rgb(0xa1a1a1).into(),
-        hover_bg: rgb(0xf5f5f5).into(),    // --accent
-        active_bg: rgb(0xf5f5f5).into(),   // --secondary
-        input_bg: rgb(0xffffff).into(),
-        chrome_bg: rgba(0xfffffff0).into(), // --popover, translucent
-        type_amber: rgb(0xf59e0b).into(),
-        red: rgb(0xe7000b).into(),         // --destructive
-        overlay_green: rgb(0x10b981).into(),
-        arg_orange: rgb(0xb05a1f).into(),
-        accent: rgb(0x0369a1).into(),
-        primary: rgb(0x171717).into(),
-        primary_fg: rgb(0xfafafa).into(),
-        type_builtin: rgb(0xb08c5a).into(),
-        relay_orange: rgb(0xf26a03).into(),
-        investigate: rgb(0xf97316).into(),
-        pin: rgb(0xf97316).into(),
-        expired: rgb(0xef4444).into(),
-        shadow: gpui::black().opacity(0.18),
-        // KIND_COLORS is theme-independent in the web app (KIND_COLORS_DARK
-        // exists but has no consumer), so light uses the same -500 series.
-        kind_object: rgb(0x0ea5e9).into(),
-        kind_interface: rgb(0x8b5cf6).into(),
-        kind_union: rgb(0xf59e0b).into(),
-        kind_enum: rgb(0x10b981).into(),
-        kind_input: rgb(0xd946ef).into(),
-        kind_scalar: rgb(0xf43f5e).into(),
+        bg: rgb(0xffffff).into(),
+        panel: rgb(0xf7f7f7).into(),
+        panel_border: rgba(0x00000021).into(),
+        card_bg: rgb(0xf2f2f2).into(),
+        card_border: rgba(0x00000033).into(),
+        text: rgb(0x000000).into(),
+        text_muted: rgba(0x00000099).into(),
+        text_faint: rgba(0x00000066).into(),
+        hover_bg: rgba(0x00000012).into(),
+        active_bg: accent.opacity(0.16),
+        input_bg: rgba(0x00000014).into(),
+        chrome_bg: rgba(0xddddddf2).into(),
+        type_amber: rgb(0xc98700).into(),
+        red: rgb(0xe51400).into(),
+        overlay_green: rgb(0x339933).into(),
+        arg_orange: rgb(0xd35400).into(),
+        accent,
+        primary: accent,
+        primary_fg: gpui::white(),
+        type_builtin: rgb(0x87794e).into(),
+        relay_orange: rgb(0xd35400).into(),
+        investigate: rgb(0xfa6800).into(),
+        pin: rgb(0xfa6800).into(),
+        expired: rgb(0xe51400).into(),
+        shadow: gpui::black().opacity(0.0),
+        kind_object: rgb(0x1ba1e2).into(),
+        kind_interface: rgb(0xaa00ff).into(),
+        kind_union: rgb(0xf0a30a).into(),
+        kind_enum: rgb(0x60a917).into(),
+        kind_input: rgb(0xd80073).into(),
+        kind_scalar: rgb(0xe51400).into(),
+    }
+}
+
+/// The Metro accent the user picked (Settings → accent), read from the
+/// `gpui_metro::Theme` global so the vendored components and the graph agree.
+pub fn accent(cx: &gpui::App) -> gpui_metro::Accent {
+    cx.try_global::<gpui_metro::Theme>()
+        .map(|t| t.accent)
+        .unwrap_or(gpui_metro::Accent::Cobalt)
+}
+
+pub fn accent_from_name(name: &str) -> gpui_metro::Accent {
+    gpui_metro::Accent::ALL
+        .into_iter()
+        .find(|a| a.name() == name)
+        .unwrap_or(gpui_metro::Accent::Cobalt)
+}
+
+pub fn set_accent(cx: &mut gpui::App, accent: gpui_metro::Accent) {
+    gpui_metro::Theme::set_accent(accent, cx);
+}
+
+/// Keeps the metro components' dark/light ground in step with the mode this
+/// app resolved (explicit choice, else the window's appearance). Call from a
+/// root render; it only touches the global when the two disagree.
+pub fn sync_metro(cx: &mut gpui::App, appearance: WindowAppearance) {
+    let want = if is_dark(mode(cx), appearance) {
+        gpui_metro::Mode::Dark
+    } else {
+        gpui_metro::Mode::Light
+    };
+    if cx
+        .try_global::<gpui_metro::Theme>()
+        .is_some_and(|t| t.mode != want)
+    {
+        gpui_metro::Theme::set_mode(want, cx);
+    }
+}
+
+fn is_dark(mode: ThemeMode, appearance: WindowAppearance) -> bool {
+    match mode {
+        ThemeMode::Light => false,
+        ThemeMode::Dark => true,
+        ThemeMode::System => {
+            if std::env::var("GRAVIZ_LIGHT").is_ok() {
+                return false;
+            }
+            if std::env::var("GRAVIZ_DARK").is_ok() {
+                return true;
+            }
+            matches!(
+                appearance,
+                WindowAppearance::Dark | WindowAppearance::VibrantDark
+            )
+        }
     }
 }
 
@@ -157,30 +214,24 @@ pub fn set_mode(cx: &mut gpui::App, mode: ThemeMode) {
     cx.set_global(ThemeState(Some(mode)));
 }
 
-/// The palette every view should use: the explicit choice, else the system.
+/// The palette every view should use: the explicit choice, else the system,
+/// tinted with the chosen Metro accent.
 pub fn current(cx: &gpui::App, appearance: WindowAppearance) -> Theme {
-    theme_for(mode(cx), appearance)
+    let accent = accent(cx).color();
+    if is_dark(mode(cx), appearance) {
+        dark(accent)
+    } else {
+        light(accent)
+    }
 }
 
-/// Palette for an explicit mode, falling back to the window appearance.
+/// Palette for an explicit mode (accent fixed to cobalt; for tests/previews).
+#[allow(dead_code)]
 pub fn theme_for(mode: ThemeMode, appearance: WindowAppearance) -> Theme {
-    match mode {
-        ThemeMode::Light => light(),
-        ThemeMode::Dark => dark(),
-        ThemeMode::System => theme(appearance),
-    }
-}
-
-pub fn theme(appearance: WindowAppearance) -> Theme {
-    // Debug overrides so automated selfshots can exercise both palettes.
-    if std::env::var("GRAVIZ_LIGHT").is_ok() {
-        return light();
-    }
-    if std::env::var("GRAVIZ_DARK").is_ok() {
-        return dark();
-    }
-    match appearance {
-        WindowAppearance::Dark | WindowAppearance::VibrantDark => dark(),
-        WindowAppearance::Light | WindowAppearance::VibrantLight => light(),
+    let accent = gpui_metro::Accent::Cobalt.color();
+    if is_dark(mode, appearance) {
+        dark(accent)
+    } else {
+        light(accent)
     }
 }

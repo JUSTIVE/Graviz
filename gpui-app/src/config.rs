@@ -43,6 +43,8 @@ pub struct Settings {
     pub dock_height: f32,
     pub theme_mode: crate::theme::ThemeMode,
     pub scroll_mode: ScrollMode,
+    /// Metro accent name (`gpui_metro::Accent::name`).
+    pub accent: String,
 }
 
 /// Drag limits for the two resizable panes, matching the web's clamps.
@@ -66,6 +68,7 @@ impl Default for Settings {
             dock_height: DOCK_DEFAULT_H,
             theme_mode: crate::theme::ThemeMode::System,
             scroll_mode: ScrollMode::Zoom,
+            accent: "cobalt".to_string(),
         }
     }
 }

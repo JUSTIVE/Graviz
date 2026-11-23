@@ -1,41 +1,21 @@
-//! Landing screen — the web app's `/` route: title, action bar, recent
-//! schemas card, SDL editor, error/warning banners and the Visualize button.
+//! Landing screen — a Metro start screen: big light title, accent tiles for
+//! open / sample / visualize and one wide tile per recent schema, the SDL
+//! paste editor, and error / warning blocks.
 
 use crate::config::{self, RecentEntry};
 use crate::editor::TextArea;
-use crate::icons::{icon, Icon};
 use crate::theme::Theme;
-use gpui::{div, prelude::*, px, Entity, SharedString, Stateful, Window};
+use gpui::{div, prelude::*, px, Entity, SharedString, Window};
+use gpui_metro::{
+    theme::size as msize, tile, tile_grid, Icon as MIcon, TextStyle, Theme as MetroTheme, TileSize,
+};
 use std::path::PathBuf;
 
 pub const SAMPLE_SDL: &str = include_str!("../assets/sample.graphql");
 pub const EXTENSIONS: &str = ".graphql · .graphqls · .gql · .sdl · .txt";
 
-/// A `size=sm, variant=outline` shadcn button: 32px tall, 8px radius.
-pub fn outline_button(
-    th: Theme,
-    id: &'static str,
-    glyph: Icon,
-    label: &'static str,
-) -> Stateful<gpui::Div> {
-    div()
-        .id(id)
-        .h(px(32.0))
-        .flex()
-        .flex_none()
-        .items_center()
-        .gap_1()
-        .rounded_md()
-        .border_1()
-        .border_color(th.card_border)
-        .px(px(10.0))
-        .text_sm()
-        .text_color(th.text)
-        .cursor_pointer()
-        .hover(|el| el.bg(th.hover_bg))
-        .child(icon(glyph, px(14.0), th.text))
-        .child(SharedString::from(label))
-}
+/// gpui-metro's hyperlink is phone-sized (20 px); 0.7 makes it 14 px.
+const LINK_SCALE: f32 = 0.7;
 
 /// `2025-08-19 09:41` — the web's history timestamp format.
 pub fn format_stamp(secs: i64) -> String {
@@ -83,8 +63,17 @@ pub struct LandingProps<'a> {
     pub dragging: bool,
 }
 
-/// Builds the landing body. Callbacks are wired by the caller through the
-/// returned element ids: `open-file`, `load-sample`, `visualize`,
+/// Start-screen grid metrics. The action grid (6 columns of 72) and the
+/// recents grid (8 columns of 52) are both 472px wide, so their edges line up.
+const ACTION_UNIT: f32 = 72.0;
+const RECENT_UNIT: f32 = 52.0;
+const GAP: f32 = 8.0;
+const GRID_W: f32 = 6.0 * ACTION_UNIT + 5.0 * GAP;
+/// Recents shown while the list is collapsed: two rows of wide tiles.
+const RECENTS_COLLAPSED: usize = 4;
+
+/// Builds the landing body — a Metro start screen. Callbacks are wired by the
+/// caller; element ids: `open-file`, `load-sample`, `visualize`,
 /// `toggle-recents`, `clear-recents`, `recent-{i}`, `recent-x-{i}`.
 #[allow(clippy::too_many_arguments)]
 pub fn view<T: 'static>(
@@ -99,404 +88,379 @@ pub fn view<T: 'static>(
     cx: &mut gpui::Context<T>,
 ) -> impl IntoElement {
     let th = p.th;
-    let recents = p.recents.to_vec();
+    let mp = MetroTheme::palette(cx);
+    let font = MetroTheme::font(cx);
+    let ink = mp.accent_ink;
     let recents_open = p.recents_open;
+    let total = p.recents.len();
+    let shown: Vec<RecentEntry> = if recents_open {
+        p.recents.to_vec()
+    } else {
+        p.recents.iter().take(RECENTS_COLLAPSED).cloned().collect()
+    };
+    let sdl = p.editor.read(cx).text().to_string();
+    let has_text = !sdl.trim().is_empty();
+    let summary = has_text.then(|| summarize(&sdl));
+
+    // ── action tiles ──────────────────────────────────────────────────────
+    let open_tile = tile("open-file", TileSize::Medium)
+        .title("open")
+        .front(move |_, _| {
+            div()
+                .size_full()
+                .relative()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(MIcon::Upload.render(px(56.0), ink))
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(6.0))
+                        .right(px(8.0))
+                        .text_size(px(msize::SMALL))
+                        .text_color(ink.opacity(0.8))
+                        .child("⌘O"),
+                )
+        })
+        .on_click(cx.listener(move |this, _, window, cx| on_open(this, window, cx)));
+    let sample_tile = tile("load-sample", TileSize::Medium)
+        .title("sample")
+        .icon(MIcon::Flask)
+        .on_click(cx.listener(move |this, _, window, cx| on_sample(this, window, cx)));
+    let visualize_tile = {
+        let t = tile("visualize", TileSize::Medium)
+            .title("visualize")
+            .icon(MIcon::Play);
+        if has_text {
+            t.on_click(cx.listener(move |this, _, window, cx| on_visualize(this, window, cx)))
+        } else {
+            // Nothing to parse yet: a grey, inert tile.
+            t.color(mp.subtle)
+        }
+    };
+
+    // ── recent tiles ──────────────────────────────────────────────────────
+    let recent_tiles: Vec<_> = shown
+        .into_iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let pick = on_pick_recent.clone();
+            let remove = on_remove_recent.clone();
+            let path = PathBuf::from(r.path.clone());
+            let rp = r.path.clone();
+            let (stamp, stats) = entry_meta(&r);
+            let dir = short_dir(&r.path);
+            let name = r.name.clone();
+            let group: SharedString = format!("recent-tile-{i}").into();
+            let remove_click = cx.listener(move |this, _: &gpui::ClickEvent, window, cx| {
+                cx.stop_propagation();
+                remove(this, rp.clone(), window, cx)
+            });
+            tile(("recent", i), TileSize::Wide)
+                .front(move |_, _| {
+                    let line = |s: String, a: f32| {
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(ink.opacity(a))
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(SharedString::from(s))
+                    };
+                    div()
+                        .group(group.clone())
+                        .size_full()
+                        .relative()
+                        .flex()
+                        .flex_col()
+                        .justify_end()
+                        .px(px(10.0))
+                        .py(px(8.0))
+                        .child(
+                            div()
+                                .text_size(px(msize::MEDIUM))
+                                .text_color(ink)
+                                .whitespace_nowrap()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .child(SharedString::from(name)),
+                        )
+                        .child(line(dir, 0.85))
+                        .child(line(stamp, 0.7))
+                        .child(line(stats, 0.7))
+                        .child(
+                            div()
+                                .id(("recent-x", i))
+                                .absolute()
+                                .top(px(4.0))
+                                .right(px(4.0))
+                                .p(px(4.0))
+                                .opacity(0.0)
+                                .group_hover(group, |s| s.opacity(1.0))
+                                .hover(|s| s.bg(ink.opacity(0.2)))
+                                .cursor_pointer()
+                                .on_click(remove_click)
+                                .child(MIcon::Close.render(px(14.0), ink)),
+                        )
+                })
+                .on_click(
+                    cx.listener(move |this, _, window, cx| pick(this, path.clone(), window, cx)),
+                )
+        })
+        .collect();
+
+    // gpui-metro's hyperlink (underlined, accent while pressed), scaled from
+    // its 20 px phone size down to the 14 px this header row uses.
+    let link = |id: &'static str, label: String| gpui_metro::hyperlink(id, label);
+    let small = |l: gpui_metro::HyperlinkButton| gpui_metro::scaled(LINK_SCALE).child(l);
+
+    // ── left column: tiles ────────────────────────────────────────────────
+    let tiles_col = div()
+        .flex_none()
+        .w(px(GRID_W))
+        .min_h_0()
+        .flex()
+        .flex_col()
+        .child(
+            tile_grid()
+                .columns(6)
+                .metrics(ACTION_UNIT, GAP)
+                .tile(open_tile)
+                .tile(sample_tile)
+                .tile(visualize_tile),
+        )
+        .when(total > 0, |el| {
+            el.child(
+                div()
+                    .flex_none()
+                    .mt(px(28.0))
+                    .mb(px(10.0))
+                    .flex()
+                    .items_baseline()
+                    .gap(px(16.0))
+                    .child(TextStyle::Large.styled(cx).child("recent"))
+                    .child(div().flex_1())
+                    .when(total > RECENTS_COLLAPSED, |el| {
+                        el.child(small(
+                            link(
+                                "toggle-recents",
+                                if recents_open {
+                                    "show fewer".into()
+                                } else {
+                                    format!("show all ({total})")
+                                },
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| on_toggle_recents(this, window, cx),
+                            )),
+                        ))
+                    })
+                    .child(small(link("clear-recents", "clear all".into()).on_click(
+                        cx.listener(move |this, _, window, cx| on_clear_recents(this, window, cx)),
+                    ))),
+            )
+            .child(
+                div()
+                    // Scrolls rather than clips: the list grows with every
+                    // schema opened.
+                    .id("landing-recents")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(
+                        tile_grid()
+                            .columns(8)
+                            .metrics(RECENT_UNIT, GAP)
+                            .tiles(recent_tiles),
+                    ),
+            )
+        });
+
+    // ── right column: SDL editor + diagnostics ────────────────────────────
+    let editor_col = div()
+        .flex_1()
+        .min_w_0()
+        .min_h_0()
+        .flex()
+        .flex_col()
+        .gap(px(12.0))
+        .child(
+            div()
+                .flex_none()
+                .flex()
+                .items_baseline()
+                .gap(px(16.0))
+                .child(TextStyle::Large.styled(cx).child("paste sdl"))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .whitespace_nowrap()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .text_size(px(msize::SMALL))
+                        .text_color(mp.subtle)
+                        .when_some(p.schema_name.map(str::to_string), |el, n| {
+                            el.child(div().text_color(mp.accent).child(SharedString::from(n)))
+                        })
+                        .when(p.schema_name.is_none() && summary.is_none(), |el| {
+                            el.child("or drop a file anywhere")
+                        }),
+                )
+                .when_some(summary, |el, s| {
+                    el.child(
+                        div()
+                            .flex_none()
+                            .text_size(px(msize::SMALL))
+                            .text_color(mp.subtle)
+                            .child(SharedString::from(s)),
+                    )
+                }),
+        )
+        .child(div().flex_1().min_h_0().child(p.editor.clone()))
+        .when_some(p.error.map(str::to_string), |el, e| {
+            // Metro message block: solid fill, semibold heading, body text.
+            el.child(
+                div()
+                    .id("landing-error")
+                    .flex_none()
+                    .max_h(px(160.0))
+                    .overflow_y_scroll()
+                    .bg(th.red)
+                    .px(px(16.0))
+                    .py(px(12.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .text_color(gpui::white())
+                    .child(
+                        div()
+                            .text_size(px(msize::NORMAL))
+                            .font_weight(gpui_metro::theme::SEMIBOLD)
+                            .child("couldn't read this schema"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .font_family("Menlo")
+                            .child(SharedString::from(e)),
+                    ),
+            )
+        })
+        .when(!p.warnings.is_empty(), |el| {
+            let ws = p.warnings.to_vec();
+            el.child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(
+                        div()
+                            .text_size(px(msize::SMALL))
+                            .font_weight(gpui_metro::theme::SEMIBOLD)
+                            .text_color(th.type_amber)
+                            .child(
+                                "duplicate or conflicting type declarations — fix before \
+                                 visualizing",
+                            ),
+                    )
+                    .children(ws.into_iter().take(8).map(|w| {
+                        div()
+                            .text_size(px(12.0))
+                            .font_family("Menlo")
+                            .text_color(mp.subtle)
+                            .child(SharedString::from(w))
+                    })),
+            )
+        });
 
     div()
         .relative()
         .flex_1()
         .min_h_0()
         .bg(th.bg)
+        .font_family(font)
         .flex()
-        .justify_center()
+        .flex_col()
+        .overflow_hidden()
+        .px(px(48.0))
+        .pt(px(16.0))
+        .pb(px(32.0))
+        // title: big light lowercase heading (the shell already shows
+        // the GRAVIZ app title in the titlebar)
         .child(
             div()
-                .w_full()
-                .max_w(px(768.0))
-                .flex()
-                .flex_col()
-                .gap_4()
-                .overflow_hidden()
-                .p_6()
-                // 1. title + tagline
-                .child(
-                    div()
-                        .flex_none()
-                        .child(
-                            div()
-                                .text_2xl()
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .text_color(th.text)
-                                .child("Visualize your GraphQL schema"),
-                        )
-                        .child(
-                            div()
-                                .mt_1()
-                                .text_sm()
-                                .text_color(th.text_muted)
-                                .child(
-                                    "Drop a .graphql file, pick one, or paste SDL below. \
-                                     Parsed once, then opens an interactive explorer.",
-                                ),
-                        ),
-                )
-                // 2. action bar
-                .child(
-                    div()
-                        .flex_none()
-                        .flex()
-                        .flex_wrap()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            outline_button(th, "open-file", Icon::Upload, "Open file").on_click(
-                                cx.listener(move |this, _, window, cx| on_open(this, window, cx)),
-                            ),
-                        )
-                        .child(
-                            outline_button(th, "load-sample", Icon::Sparkles, "Load sample")
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    on_sample(this, window, cx)
-                                })),
-                        )
-                        .when_some(p.schema_name.map(str::to_string), |el, n| {
-                            el.child(
-                                div()
-                                    .ml_1()
-                                    .flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .text_xs()
-                                    .text_color(th.text_muted)
-                                    .child(icon(Icon::Link2, px(12.0), th.accent))
-                                    .child(SharedString::from(n)),
-                            )
-                        }),
-                )
-                // 3. recent schemas card
-                .when(!recents.is_empty(), |el| {
-                    el.child(
-                        div()
-                            .flex_none()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(th.card_border)
-                            .bg(th.card_bg)
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .px_3()
-                                    .py_2()
-                                    .child(
-                                        div()
-                                            .id("toggle-recents")
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(6.0))
-                                            .text_xs()
-                                            .text_color(th.text_muted)
-                                            .cursor_pointer()
-                                            .hover(|el| el.text_color(th.text))
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                on_toggle_recents(this, window, cx)
-                                            }))
-                                            .child(icon(
-                                                if recents_open {
-                                                    Icon::ChevronDown
-                                                } else {
-                                                    Icon::ChevronRight
-                                                },
-                                                px(14.0),
-                                                th.text_muted,
-                                            ))
-                                            .child(icon(Icon::History, px(14.0), th.text_muted))
-                                            .child(SharedString::from(format!(
-                                                "Recent schemas ({})",
-                                                recents.len()
-                                            ))),
-                                    )
-                                    .when(recents_open, |el| {
-                                        el.child(
-                                            div()
-                                                .id("clear-recents")
-                                                .h(px(28.0))
-                                                .flex()
-                                                .items_center()
-                                                .gap_1()
-                                                .rounded_md()
-                                                .px_2()
-                                                .text_xs()
-                                                .text_color(th.text_muted)
-                                                .cursor_pointer()
-                                                .hover(|el| el.text_color(th.red))
-                                                .on_click(cx.listener(
-                                                    move |this, _, window, cx| {
-                                                        on_clear_recents(this, window, cx)
-                                                    },
-                                                ))
-                                                .child(icon(Icon::Trash2, px(12.0), th.text_muted))
-                                                .child("Clear"),
-                                        )
-                                    }),
-                            )
-                            .when(recents_open, |el| {
-                                el.child(
-                                    div()
-                                        // Scrolls rather than clips: the list
-                                        // grows with every schema opened, and
-                                        // clipping simply hides the older ones.
-                                        .id("landing-recents")
-                                        .max_h(px(192.0))
-                                        .overflow_y_scroll()
-                                        .border_t_1()
-                                        .border_color(th.panel_border)
-                                        .flex()
-                                        .flex_col()
-                                        .children(recents.into_iter().enumerate().map(
-                                            |(i, r)| {
-                                                let pick = on_pick_recent.clone();
-                                                let remove = on_remove_recent.clone();
-                                                let path = PathBuf::from(r.path.clone());
-                                                let rp = r.path.clone();
-                                                let (stamp, stats) = entry_meta(&r);
-                                                div()
-                                                    .flex()
-                                                    .items_center()
-                                                    .gap_2()
-                                                    .px_3()
-                                                    .py_2()
-                                                    .border_b_1()
-                                                    .border_color(th.panel_border.opacity(0.5))
-                                                    .child(
-                                                        div()
-                                                            .id(("recent", i))
-                                                            .flex()
-                                                            .flex_1()
-                                                            .min_w_0()
-                                                            .flex_col()
-                                                            .gap(px(2.0))
-                                                            .cursor_pointer()
-                                                            .on_click(cx.listener(
-                                                                move |this, _, window, cx| {
-                                                                    pick(
-                                                                        this,
-                                                                        path.clone(),
-                                                                        window,
-                                                                        cx,
-                                                                    )
-                                                                },
-                                                            ))
-                                                            .child(
-                                                                div()
-                                                                    .text_sm()
-                                                                    .font_weight(
-                                                                        gpui::FontWeight::MEDIUM,
-                                                                    )
-                                                                    .text_color(th.text)
-                                                                    .whitespace_nowrap()
-                                                                    .overflow_hidden()
-                                                                    .child(SharedString::from(
-                                                                        r.name.clone(),
-                                                                    )),
-                                                            )
-                                                            .child(
-                                                                div()
-                                                                    .text_size(px(11.0))
-                                                                    .text_color(th.text_muted)
-                                                                    .child(SharedString::from(
-                                                                        stamp,
-                                                                    )),
-                                                            )
-                                                            .child(
-                                                                div()
-                                                                    .text_size(px(10.0))
-                                                                    .font_family("Menlo")
-                                                                    .text_color(
-                                                                        th.text_muted.opacity(0.7),
-                                                                    )
-                                                                    .whitespace_nowrap()
-                                                                    .overflow_hidden()
-                                                                    .child(SharedString::from(
-                                                                        stats,
-                                                                    )),
-                                                            ),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .id(("recent-x", i))
-                                                            .flex_none()
-                                                            .rounded_md()
-                                                            .p_1()
-                                                            .cursor_pointer()
-                                                            .hover(|el| el.bg(th.hover_bg))
-                                                            .on_click(cx.listener(
-                                                                move |this, _, window, cx| {
-                                                                    remove(
-                                                                        this,
-                                                                        rp.clone(),
-                                                                        window,
-                                                                        cx,
-                                                                    )
-                                                                },
-                                                            ))
-                                                            .child(icon(
-                                                                Icon::X,
-                                                                px(14.0),
-                                                                th.text_muted,
-                                                            )),
-                                                    )
-                                            },
-                                        )),
-                                )
-                            }),
-                    )
-                })
-                // 4. editor
-                .child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(th.card_border)
-                        .bg(th.card_bg)
-                        .child(p.editor.clone()),
-                )
-                // 5. error banner
-                .when_some(p.error.map(str::to_string), |el, e| {
-                    el.child(
-                        div()
-                            .flex_none()
-                            .flex()
-                            .items_start()
-                            .gap_2()
-                            .id("landing-error")
-                            .max_h(px(128.0))
-                            .overflow_y_scroll()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(th.red.opacity(0.4))
-                            .bg(th.red.opacity(0.1))
-                            .p_3()
-                            .text_xs()
-                            .text_color(th.red)
-                            .child(icon(Icon::CircleAlert, px(16.0), th.red))
-                            .child(
-                                div()
-                                    .font_family("Menlo")
-                                    .child(SharedString::from(e)),
-                            ),
-                    )
-                })
-                // 6. warnings banner
-                .when(!p.warnings.is_empty(), |el| {
-                    let ws = p.warnings.to_vec();
-                    el.child(
-                        div()
-                            .flex_none()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(th.type_amber.opacity(0.4))
-                            .bg(th.type_amber.opacity(0.1))
-                            .p_3()
-                            .text_xs()
-                            .text_color(th.type_amber)
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .mb(px(6.0))
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(6.0))
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .child(icon(Icon::TriangleAlert, px(14.0), th.type_amber))
-                                    .child(
-                                        "Schema has duplicate or conflicting type declarations \
-                                         — fix before visualizing",
-                                    ),
-                            )
-                            .children(ws.into_iter().take(8).map(|w| {
-                                div()
-                                    .font_family("Menlo")
-                                    .child(SharedString::from(w))
-                            })),
-                    )
-                })
-                // 7. action row
-                .child(
-                    div()
-                        .flex_none()
-                        .flex()
-                        .justify_end()
-                        .child(
-                            div()
-                                .id("visualize")
-                                .h(px(40.0))
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .rounded_md()
-                                .px_4()
-                                .bg(th.primary)
-                                .text_color(th.primary_fg)
-                                .text_sm()
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .cursor_pointer()
-                                .hover(|el| el.opacity(0.9))
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    on_visualize(this, window, cx)
-                                }))
-                                .child(icon(Icon::Wand2, px(16.0), th.primary_fg))
-                                .child("Visualize"),
-                        ),
-                ),
+                .flex_none()
+                .ml(px(-4.0))
+                .text_size(px(72.0))
+                .font_weight(gpui_metro::theme::LIGHT)
+                .line_height(gpui::relative(1.15))
+                .text_color(mp.foreground)
+                .child("open a schema"),
         )
-        // 8. drag overlay
+        .child(
+            div()
+                .flex_1()
+                .min_h_0()
+                .mt(px(24.0))
+                .flex()
+                .gap(px(48.0))
+                .child(tiles_col)
+                .child(editor_col),
+        )
+        // drag-over: the whole screen becomes an accent drop target
         .when(p.dragging, |el| {
             el.child(
                 div()
                     .absolute()
                     .inset_0()
-                    .bg(th.bg.opacity(0.8))
-                    .flex()
-                    .items_center()
-                    .justify_center()
+                    .bg(mp.background.opacity(0.85))
+                    .p(px(32.0))
                     .child(
                         div()
-                            .rounded_xl()
+                            .size_full()
+                            .bg(mp.accent)
                             .border_2()
-                            .border_dashed()
-                            .border_color(th.primary)
-                            .bg(th.card_bg)
-                            .px(px(48.0))
-                            .py(px(40.0))
+                            .border_color(ink)
                             .flex()
                             .flex_col()
-                            .items_center()
-                            .child(icon(Icon::Upload, px(40.0), th.primary))
+                            .items_start()
+                            .justify_end()
+                            .p(px(32.0))
+                            .child(MIcon::Upload.render(px(72.0), ink))
                             .child(
                                 div()
-                                    .mt_3()
-                                    .text_lg()
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .text_color(th.text)
-                                    .child("Drop your SDL file"),
+                                    .mt(px(16.0))
+                                    .text_size(px(72.0))
+                                    .font_weight(gpui_metro::theme::LIGHT)
+                                    .text_color(ink)
+                                    .child("drop to open"),
                             )
                             .child(
                                 div()
-                                    .mt_1()
-                                    .text_xs()
-                                    .text_color(th.text_muted)
+                                    .text_size(px(msize::NORMAL))
+                                    .text_color(ink.opacity(0.8))
                                     .child(EXTENSIONS),
                             ),
                     ),
             )
         })
+}
+
+/// The entry's folder, with `$HOME` shortened to `~`.
+fn short_dir(path: &str) -> String {
+    let dir = std::path::Path::new(path)
+        .parent()
+        .map(|d| d.display().to_string())
+        .unwrap_or_default();
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() && dir.starts_with(&home) => {
+            format!("~{}", &dir[home.len()..])
+        }
+        _ => dir,
+    }
 }
 
 /// `updated 2025-08-19 09:41` + the type/line summary for a history row.

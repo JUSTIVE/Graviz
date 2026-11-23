@@ -259,7 +259,6 @@ pub fn input<T: 'static>(
                     .top_0()
                     .bottom_0()
                     .w(px(w))
-                    .rounded(px(2.0))
                     .bg(th.accent.opacity(0.35)),
             )
         })

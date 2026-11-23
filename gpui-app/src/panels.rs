@@ -63,7 +63,6 @@ fn kind_badge(th: Theme, kind: NodeKind) -> impl IntoElement {
     div()
         .flex_none()
         .px(px(6.0))
-        .rounded(px(8.0))
         .bg(th.kind_color(kind))
         .text_size(px(9.0))
         .line_height(px(16.0))
@@ -137,10 +136,12 @@ impl OrphanPanel {
                 .w_full()
                 .h(px(ORPHAN_ROW_H))
                 .flex()
-                .items_center()
-                .gap_1()
+                .items_end()
+                .gap(px(4.0))
                 .px_3()
+                .pb(px(2.0))
                 .text_size(px(10.0))
+                .font_weight(FontWeight::SEMIBOLD)
                 .text_color(th.text_muted)
                 .child(label.clone())
                 .child(div().opacity(0.6).child(count.clone()))
@@ -156,6 +157,12 @@ impl OrphanPanel {
                     .gap_2()
                     .px_3()
                     .cursor_pointer()
+                    .border_l_2()
+                    .border_color(if self.selected == Some(card) {
+                        th.accent
+                    } else {
+                        gpui::transparent_black()
+                    })
                     .when(self.selected == Some(card), |el| el.bg(th.active_bg))
                     .hover(|el| el.bg(th.hover_bg))
                     .on_click(cx.listener(move |this, _, _, cx| this.select(card, cx)))
@@ -234,13 +241,7 @@ impl EventEmitter<PanelEvent> for OrphanPanel {}
 impl Render for OrphanPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let th = crate::theme::current(cx, window.appearance());
-        let base = div()
-            .flex()
-            .flex_col()
-            .size_full()
-            .bg(th.panel)
-            .border_r_1()
-            .border_color(th.panel_border);
+        let base = div().flex().flex_col().size_full().bg(th.panel);
 
         if self.total == 0 {
             return base.child(
@@ -252,7 +253,7 @@ impl Render for OrphanPanel {
                     .p(px(24.0))
                     .text_size(px(12.0))
                     .text_color(th.text_muted)
-                    .child(SharedString::from("No orphaned types found.")),
+                    .child(SharedString::from("no orphaned types found")),
             );
         }
 
@@ -261,7 +262,7 @@ impl Render for OrphanPanel {
             div()
                 .px_3()
                 .py_2()
-                .text_size(px(10.0))
+                .text_size(px(12.0))
                 .text_color(th.text_muted)
                 .child(SharedString::from(format!(
                     "{total} type{} unreachable from root",
@@ -294,12 +295,12 @@ enum Variant {
 }
 
 impl Variant {
-    /// Section title, already uppercased (the web applies `uppercase` in CSS).
+    /// Section title, a lowercase Metro header.
     fn title(self) -> &'static str {
         match self {
-            Variant::Expired => "EXPIRED",
-            Variant::Upcoming => "UPCOMING",
-            Variant::Undated => "DEPRECATED",
+            Variant::Expired => "expired",
+            Variant::Upcoming => "upcoming",
+            Variant::Undated => "deprecated",
         }
     }
 
@@ -403,19 +404,30 @@ impl UntilPanel {
                     .flex()
                     .items_center()
                     .child(
+                        // A Metro header in the section's tone rather than a
+                        // tinted banner: the type carries the structure.
                         div()
                             .w_full()
                             .flex()
-                            .items_center()
-                            .gap(px(6.0))
+                            .items_start()
+                            .gap(px(3.0))
                             .px_3()
-                            .py(px(6.0))
-                            .bg(variant.tint(th))
-                            .text_size(px(10.0))
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .border_l_2()
+                            .border_color(variant.date(th))
+                            .text_size(px(20.0))
+                            .line_height(px(26.0))
+                            .font_weight(gpui_metro::theme::LIGHT)
                             .text_color(variant.text(th))
                             .child(SharedString::from(variant.title()))
-                            .child(div().opacity(0.7).child(count.clone())),
+                            .child(
+                                div()
+                                    .mt(px(2.0))
+                                    .text_size(px(10.0))
+                                    .line_height(px(12.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .opacity(0.8)
+                                    .child(count.clone()),
+                            ),
                     )
                     .into_any_element()
             }
@@ -577,7 +589,7 @@ fn push_section(rows: &mut Vec<UntilRow>, variant: Variant, entries: Vec<Entry>,
     }
     rows.push(UntilRow::Banner {
         variant,
-        count: SharedString::from(format!("({})", entries.len())),
+        count: SharedString::from(entries.len().to_string()),
     });
 
     let mut order: Vec<Vec<Entry>> = Vec::new();
@@ -754,25 +766,20 @@ impl EventEmitter<PanelEvent> for UntilPanel {}
 impl Render for UntilPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let th = crate::theme::current(cx, window.appearance());
-        div()
-            .flex()
-            .flex_col()
-            .size_full()
-            .bg(th.panel)
-            .border_r_1()
-            .border_color(th.panel_border)
-            .child(
-                uniform_list(
-                    "until-items",
-                    self.rows.len(),
-                    cx.processor(|this, range: std::ops::Range<usize>, window, cx| {
-                        let th = crate::theme::current(cx, window.appearance());
-                        range.map(|ix| this.render_row(ix, th, cx)).collect::<Vec<_>>()
-                    }),
-                )
-                .flex_1()
-                .track_scroll(&self.scroll),
+        div().flex().flex_col().size_full().bg(th.panel).child(
+            uniform_list(
+                "until-items",
+                self.rows.len(),
+                cx.processor(|this, range: std::ops::Range<usize>, window, cx| {
+                    let th = crate::theme::current(cx, window.appearance());
+                    range
+                        .map(|ix| this.render_row(ix, th, cx))
+                        .collect::<Vec<_>>()
+                }),
             )
+            .flex_1()
+            .track_scroll(&self.scroll),
+        )
     }
 }
 

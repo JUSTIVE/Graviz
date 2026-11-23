@@ -137,8 +137,6 @@ pub struct Card {
     pub kind: NodeKind,
     /// Lowercase word for sidebar badges ("type", "interface", …).
     pub kind_label: &'static str,
-    /// Uppercase word the card header paints ("OBJECT", "INTERFACE", …).
-    pub kind_upper: &'static str,
     pub description: Option<String>,
     /// One-line header description, shown in show-descriptions mode.
     pub header_desc: Option<gpui::SharedString>,
@@ -218,17 +216,6 @@ impl Card {
             Some(i) if i < self.rows.len() => self.row_y(i) + self.body_pitch() / 2.0,
             _ => self.h / 2.0,
         }
-    }
-}
-
-fn kind_upper(kind: NodeKind) -> &'static str {
-    match kind {
-        NodeKind::Object => "OBJECT",
-        NodeKind::Interface => "INTERFACE",
-        NodeKind::Union => "UNION",
-        NodeKind::Enum => "ENUM",
-        NodeKind::Scalar => "SCALAR",
-        NodeKind::Input => "INPUT",
     }
 }
 
@@ -751,13 +738,29 @@ pub fn build_model(graph: ParsedGraph, schema_name: String, options: &ModelOptio
         let w = MIN_CARD_W.max(MAX_CARD_W.min(required)).max(field_max).round();
 
         // ---- height: estimateNodeHeight ----
-        let row_h = if options.show_descriptions { ROW_H_WITH_DESC } else { ROW_H };
-        let header_h = if options.show_descriptions { HEADER_H_WITH_DESC } else { HEADER_H };
-        let field_count = if n.kind == NodeKind::Union { 0 } else { rows.len() };
+        let row_h = if options.show_descriptions {
+            ROW_H_WITH_DESC
+        } else {
+            ROW_H
+        };
+        let header_h = if options.show_descriptions {
+            HEADER_H_WITH_DESC
+        } else {
+            HEADER_H
+        };
+        // With every field filtered out, the painter writes "… N hidden
+        // fields" in row 0, so that line needs its slot — otherwise the
+        // implements/union bands start where it is drawn and overlap it.
+        let placeholder_row = usize::from(rows.is_empty() && hidden_rows > 0);
+        let field_count = if n.kind == NodeKind::Union {
+            0
+        } else {
+            rows.len().max(placeholder_row)
+        };
         let (grid_rows, tight_rows) = match n.kind {
             NodeKind::Union => (0, rows.len()),
             NodeKind::Scalar => (0, 0),
-            _ => (rows.len(), implements.len() + member_of_unions.len()),
+            _ => (field_count, implements.len() + member_of_unions.len()),
         };
         let body = if grid_rows == 0 && tight_rows == 0 {
             row_h
@@ -849,7 +852,6 @@ pub fn build_model(graph: ParsedGraph, schema_name: String, options: &ModelOptio
             name_fit,
             kind: n.kind,
             kind_label: kind_label(n.kind),
-            kind_upper: kind_upper(n.kind),
             description: n.description.clone(),
             header_desc,
             rows,
@@ -1223,6 +1225,29 @@ mod tests {
         assert_eq!(c.rows.len(), 1, "String field hidden");
         assert_eq!(c.display_row(0), None, "hidden field maps to nothing");
         assert_eq!(c.display_row(1), Some(0), "second field moved up");
+    }
+
+    /// With every field hidden, the "… N hidden fields" line keeps a row of
+    /// its own: the union band starts below it instead of on top of it.
+    #[test]
+    fn all_fields_hidden_leaves_room_above_the_union_band() {
+        let m = model_of(
+            "type Query { t: Tag } type Tag { a: String, b: Int } union U = Tag",
+            ModelOptions {
+                hide_primitive_fields: true,
+                today: "2020-01-01".into(),
+                ..Default::default()
+            },
+        );
+        let c = &m.cards[m.index_of["Tag"] as usize];
+        assert!(c.rows.is_empty());
+        assert_eq!(c.hidden_rows, 2);
+        assert!(
+            c.band.union_band_top >= c.row_y(1),
+            "union band ({}) must start below the hidden-fields line ({})",
+            c.band.union_band_top,
+            c.row_y(1),
+        );
     }
 
     /// "Hide custom scalars" declutters the graph's edges by dropping the

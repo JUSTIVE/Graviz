@@ -1,4 +1,6 @@
-//! Lucide icons, embedded into the binary at compile time.
+//! Lucide icons, embedded into the binary at compile time — only the few
+//! gpui-metro's own set has no glyph for; everything else uses
+//! `gpui_metro::Icon`.
 //!
 //! The SVGs under `assets/icons/` are the same shapes the web app renders
 //! (generated from the `lucide-react` package the web app depends on). GPUI
@@ -43,37 +45,12 @@ macro_rules! define_icons {
 }
 
 define_icons! {
-    Search => "search",
-    X => "x",
-    Filter => "filter",
-    History => "history",
-    Trash2 => "trash-2",
     ChevronUp => "chevron-up",
     ChevronDown => "chevron-down",
-    ChevronRight => "chevron-right",
-    ArrowRight => "arrow-right",
-    Microscope => "microscope",
     PanelLeftOpen => "panel-left-open",
     PanelLeftClose => "panel-left-close",
-    Waypoints => "waypoints",
-    Unlink => "unlink",
-    Clock => "clock",
     Layers => "layers",
-    Highlighter => "highlighter",
-    Sun => "sun",
-    Moon => "moon",
-    Monitor => "monitor",
-    Upload => "upload",
     Link2 => "link-2",
-    Sparkles => "sparkles",
-    Wand2 => "wand-2",
-    TriangleAlert => "triangle-alert",
-    CircleAlert => "circle-alert",
-    LoaderCircle => "loader-circle",
-    Settings => "settings",
-    Info => "info",
-    Move => "move",
-    ZoomIn => "zoom-in",
 }
 
 /// Asset path of the app wordmark's logo — the compass the web app uses as
@@ -118,7 +95,7 @@ impl AssetSource for Assets {
 
 #[allow(dead_code)]
 fn _typecheck() {
-    let _ = icon(Icon::Search, gpui::px(12.0), gpui::white());
+    let _ = icon(Icon::Layers, gpui::px(12.0), gpui::white());
 }
 
 #[cfg(test)]

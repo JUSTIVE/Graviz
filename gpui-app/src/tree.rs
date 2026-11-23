@@ -16,13 +16,14 @@ use crate::model::{mono_w, Model, RowKind};
 use crate::textedit::TextEdit;
 use crate::theme::Theme;
 use crate::workspace::kind_badge;
+use gpui::{
+    div, prelude::*, px, transparent_black, uniform_list, AnyElement, App, Context, EventEmitter,
+    FocusHandle, Focusable, FontWeight, HighlightStyle, Hsla, KeyDownEvent, MouseButton,
+    ScrollHandle, SharedString, StyledText, Window,
+};
+use gpui_metro::theme::SEMIBOLD;
 use graviz_core::graph::NodeKind;
 use graviz_core::search::{search_graph, SearchResult, SnippetKind};
-use gpui::{
-    div, prelude::*, px, transparent_black, uniform_list, AnyElement, App, Context,
-    EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle, Hsla, KeyDownEvent,
-    MouseButton, ScrollHandle, SharedString, StyledText, Window,
-};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -61,7 +62,10 @@ pub fn kind_label(kind: NodeKind) -> &'static str {
 }
 
 pub enum TreeEvent {
-    Select { node_index: usize, row: Option<usize> },
+    Select {
+        node_index: usize,
+        row: Option<usize>,
+    },
     /// A root operation button was picked in the root selector.
     RootPicked(String),
 }
@@ -232,14 +236,21 @@ impl TreePanel {
         let name = model.cards[card as usize].name.clone();
         let kind = model.cards[card as usize].kind;
         let by_name = |a: &(u32, Vec<SharedString>), b: &(u32, Vec<SharedString>)| {
-            model.cards[a.0 as usize].name.cmp(&model.cards[b.0 as usize].name)
+            model.cards[a.0 as usize]
+                .name
+                .cmp(&model.cards[b.0 as usize].name)
         };
 
         let mut implementers: Vec<(u32, Vec<SharedString>)> = Vec::new();
         if kind == NodeKind::Interface {
             for c in &model.cards {
                 if c.implements.contains(&name) {
-                    let others = c.implements.iter().filter(|i| **i != name).cloned().collect();
+                    let others = c
+                        .implements
+                        .iter()
+                        .filter(|i| **i != name)
+                        .cloned()
+                        .collect();
                     implementers.push((c.index, others));
                 }
             }
@@ -290,7 +301,10 @@ impl TreePanel {
             .and_then(|r| self.model.cards[card as usize].display_row(r))
             .map(|d| (card, d));
         self.recompute_sections(card);
-        cx.emit(TreeEvent::Select { node_index: card as usize, row });
+        cx.emit(TreeEvent::Select {
+            node_index: card as usize,
+            row,
+        });
         cx.notify();
     }
 
@@ -306,7 +320,9 @@ impl TreePanel {
     /// Commit search result `ix` (an index into `filtered`) — the web's
     /// `jumpToAndClose`: remember the query, jump, then empty the box.
     fn select_result(&mut self, ix: usize, cx: &mut Context<Self>) {
-        let Some(&ri) = self.filtered.get(ix) else { return };
+        let Some(&ri) = self.filtered.get(ix) else {
+            return;
+        };
         let (card, row) = {
             let r = &self.results[ri];
             (r.node_index as u32, r.row_index)
@@ -373,15 +389,16 @@ impl TreePanel {
         // to their left, which is exact because the box is monospaced.
         let caret_x = mono_w(&query[..self.search.cursor], SEARCH_FONT_PX);
         let selection = self.search.selection().map(|(s, e)| {
-            (mono_w(&query[..s], SEARCH_FONT_PX), mono_w(&query[s..e], SEARCH_FONT_PX))
+            (
+                mono_w(&query[..s], SEARCH_FONT_PX),
+                mono_w(&query[s..e], SEARCH_FONT_PX),
+            )
         });
         let origin = self.search_origin.clone();
         div()
             .flex_none()
             .px_3()
             .py_2()
-            .border_b_1()
-            .border_color(th.panel_border)
             .child(
                 div()
                     .w_full()
@@ -390,16 +407,19 @@ impl TreePanel {
                     .items_center()
                     .gap_2()
                     .px(px(8.0))
-                    .rounded(px(4.0))
                     .border_1()
                     // The input owns the focus that drives the recent-search
                     // list. `track_focus` auto-focuses on mouse down, so
                     // hanging that off the panel root instead would make
                     // *any* sidebar click open the list.
                     .track_focus(&self.search_focus)
-                    .border_color(if focused { th.accent } else { th.panel_border })
-                    .bg(th.bg)
-                    .child(icon(Icon::Search, px(12.0), th.text_muted))
+                    .border_color(if focused { th.accent } else { th.card_border })
+                    .bg(th.input_bg)
+                    .child(gpui_metro::icon(
+                        gpui_metro::Icon::Search,
+                        px(12.0),
+                        th.text_muted,
+                    ))
                     .child(
                         div()
                             .id("search-text")
@@ -419,9 +439,7 @@ impl TreePanel {
                             .child(
                                 gpui::canvas(
                                     |_, _, _| (),
-                                    move |bounds, _, _, _| {
-                                        origin.set(f32::from(bounds.origin.x))
-                                    },
+                                    move |bounds, _, _, _| origin.set(f32::from(bounds.origin.x)),
                                 )
                                 .absolute()
                                 .size_full(),
@@ -430,7 +448,8 @@ impl TreePanel {
                                 MouseButton::Left,
                                 cx.listener(|this, ev: &gpui::MouseDownEvent, _, cx| {
                                     let x = f32::from(ev.position.x) - this.search_origin.get();
-                                    let to = field::offset_for_x(&this.search.text, x, SEARCH_FONT_PX);
+                                    let to =
+                                        field::offset_for_x(&this.search.text, x, SEARCH_FONT_PX);
                                     this.search.move_cursor(to, false);
                                     cx.notify();
                                 }),
@@ -444,7 +463,6 @@ impl TreePanel {
                                         .top_0()
                                         .bottom_0()
                                         .w(px(w))
-                                        .rounded(px(2.0))
                                         .bg(th.accent.opacity(0.35)),
                                 )
                             })
@@ -479,7 +497,11 @@ impl TreePanel {
                             .on_click(
                                 cx.listener(|this, _, _, cx| this.set_query(String::new(), cx)),
                             )
-                            .child(icon(Icon::X, px(12.0), th.text_muted))
+                            .child(gpui_metro::icon(
+                                gpui_metro::Icon::Close,
+                                px(12.0),
+                                th.text_muted,
+                            ))
                             .into_any_element()
                     }),
             )
@@ -489,44 +511,57 @@ impl TreePanel {
     // ---- 2. search history -----------------------------------------------
 
     fn render_history(&self, th: Theme, cx: &mut Context<Self>) -> AnyElement {
-        let rows = self.search_history.clone().into_iter().enumerate().map(|(i, q)| {
-            let fill = q.clone();
-            let del = q.clone();
-            div()
-                .id(("history", i))
-                .w_full()
-                .flex()
-                .items_center()
-                .gap_2()
-                .px_3()
-                .py(px(6.0))
-                .cursor_pointer()
-                .hover(|el| el.bg(th.hover_bg))
-                .on_click(cx.listener(move |this, _, _, cx| this.set_query(fill.clone(), cx)))
-                .child(icon(Icon::Clock, px(12.0), th.text_muted))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .font_family(MONO)
-                        .text_size(px(12.0))
-                        .text_color(th.text)
-                        .whitespace_nowrap()
-                        .overflow_hidden()
-                        .child(SharedString::from(q)),
-                )
-                .child(
-                    div()
-                        .id(("history-del", i))
-                        .flex_none()
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.remove_history(&del, cx);
-                        }))
-                        .child(icon(Icon::X, px(12.0), th.text_muted)),
-                )
-        });
+        let rows = self
+            .search_history
+            .clone()
+            .into_iter()
+            .enumerate()
+            .map(|(i, q)| {
+                let fill = q.clone();
+                let del = q.clone();
+                div()
+                    .id(("history", i))
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py(px(6.0))
+                    .cursor_pointer()
+                    .hover(|el| el.bg(th.hover_bg))
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_query(fill.clone(), cx)))
+                    .child(gpui_metro::icon(
+                        gpui_metro::Icon::Clock,
+                        px(12.0),
+                        th.text_muted,
+                    ))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .font_family(MONO)
+                            .text_size(px(12.0))
+                            .text_color(th.text)
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .child(SharedString::from(q)),
+                    )
+                    .child(
+                        div()
+                            .id(("history-del", i))
+                            .flex_none()
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.remove_history(&del, cx);
+                            }))
+                            .child(gpui_metro::icon(
+                                gpui_metro::Icon::Close,
+                                px(12.0),
+                                th.text_muted,
+                            )),
+                    )
+            });
 
         div()
             .id("history-list")
@@ -540,21 +575,16 @@ impl TreePanel {
                     .justify_between()
                     .px_3()
                     .py(px(6.0))
-                    .child(
-                        div()
-                            .text_size(px(10.0))
-                            .text_color(th.text_muted)
-                            .child("RECENT"),
-                    )
+                    .child(section_header(th, "recent"))
                     .child(
                         div()
                             .id("history-clear-all")
                             .cursor_pointer()
-                            .text_size(px(10.0))
+                            .text_size(px(11.0))
                             .text_color(th.text_muted)
-                            .hover(|el| el.text_color(th.text))
+                            .hover(|el| el.text_color(th.accent))
                             .on_click(cx.listener(|this, _, _, cx| this.clear_history(cx)))
-                            .child("Clear all"),
+                            .child("clear all"),
                     ),
             )
             .children(rows)
@@ -576,14 +606,13 @@ impl TreePanel {
                     .flex()
                     .items_center()
                     .gap_1()
-                    .rounded_full()
                     .border_1()
-                    .px_2()
-                    .py(px(2.0))
-                    .text_size(px(10.0))
+                    .px(px(6.0))
+                    .h(px(20.0))
+                    .text_size(px(11.0))
                     .cursor_pointer()
-                    .border_color(if active { transparent_black() } else { th.card_border })
-                    .when(active, |el| el.bg(tone.opacity(0.1)).text_color(tone))
+                    .border_color(if active { tone } else { th.card_border })
+                    .when(active, |el| el.bg(tone).text_color(gpui::white()))
                     .when(!active, |el| el.text_color(th.text_muted))
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle_kind(kind, cx)))
                     .child(SharedString::from(label))
@@ -591,7 +620,7 @@ impl TreePanel {
                         div()
                             .font_family(MONO)
                             .text_size(px(9.0))
-                            .text_color(if active { tone } else { th.text_muted.opacity(0.7) })
+                            .text_color(if active { gpui::white() } else { th.text_faint })
                             .child(SharedString::from(count.to_string())),
                     )
             });
@@ -604,8 +633,6 @@ impl TreePanel {
             .gap_1()
             .px_3()
             .py(px(6.0))
-            .border_b_1()
-            .border_color(th.panel_border)
             .children(chips)
             .when(!self.kind_filter.is_empty(), |el| {
                 el.child(
@@ -615,16 +642,18 @@ impl TreePanel {
                         .flex()
                         .items_center()
                         .gap_1()
-                        .rounded_full()
                         .px(px(6.0))
-                        .py(px(2.0))
-                        .text_size(px(10.0))
+                        .text_size(px(11.0))
                         .text_color(th.text_muted)
                         .cursor_pointer()
-                        .hover(|el| el.text_color(th.text))
+                        .hover(|el| el.text_color(th.accent))
                         .on_click(cx.listener(|this, _, _, cx| this.clear_kind_filter(cx)))
-                        .child(icon(Icon::X, px(10.0), th.text_muted))
-                        .child("Clear"),
+                        .child(gpui_metro::icon(
+                            gpui_metro::Icon::Close,
+                            px(10.0),
+                            th.text_muted,
+                        ))
+                        .child("clear"),
                 )
             })
             .into_any_element()
@@ -664,7 +693,7 @@ impl TreePanel {
                                 .text_center()
                                 .text_size(px(12.0))
                                 .text_color(th.text_muted)
-                                .child("No results"),
+                                .child("no results"),
                         )
                     })
                     .children(rows),
@@ -701,24 +730,22 @@ impl TreePanel {
                         )),
                 )
                 .child(div().flex_none().text_color(th.text_muted).child("."))
-                .child(
-                    div()
-                        .flex_none()
-                        .text_color(th.text)
-                        .child(highlighted(field, &r.match_indices, th.primary)),
-                ),
+                .child(div().flex_none().text_color(th.text).child(highlighted(
+                    field,
+                    &r.match_indices,
+                    th.primary,
+                ))),
             None => div()
                 .flex()
                 .flex_1()
                 .min_w_0()
                 .whitespace_nowrap()
                 .overflow_hidden()
-                .child(
-                    div()
-                        .flex_none()
-                        .text_color(th.text)
-                        .child(highlighted(&r.type_name, &r.match_indices, th.primary)),
-                ),
+                .child(div().flex_none().text_color(th.text).child(highlighted(
+                    &r.type_name,
+                    &r.match_indices,
+                    th.primary,
+                ))),
         };
 
         let line1 = div()
@@ -757,7 +784,6 @@ impl TreePanel {
                 .child(
                     div()
                         .flex_none()
-                        .rounded(px(4.0))
                         .px(px(4.0))
                         .py(px(1.0))
                         .text_size(px(9.0))
@@ -787,6 +813,12 @@ impl TreePanel {
             .font_family(MONO)
             .text_size(px(12.0))
             .cursor_pointer()
+            .border_l_2()
+            .border_color(if selected {
+                th.accent
+            } else {
+                transparent_black()
+            })
             .when(selected, |el| el.bg(th.active_bg))
             .hover(|el| el.bg(th.hover_bg))
             .on_click(cx.listener(move |this, _, _, cx| this.select_result(ix, cx)))
@@ -803,60 +835,64 @@ impl TreePanel {
         } else {
             self.model.schema_name.clone().into()
         };
-        let buttons = self.model.root_ops.iter().enumerate().map(|(i, (op, name))| {
-            let active = self.root_pick.as_ref() == Some(name);
-            let pick = name.clone();
-            div()
-                .id(("root", i))
-                .flex()
-                .flex_col()
-                .gap(px(1.0))
-                .rounded_md()
-                .border_1()
-                .px_2()
-                .py(px(4.0))
-                .cursor_pointer()
-                .when(active, |el| {
-                    el.bg(th.primary).border_color(th.primary).text_color(th.primary_fg)
-                })
-                .when(!active, |el| {
-                    el.bg(th.active_bg)
-                        .border_color(th.card_border)
-                        .text_color(th.text)
-                        .hover(|el| el.bg(th.hover_bg).border_color(th.text_muted))
-                })
-                .on_click(cx.listener(move |this, _, _, cx| this.pick_root(pick.clone(), cx)))
-                .child(
-                    // The operation this type serves, so three buttons named
-                    // after three unrelated types still read as query /
-                    // mutation / subscription.
-                    div()
-                        .text_size(px(9.0))
-                        .opacity(if active { 0.8 } else { 0.6 })
-                        .child(SharedString::from(*op)),
-                )
-                .child(
-                    div()
-                        .font_family(MONO)
-                        .text_size(px(12.0))
-                        .child(name.clone()),
-                )
-        });
+        let buttons = self
+            .model
+            .root_ops
+            .iter()
+            .enumerate()
+            .map(|(i, (op, name))| {
+                let active = self.root_pick.as_ref() == Some(name);
+                let pick = name.clone();
+                div()
+                    .id(("root", i))
+                    .flex()
+                    .flex_col()
+                    .justify_end()
+                    .gap(px(1.0))
+                    .min_w(px(84.0))
+                    .h(px(52.0))
+                    .px_2()
+                    .pb(px(4.0))
+                    .cursor_pointer()
+                    .when(active, |el| el.bg(th.accent).text_color(th.primary_fg))
+                    .when(!active, |el| {
+                        el.bg(th.hover_bg)
+                            .text_color(th.text)
+                            .hover(|el| el.bg(th.active_bg))
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| this.pick_root(pick.clone(), cx)))
+                    .child(
+                        // The operation this type serves, so three buttons named
+                        // after three unrelated types still read as query /
+                        // mutation / subscription.
+                        div()
+                            .text_size(px(10.0))
+                            .opacity(if active { 0.85 } else { 0.6 })
+                            .child(SharedString::from(*op)),
+                    )
+                    .child(
+                        div()
+                            .font_family(MONO)
+                            .text_size(px(12.0))
+                            .child(name.clone()),
+                    )
+            });
         let empty = self.model.root_ops.is_empty();
 
         div()
             .flex_none()
-            .p_3()
-            .border_b_1()
-            .border_color(th.panel_border)
+            .px_3()
+            .pt(px(4.0))
+            .pb_3()
             .child(
                 div()
-                    .mb(px(4.0))
+                    .mb(px(6.0))
                     .text_size(px(10.0))
+                    .font_weight(SEMIBOLD)
                     .text_color(th.text_muted)
-                    .child(label),
+                    .child(SharedString::from(label.to_uppercase())),
             )
-            .child(div().flex().flex_wrap().gap_1().children(buttons))
+            .child(div().flex().flex_wrap().gap(px(4.0)).children(buttons))
             .when(empty, |el| {
                 el.child(
                     div()
@@ -876,34 +912,33 @@ impl TreePanel {
         }
         let open = self.all_types_open;
         let count = self.all_sorted.len();
-        let mut section = div()
-            .flex_none()
-            .border_b_1()
-            .border_color(th.panel_border)
-            .child(
-                div()
-                    .id("all-types-toggle")
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .px_3()
-                    .py_2()
-                    .text_size(px(10.0))
-                    .text_color(th.text_muted)
-                    .cursor_pointer()
-                    .hover(|el| el.bg(th.hover_bg))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.all_types_open = !this.all_types_open;
-                        cx.notify();
-                    }))
-                    .child(icon(
-                        if open { Icon::ChevronDown } else { Icon::ChevronRight },
-                        px(12.0),
-                        th.text_muted,
-                    ))
-                    .child(SharedString::from(format!("All types ({count})"))),
-            );
+        let mut section = div().flex_none().child(
+            div()
+                .id("all-types-toggle")
+                .w_full()
+                .flex()
+                .items_center()
+                .gap_1()
+                .px_3()
+                .py_1()
+                .cursor_pointer()
+                .hover(|el| el.bg(th.hover_bg))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.all_types_open = !this.all_types_open;
+                    cx.notify();
+                }))
+                .child(gpui_metro::icon(
+                    if open {
+                        gpui_metro::Icon::ChevronDown
+                    } else {
+                        gpui_metro::Icon::ChevronRight
+                    },
+                    px(12.0),
+                    th.text_muted,
+                ))
+                .child(section_header(th, "all types"))
+                .child(section_count(th, count)),
+        );
 
         if open {
             section = section.child(
@@ -920,9 +955,7 @@ impl TreePanel {
                             .collect::<Vec<_>>()
                     }),
                 )
-                .h(px((count as f32 * LIST_ROW_H).min(LIST_MAX_H)))
-                .border_t_1()
-                .border_color(th.panel_border),
+                .h(px((count as f32 * LIST_ROW_H).min(LIST_MAX_H))),
             );
         }
         section.into_any_element()
@@ -935,7 +968,7 @@ impl TreePanel {
         if !self.implementers.is_empty() {
             out.push(self.render_section(
                 "implemented-by",
-                format!("Implemented by ({})", self.implementers.len()),
+                "implemented by",
                 self.implementers.len(),
                 th,
                 cx.processor(|this, range: std::ops::Range<usize>, window, cx| {
@@ -952,7 +985,7 @@ impl TreePanel {
         if !self.union_members.is_empty() {
             out.push(self.render_section(
                 "members",
-                format!("Members ({})", self.union_members.len()),
+                "members",
                 self.union_members.len(),
                 th,
                 cx.processor(|this, range: std::ops::Range<usize>, window, cx| {
@@ -969,7 +1002,7 @@ impl TreePanel {
         if !self.referenced_by.is_empty() {
             out.push(self.render_section(
                 "referenced-by",
-                format!("Referenced by ({})", self.referenced_by.len()),
+                "referenced by",
                 self.referenced_by.len(),
                 th,
                 cx.processor(|this, range: std::ops::Range<usize>, window, cx| {
@@ -989,15 +1022,13 @@ impl TreePanel {
     fn render_section<R: IntoElement>(
         &self,
         id: &'static str,
-        title: String,
+        title: &'static str,
         count: usize,
         th: Theme,
         items: impl 'static + Fn(std::ops::Range<usize>, &mut Window, &mut App) -> Vec<R>,
     ) -> AnyElement {
         div()
             .flex_none()
-            .border_b_1()
-            .border_color(th.panel_border)
             .child(
                 div()
                     .w_full()
@@ -1005,16 +1036,13 @@ impl TreePanel {
                     .items_center()
                     .gap_1()
                     .px_3()
-                    .py_2()
-                    .text_size(px(10.0))
-                    .text_color(th.text_muted)
-                    .child(SharedString::from(title)),
+                    .pt_2()
+                    .pb_1()
+                    .child(section_header(th, title))
+                    .child(section_count(th, count)),
             )
             .child(
-                uniform_list(id, count, items)
-                    .h(px((count as f32 * LIST_ROW_H).min(LIST_MAX_H)))
-                    .border_t_1()
-                    .border_color(th.panel_border),
+                uniform_list(id, count, items).h(px((count as f32 * LIST_ROW_H).min(LIST_MAX_H))),
             )
             .into_any_element()
     }
@@ -1033,7 +1061,9 @@ impl TreePanel {
         let selected = self.selected == Some(card);
         let badge = kind_badge(th, c.kind, c.kind_label);
         let badge = if selected {
-            badge.bg(th.primary_fg.opacity(0.2)).text_color(th.primary_fg)
+            badge
+                .bg(th.primary_fg.opacity(0.2))
+                .text_color(th.primary_fg)
         } else {
             badge
         };
@@ -1043,12 +1073,19 @@ impl TreePanel {
             .map(|label| {
                 div()
                     .flex_none()
-                    .rounded(px(4.0))
                     .px(px(4.0))
                     .py(px(1.0))
                     .text_size(px(9.0))
-                    .bg(if selected { th.primary_fg.opacity(0.2) } else { th.active_bg })
-                    .text_color(if selected { th.primary_fg } else { th.text_muted })
+                    .bg(if selected {
+                        th.primary_fg.opacity(0.2)
+                    } else {
+                        th.active_bg
+                    })
+                    .text_color(if selected {
+                        th.primary_fg
+                    } else {
+                        th.text_muted
+                    })
                     .child(label)
             })
             .collect::<Vec<_>>();
@@ -1066,7 +1103,7 @@ impl TreePanel {
             .font_family(MONO)
             .text_size(px(12.0))
             .cursor_pointer()
-            .when(selected, |el| el.bg(th.primary).text_color(th.primary_fg))
+            .when(selected, |el| el.bg(th.accent).text_color(th.primary_fg))
             .when(!selected, |el| {
                 el.text_color(th.text).hover(|el| el.bg(th.hover_bg))
             })
@@ -1097,7 +1134,11 @@ impl TreePanel {
     // ---- 8. TypeDetail -----------------------------------------------------
 
     fn render_detail(&self, th: Theme, cx: &mut Context<Self>) -> AnyElement {
-        let pane = div().id("type-detail").flex_1().min_h_0().overflow_y_scroll();
+        let pane = div()
+            .id("type-detail")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll();
         let Some(card) = self.selected else {
             return pane
                 .child(
@@ -1106,7 +1147,7 @@ impl TreePanel {
                         .text_center()
                         .text_size(px(12.0))
                         .text_color(th.text_muted)
-                        .child("Select a type to start exploring."),
+                        .child("select a type to start exploring"),
                 )
                 .into_any_element();
         };
@@ -1119,12 +1160,13 @@ impl TreePanel {
                 let target = self.model.index_of.get(name.as_ref()).copied();
                 div()
                     .id(("iface", i))
-                    .rounded(px(4.0))
                     .px(px(6.0))
                     .py(px(2.0))
                     .font_family(MONO)
                     .when(navigable, |el| {
-                        el.cursor_pointer().bg(th.active_bg).hover(|el| el.bg(th.hover_bg))
+                        el.cursor_pointer()
+                            .bg(th.active_bg)
+                            .hover(|el| el.bg(th.hover_bg))
                     })
                     .when(!navigable, |el| el.opacity(0.6))
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -1148,7 +1190,11 @@ impl TreePanel {
 
         // Body: one row per field / enum value / union member.
         let body: Vec<AnyElement> = if c.rows.is_empty() {
-            let empty = if c.kind == NodeKind::Enum { "no values" } else { "no fields" };
+            let empty = if c.kind == NodeKind::Enum {
+                "no values"
+            } else {
+                "no fields"
+            };
             vec![div()
                 .px_2()
                 .py_1()
@@ -1184,8 +1230,7 @@ impl TreePanel {
                                 .whitespace_nowrap()
                                 .overflow_hidden()
                                 .font_family(MONO)
-                                .text_size(px(14.0))
-                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_size(px(18.0))
                                 .text_color(th.text)
                                 .child(c.name.clone()),
                         ),
@@ -1273,7 +1318,6 @@ impl TreePanel {
             .min_w_0()
             .items_center()
             .gap(px(2.0))
-            .rounded(px(4.0))
             .when(row.is_relay, |el| {
                 el.child(icon(Icon::Link2, px(10.0), th.relay_orange))
             });
@@ -1297,7 +1341,11 @@ impl TreePanel {
                         this.select_card(t, None, cx);
                     }
                 }))
-                .child(icon(Icon::ChevronRight, px(12.0), th.text_muted));
+                .child(gpui_metro::icon(
+                    gpui_metro::Icon::ChevronRight,
+                    px(12.0),
+                    th.text_muted,
+                ));
         }
 
         let line1 = div()
@@ -1307,7 +1355,14 @@ impl TreePanel {
             .justify_between()
             .gap_2()
             .child(left)
-            .child(div().flex().min_w_0().items_center().justify_end().child(chip));
+            .child(
+                div()
+                    .flex()
+                    .min_w_0()
+                    .items_center()
+                    .justify_end()
+                    .child(chip),
+            );
 
         // Line 2: the deprecation note. Line 3: the description.
         let note = deprecated.then(|| {
@@ -1323,7 +1378,7 @@ impl TreePanel {
                 .gap_1()
                 .text_size(px(11.0))
                 .text_color(tone)
-                .child(icon(Icon::TriangleAlert, px(10.0), tone))
+                .child(gpui_metro::icon(gpui_metro::Icon::Alert, px(10.0), tone))
                 .child(text)
         });
         let desc = row.description.clone().map(|d| {
@@ -1342,14 +1397,9 @@ impl TreePanel {
                 .top(px(28.0))
                 .right(px(4.0))
                 .min_w(px(180.0))
-                .rounded_lg()
-                .border_1()
-                .border_color(th.card_border)
                 .bg(th.chrome_bg)
-                .shadow_lg()
                 .py_1()
-                .font_family("Menlo")
-                .text_size(px(12.0))
+                .text_size(px(14.0))
                 .text_color(th.text)
                 // See the same trick in canvas.rs's node context menu: without
                 // this a click on the item also bubbles down to the row's own
@@ -1367,7 +1417,7 @@ impl TreePanel {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.copy_field_path(card, dix, cx);
                         }))
-                        .child(SharedString::from(format!("Copy \"{field_path}\""))),
+                        .child(SharedString::from(format!("copy \"{field_path}\""))),
                 )
         });
 
@@ -1377,7 +1427,6 @@ impl TreePanel {
             .flex()
             .flex_col()
             .gap(px(2.0))
-            .rounded(px(4.0))
             .px_2()
             .py_1()
             .border_1()
@@ -1411,6 +1460,30 @@ impl TreePanel {
             .children(field_menu)
             .into_any_element()
     }
+}
+
+/// A Metro section header: a lowercase light word, type doing the work a
+/// rule used to.
+fn section_header(th: Theme, title: &'static str) -> gpui::Div {
+    // gpui-metro's normal text style (PhoneTextNormalStyle, 17 px).
+    let style = gpui_metro::TextStyle::Normal;
+    div()
+        .text_size(px(style.size()))
+        .line_height(px(22.0))
+        .font_weight(style.weight())
+        .text_color(th.text)
+        .child(title)
+}
+
+/// The superscript-ish count beside a [`section_header`].
+fn section_count(th: Theme, count: usize) -> gpui::Div {
+    div()
+        .self_start()
+        .mt(px(1.0))
+        .text_size(px(10.0))
+        .font_weight(SEMIBOLD)
+        .text_color(th.text_muted)
+        .child(SharedString::from(count.to_string()))
 }
 
 /// Merge sorted char indices into byte ranges over `text`.
@@ -1447,7 +1520,11 @@ pub fn highlighted(text: &str, char_idxs: &[usize], color: Hsla) -> AnyElement {
 
 fn sorted_cards(model: &Model) -> Vec<u32> {
     let mut all: Vec<u32> = (0..model.cards.len() as u32).collect();
-    all.sort_by(|&a, &b| model.cards[a as usize].name.cmp(&model.cards[b as usize].name));
+    all.sort_by(|&a, &b| {
+        model.cards[a as usize]
+            .name
+            .cmp(&model.cards[b as usize].name)
+    });
     all
 }
 
@@ -1499,24 +1576,22 @@ impl Render for TreePanel {
             .size_full()
             .min_h_0()
             .bg(th.panel)
-            .border_r_1()
-            .border_color(th.panel_border)
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key_down))
             // Same as the palette: the escape binding is dispatched as an
             // action before any key handler, so the search box can only hear
             // it this way. Only while it has something to clear, otherwise
             // escape still means "drop the canvas selection".
-            .on_action(cx.listener(
-                |this, _: &crate::workspace::ClearSelection, window, cx| {
+            .on_action(
+                cx.listener(|this, _: &crate::workspace::ClearSelection, window, cx| {
                     if this.search_focus.is_focused(window) && !this.search.text.is_empty() {
                         this.search.clear();
                         this.refresh();
                         cx.stop_propagation();
                         cx.notify();
                     }
-                },
-            ))
+                }),
+            )
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
@@ -1556,13 +1631,19 @@ mod tests {
     fn model_of(sdl: &str, root: Option<&str>) -> Model {
         let g = sdl_to_graph(
             sdl,
-            &SdlToGraphOptions { hide_relay_boilerplate: false, ..Default::default() },
+            &SdlToGraphOptions {
+                hide_relay_boilerplate: false,
+                ..Default::default()
+            },
         );
         assert!(g.error.is_none(), "{:?}", g.error);
         build_model(
             slice_graph(&g, Mode::Reachable, root),
             "t".into(),
-            &ModelOptions { today: "2020-01-01".into(), ..Default::default() },
+            &ModelOptions {
+                today: "2020-01-01".into(),
+                ..Default::default()
+            },
         )
     }
 
@@ -1572,7 +1653,11 @@ mod tests {
     #[test]
     fn root_names_survive_a_single_root_slice() {
         let m = model_of(THREE_ROOTS, Some("Mutation"));
-        assert_eq!(m.roots.len(), 1, "the slice really does keep only one root card");
+        assert_eq!(
+            m.roots.len(),
+            1,
+            "the slice really does keep only one root card"
+        );
         let names: Vec<String> = root_names(&m).iter().map(|n| n.to_string()).collect();
         assert_eq!(names, ["Query", "Mutation", "Subscription"]);
     }

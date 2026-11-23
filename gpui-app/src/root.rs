@@ -8,7 +8,7 @@ use crate::landing;
 use crate::loader;
 use crate::workspace::{ClearSelection, OpenSchema, OpenSettings, Workspace};
 use gpui::{
-    div, prelude::*, px, App, Context, Entity, ExternalPaths, FocusHandle, Focusable,
+    div, prelude::*, App, Context, Entity, ExternalPaths, FocusHandle, Focusable,
     PathPromptOptions, Window,
 };
 use std::path::PathBuf;
@@ -155,38 +155,33 @@ impl Focusable for Root {
 
 impl Render for Root {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::theme::sync_metro(cx, window.appearance());
         let th = crate::theme::current(cx, window.appearance());
 
         let has_schema = self.workspace.is_some();
+        // Settings is a flyout over the page, not a page of its own: `route`
+        // is what sits underneath, and the nav marks settings while it's out.
         let route = if self.show_about {
             crate::shell::Route::About
-        } else if self.show_settings {
-            crate::shell::Route::Settings
         } else if self.show_landing || !has_schema {
             crate::shell::Route::New
         } else {
             crate::shell::Route::View
         };
+        // gpui-metro's hyperlink, scaled to the title strip's 12 px.
         let update_badge = self.update_available.as_ref().map(|info| {
             let url = info.url.clone();
             div()
-                .id("update-available")
                 .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .h(px(20.0))
-                .flex()
-                .items_center()
-                .gap_1()
-                .rounded_md()
-                .border_1()
-                .border_color(th.investigate)
-                .px(px(6.0))
-                .text_xs()
-                .text_color(th.investigate)
-                .cursor_pointer()
-                .hover(|el| el.bg(th.investigate.opacity(0.1)))
-                .on_click(move |_, _, cx| cx.open_url(&url))
-                .child(crate::icons::icon(crate::icons::Icon::Sparkles, px(12.0), th.investigate))
-                .child(gpui::SharedString::from(format!("v{} available", info.version)))
+                .child(
+                    gpui_metro::scaled(0.6).child(
+                        gpui_metro::hyperlink(
+                            "update-available",
+                            format!("v{} available", info.version),
+                        )
+                        .on_click(move |_, _, cx| cx.open_url(&url)),
+                    ),
+                )
                 .into_any_element()
         });
         let home = std::env::var("HOME").ok();
@@ -194,14 +189,24 @@ impl Render for Root {
             .workspace
             .as_ref()
             .map(|w| crate::shell::file_label(w.read(cx).schema_path(), home.as_deref()));
-        let header = crate::shell::header(th, file, update_badge);
-        let rail = crate::shell::rail(
-            th,
-            route,
+        let header = crate::shell::header(th, file, update_badge, cx);
+        let nav = crate::shell::nav(
+            if self.show_settings {
+                crate::shell::Route::Settings
+            } else {
+                route
+            },
             has_schema,
             |this: &mut Self, route, window, cx| {
+                if route == crate::shell::Route::Settings {
+                    // Opens over whatever is showing; the page stays put.
+                    this.show_settings = true;
+                    window.focus(&this.focus, cx);
+                    cx.notify();
+                    return;
+                }
+                this.show_settings = false;
                 this.show_about = route == crate::shell::Route::About;
-                this.show_settings = route == crate::shell::Route::Settings;
                 this.show_landing = route == crate::shell::Route::New;
                 // The workspace leaves the tree with the focus still on it,
                 // and escape would then have nowhere to land.
@@ -211,8 +216,10 @@ impl Render for Root {
             cx,
         );
 
-        let body: gpui::AnyElement = if self.show_settings {
-            crate::settings::view(
+        let settings = gpui_metro::settings_flyout("settings", self.show_settings)
+            .title("settings")
+            .width(gpui_metro::FlyoutWidth::Wide)
+            .child(crate::settings::view(
                 crate::settings::SettingsProps {
                     th,
                     theme_mode: crate::theme::mode(cx),
@@ -235,9 +242,13 @@ impl Render for Root {
                     cx.notify();
                 },
                 cx,
-            )
-            .into_any_element()
-        } else if self.show_about {
+            ))
+            .on_dismiss(cx.listener(|this, _, _, cx| {
+                this.show_settings = false;
+                cx.notify();
+            }));
+
+        let body: gpui::AnyElement = if self.show_about {
             crate::about::view(
                 th,
                 |this: &mut Self, _w, cx| {
@@ -291,6 +302,21 @@ impl Render for Root {
             .into_any_element()
         };
 
+        // Metro turnstile on route change. The graph itself enters without
+        // it: sliding the canvas would repaint every frame of the entrance.
+        let (_, generation) = gpui_metro::motion::track("root-route", route as usize, window, cx);
+        let body = if route == crate::shell::Route::View || generation == 0 {
+            body
+        } else {
+            gpui_metro::motion::enter_div(
+                gpui_metro::motion::generation_id("root-route-body", generation),
+                gpui_metro::motion::Direction::Forward,
+                0,
+                div().flex_1().min_h_0().flex().flex_col().child(body),
+                cx,
+            )
+        };
+
         if !self.focused_once {
             self.focused_once = true;
             window.focus(&self.focus, cx);
@@ -313,19 +339,16 @@ impl Render for Root {
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                 this.show_settings = !this.show_settings;
                 if this.show_settings {
-                    this.show_about = false;
                     window.focus(&this.focus, cx);
                 }
                 cx.notify();
             }))
-            // Escape leaves Settings for whatever you were looking at: the
-            // graph, or the landing screen when nothing is open. The
-            // workspace owns this key too, but it is not in the tree while
-            // the page is up, so the two never both fire.
+            // Escape puts the settings flyout away. The workspace owns this
+            // key too, but opening the flyout moves focus here, so the
+            // dispatch path stops at Root and the two never both fire.
             .on_action(cx.listener(|this, _: &ClearSelection, _, cx| {
                 if this.show_settings {
                     this.show_settings = false;
-                    this.show_landing = this.workspace.is_none();
                     cx.notify();
                 }
             }))
@@ -335,16 +358,10 @@ impl Render for Root {
                 }
             }))
             .child(header)
-            // The rail is the outermost pane: the schema sidebar and the
-            // canvas both start to its right.
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .flex()
-                    .child(rail)
-                    .child(div().flex_1().min_w_0().flex().flex_col().child(body)),
-            )
+            .child(nav)
+            .child(div().flex_1().min_h_0().flex().flex_col().child(body))
             .when_some(crate::shell::commit_badge(th), |el, b| el.child(b))
+            // Last, so it lies over everything, title strip included.
+            .child(settings)
     }
 }

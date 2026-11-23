@@ -8,6 +8,7 @@
 
 use crate::theme::Theme;
 use gpui::{div, prelude::*, px, SharedString, Window};
+use gpui_metro::{button, text, theme::size, TextStyle};
 
 struct Item {
     title: &'static str,
@@ -129,45 +130,34 @@ const TIPS: &[&str] = &[
     "The FPS chart in the bottom-right corner reports what each frame actually costs.",
 ];
 
-fn section(th: Theme, title: &'static str, items: &'static [Item]) -> impl IntoElement {
+/// A type-ramp section: a light lowercase header, then each item as a title
+/// over subtle body copy. Whitespace separates them; nothing is boxed.
+fn section(title: &'static str, items: &'static [Item]) -> impl IntoElement {
     div()
-        .mt_8()
+        .mt_12()
         .flex()
         .flex_col()
-        .gap_3()
-        .child(
-            div()
-                .text_base()
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(th.text)
-                .child(title),
-        )
+        .gap_5()
+        .child(text(TextStyle::Title2, title).lowercase())
         .children(items.iter().map(|it| {
             div()
                 .flex()
                 .flex_col()
                 .gap_1()
-                .rounded_lg()
-                .border_1()
-                .border_color(th.card_border)
-                .bg(th.card_bg.opacity(0.4))
-                .px_4()
-                .py_3()
                 .child(
                     div()
-                        .text_sm()
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(th.text)
+                        .text_size(px(size::MEDIUM_LARGE))
+                        .font_weight(gpui_metro::theme::SEMILIGHT)
                         .child(it.title),
                 )
-                .child(
-                    div()
-                        .text_sm()
-                        .line_height(px(20.0))
-                        .text_color(th.text_muted)
-                        .child(it.body),
-                )
+                .child(body(it.body))
         }))
+}
+
+fn body(content: impl Into<SharedString>) -> impl IntoElement {
+    div()
+        .max_w(px(720.0))
+        .child(text(TextStyle::Subtle, content))
 }
 
 /// The About page. `on_start` fires when the reader clicks through to the
@@ -177,97 +167,69 @@ pub fn view<T: 'static>(
     on_start: impl Fn(&mut T, &mut Window, &mut gpui::Context<T>) + 'static,
     cx: &mut gpui::Context<T>,
 ) -> impl IntoElement {
+    let p = gpui_metro::Theme::palette(cx);
+    let entity = cx.entity().downgrade();
     div()
         .id("about-scroll")
         .flex_1()
         .min_h_0()
         .overflow_y_scroll()
+        .font_family(gpui_metro::Theme::font(cx))
+        .text_color(th.text)
         .child(
             div()
                 .max_w(px(880.0))
                 .mx_auto()
                 .px_6()
-                .py_10()
+                .py_8()
                 .flex()
                 .flex_col()
                 .child(
                     div()
-                        .text_3xl()
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(th.text)
-                        .child("Graviz"),
+                        .ml(px(-3.))
+                        .child(text(TextStyle::Title1, "graviz").lowercase()),
                 )
+                .child(div().mt_3().child(body(
+                    "A GraphQL schema explorer. Load an SDL file and it becomes a graph \
+                     you can walk: types as cards, fields as edges, with the parts you \
+                     cannot reach and the parts you have deprecated each in their own \
+                     tab.",
+                )))
+                .child(div().mt_3().child(body(SharedString::from(format!(
+                    "Stack — Rust and GPUI, drawing to Metal. Schema parsing, layout and \
+                     overlay merging are all native, with no browser, WASM or worker pool \
+                     in the path.{}",
+                    crate::shell::COMMIT
+                        .map(|c| format!(" Build {c}."))
+                        .unwrap_or_default()
+                )))))
+                .child(section("Rendering", RENDERING))
+                .child(section("Graph and layout", LAYOUT))
                 .child(
                     div()
-                        .mt_2()
-                        .text_sm()
-                        .line_height(px(22.0))
-                        .text_color(th.text_muted)
-                        .child(
-                            "A GraphQL schema explorer. Load an SDL file and it becomes a graph \
-                             you can walk: types as cards, fields as edges, with the parts you \
-                             cannot reach and the parts you have deprecated each in their own \
-                             tab.",
-                        ),
-                )
-                .child(
-                    div()
-                        .mt_4()
-                        .text_sm()
-                        .line_height(px(22.0))
-                        .text_color(th.text_muted)
-                        .child(SharedString::from(format!(
-                            "Stack — Rust and GPUI, drawing to Metal. Schema parsing, layout and \
-                             overlay merging are all native, with no browser, WASM or worker pool \
-                             in the path.{}",
-                            crate::shell::COMMIT
-                                .map(|c| format!(" Build {c}."))
-                                .unwrap_or_default()
-                        ))),
-                )
-                .child(section(th, "Rendering", RENDERING))
-                .child(section(th, "Graph and layout", LAYOUT))
-                .child(
-                    div()
-                        .mt_8()
+                        .mt_12()
                         .flex()
                         .flex_col()
-                        .gap_2()
-                        .child(
-                            div()
-                                .text_base()
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .text_color(th.text)
-                                .child("Tips"),
-                        )
+                        .gap_3()
+                        .child(text(TextStyle::Title2, "tips").lowercase())
                         .children(TIPS.iter().map(|t| {
                             div()
                                 .flex()
-                                .gap_2()
-                                .text_sm()
-                                .line_height(px(20.0))
-                                .text_color(th.text_muted)
-                                .child(div().flex_none().child("·"))
-                                .child(div().child(*t))
+                                .items_start()
+                                .gap_3()
+                                .child(div().flex_none().mt(px(9.)).size(px(6.)).bg(p.accent))
+                                .child(body(*t))
                         })),
                 )
                 .child(
-                    div().mt_10().flex().child(
-                        div()
-                            .id("about-start")
-                            .rounded_md()
-                            .bg(th.accent)
-                            .px_4()
-                            .py_2()
-                            .text_sm()
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(gpui::white())
-                            .cursor_pointer()
-                            .hover(|el| el.opacity(0.9))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                on_start(this, window, cx)
-                            }))
-                            .child("Start visualizing"),
+                    div().mt_12().flex().child(
+                        button("about-start", "start visualizing")
+                            .accent()
+                            .on_click(move |_, window, cx| {
+                                entity
+                                    .update(cx, |this, cx| on_start(this, window, cx))
+                                    .ok();
+                            }),
                     ),
                 ),
         )

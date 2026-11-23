@@ -514,7 +514,6 @@ impl Render for TextArea {
 
         div()
             .size_full()
-            .rounded_md()
             .border_1()
             .border_color(if focused { th.accent } else { th.card_border })
             .bg(th.input_bg)
@@ -681,7 +680,7 @@ mod tests {
     }
 
     fn th() -> Theme {
-        crate::theme::theme(gpui::WindowAppearance::Dark)
+        crate::theme::theme_for(crate::theme::ThemeMode::Dark, gpui::WindowAppearance::Dark)
     }
 
     /// Runs must tile the line exactly — a mismatch makes shape_line panic.
