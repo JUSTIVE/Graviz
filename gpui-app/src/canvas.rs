@@ -874,14 +874,6 @@ impl GraphCanvas {
     }
 }
 
-/// Per-stroke alpha for edges faded behind a focused card or a pinned edge.
-///
-/// It has to be far harder than it looks. The web fades a whole PixiJS
-/// container, so its alpha composites once; these are separate strokes, and
-/// twenty overlapping hairlines at 0.1 add back up to an opaque wash — which
-/// is why "dimmed" edges still read as bright. Chosen for how it accumulates:
-/// a lone edge is a whisper, twenty stacked are a faint haze.
-const FOCUS_DIM_ALPHA: f32 = 0.015;
 
 /// Should this edge be drawn in the dim pass?
 ///
@@ -1081,6 +1073,17 @@ fn cubic_steps(
     k: f32,
     tol: f32,
 ) -> usize {
+    // A curve never leaves the box round its control points, and neither
+    // does its chord, so the two are never further apart than the box is
+    // thin. A lane's bend is a tall S half a gap wide: with the whole schema
+    // on screen that is two pixels across and hundreds tall, and the
+    // curvature bound below would spend a dozen segments drawing what is, at
+    // that size, a vertical line.
+    let w = p0.x.max(c.c1.x).max(c.c2.x).max(c.end.x) - p0.x.min(c.c1.x).min(c.c2.x).min(c.end.x);
+    let h = p0.y.max(c.c1.y).max(c.c2.y).max(c.end.y) - p0.y.min(c.c1.y).min(c.c2.y).min(c.end.y);
+    if w.min(h) * k <= tol {
+        return 1;
+    }
     let d0x = (p0.x - 2.0 * c.c1.x + c.c2.x) * k;
     let d0y = (p0.y - 2.0 * c.c1.y + c.c2.y) * k;
     let d1x = (c.c1.x - 2.0 * c.c2.x + c.end.x) * k;
@@ -1117,6 +1120,7 @@ fn cubic_visible(
 }
 
 fn flatten_cubic(
+    pen: &mut Pen,
     builder: &mut PathBuilder,
     p0: graviz_core::layout::Point,
     c: &graviz_core::layout::CubicSeg,
@@ -1125,16 +1129,120 @@ fn flatten_cubic(
     to_screen: &impl Fn(f32, f32) -> gpui::Point<Pixels>,
 ) -> usize {
     let n = cubic_steps(p0, c, k, tol);
+    let mut emitted = 0;
     for i in 1..=n {
         let t = i as f32 / n as f32;
         let u = 1.0 - t;
         let (a, b, cc, d) = (u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t);
-        builder.line_to(to_screen(
-            a * p0.x + b * c.c1.x + cc * c.c2.x + d * c.end.x,
-            a * p0.y + b * c.c1.y + cc * c.c2.y + d * c.end.y,
-        ));
+        emitted += pen.line_to(
+            builder,
+            to_screen(
+                a * p0.x + b * c.c1.x + cc * c.c2.x + d * c.end.x,
+                a * p0.y + b * c.c1.y + cc * c.c2.y + d * c.end.y,
+            ),
+        );
     }
-    n
+    emitted
+}
+
+/// How far, in screen pixels, a dropped vertex may sit from the line drawn in
+/// its place.
+const PEN_TOL: f32 = 0.3;
+
+/// Draws a polyline, leaving out the vertices that would not show.
+///
+/// A lane-routed edge is level runs joined by short bends, and a run that
+/// shifts by one lane pitch is three segments in the world and one straight
+/// line on screen at any zoom below a quarter. With the whole schema in view
+/// that is most of every edge: per-cubic flattening cannot go below one
+/// segment each, so the floor was the cubic count, forty thousand segments
+/// of which most were invisible.
+///
+/// The test is a sleeve: from the last vertex kept, each candidate narrows a
+/// wedge of directions that pass within tolerance of everything dropped so
+/// far, and a vertex is kept only when the next one falls outside it. So the
+/// bound holds for the whole dropped run, not just its last point.
+struct Pen {
+    anchor: (f32, f32),
+    pending: Option<(f32, f32)>,
+    reach: f32,
+    left: (f32, f32),
+    right: (f32, f32),
+}
+
+impl Pen {
+    fn new() -> Self {
+        Self { anchor: (0.0, 0.0), pending: None, reach: 0.0, left: (0.0, 0.0), right: (0.0, 0.0) }
+    }
+
+    fn move_to(&mut self, builder: &mut PathBuilder, p: gpui::Point<Pixels>) -> usize {
+        let n = self.finish(builder);
+        builder.move_to(p);
+        self.anchor = (f32::from(p.x), f32::from(p.y));
+        n
+    }
+
+    /// Returns how many segments reached the builder.
+    fn line_to(&mut self, builder: &mut PathBuilder, p: gpui::Point<Pixels>) -> usize {
+        let c = (f32::from(p.x), f32::from(p.y));
+        let mut emitted = 0;
+        loop {
+            let v = (c.0 - self.anchor.0, c.1 - self.anchor.1);
+            let d = (v.0 * v.0 + v.1 * v.1).sqrt();
+            if d < 1e-3 {
+                return emitted;
+            }
+            let perp = (-v.1 / d * PEN_TOL, v.0 / d * PEN_TOL);
+            let (l, r) = ((v.0 + perp.0, v.1 + perp.1), (v.0 - perp.0, v.1 - perp.1));
+            let cross = |a: (f32, f32), b: (f32, f32)| a.0 * b.1 - a.1 * b.0;
+            let Some(b) = self.pending else {
+                self.pending = Some(c);
+                self.reach = d;
+                self.left = l;
+                self.right = r;
+                return emitted;
+            };
+            if d >= self.reach && cross(v, self.left) >= 0.0 && cross(self.right, v) >= 0.0 {
+                self.pending = Some(c);
+                self.reach = d;
+                if cross(self.left, l) < 0.0 {
+                    self.left = l;
+                }
+                if cross(self.right, r) > 0.0 {
+                    self.right = r;
+                }
+                return emitted;
+            }
+            builder.line_to(point(px(b.0), px(b.1)));
+            emitted += 1;
+            self.anchor = b;
+            self.pending = None;
+        }
+    }
+
+    fn finish(&mut self, builder: &mut PathBuilder) -> usize {
+        match self.pending.take() {
+            Some(b) => {
+                builder.line_to(point(px(b.0), px(b.1)));
+                self.anchor = b;
+                1
+            }
+            None => 0,
+        }
+    }
+}
+
+/// How much of a receded edge's colour survives while something else has the
+/// focus. Higher than the cards' dim because it is no longer cumulative: a
+/// lone edge has to stay findable at this value, where before it relied on
+/// its neighbours piling up.
+const EDGE_DIM: f32 = 0.10;
+
+/// `top` composited over an opaque `base`, as an opaque colour.
+fn over(base: Hsla, top: Hsla) -> Hsla {
+    let (b, t) = (gpui::Rgba::from(base), gpui::Rgba::from(top));
+    let mix = |b: f32, t: f32| b + (t - b) * top.a;
+    Hsla::from(gpui::Rgba { r: mix(b.r, t.r), g: mix(b.g, t.g), b: mix(b.b, t.b), a: 1.0 })
 }
 
 fn edge_color(th: &Theme, group: EdgeGroup) -> Hsla {
@@ -1962,17 +2070,29 @@ fn paint_scene(
         // builder silently drops geometry. Flush in batches well under that cap
         // (the web app hit the same wall and batched for the same reason).
         const SEGS_PER_BATCH: usize = 900;
-        for (group, dim_pass) in groups.iter().flat_map(|&g| [(g, false), (g, true)]) {
+        // Every dimmed edge first, then every lit one. Going group by group
+        // let the dimmed edges of a later group paint over the lit edges of
+        // an earlier one, which in a bundle of parallel lanes is exactly
+        // where the edge being followed runs.
+        for (group, dim_pass) in
+            [true, false].into_iter().flat_map(|d| groups.iter().map(move |&g| (g, d)))
+        {
             let color = if dim_pass {
                 // With a focus of any kind the dimmed edges have to recede hard;
                 // without one this pass is only the hub fading, which should stay
                 // legible.
                 let a = if focused_edge.is_some() || focus.is_some() || investigate {
-                    FOCUS_DIM_ALPHA
+                    EDGE_DIM
                 } else {
                     0.35
                 };
-                edge_color(&th, group).opacity(a)
+                // Mixed into the background and painted opaque. A translucent
+                // dim adds up wherever edges overlap, and lanes overlap by
+                // design — a bundle of thirty receded edges came out brighter
+                // than the one edge being pointed at. Opaque, thirty look
+                // like one.
+                let c = edge_color(&th, group);
+                over(th.bg, c.opacity(c.a * a))
             } else {
                 edge_color(&th, group)
             };
@@ -2040,6 +2160,8 @@ fn paint_scene(
                 // a skipped run has to re-open the contour with a move_to.
                 let mut pen = false;
                 let mut drew = false;
+                let mut nib = Pen::new();
+                let mut n = 0;
                 for c in &e.curves {
                     if !cubic_visible(p0, c, cull) {
                         pen = false;
@@ -2047,15 +2169,16 @@ fn paint_scene(
                         continue;
                     }
                     if !pen {
-                        builder.move_to(to_screen(p0.x, p0.y));
+                        n += nib.move_to(&mut builder, to_screen(p0.x, p0.y));
                         pen = true;
                     }
-                    let n = flatten_cubic(&mut builder, p0, c, k, curve_tol, &to_screen);
-                    segs += n;
-                    n_pts += n;
+                    n += flatten_cubic(&mut nib, &mut builder, p0, c, k, curve_tol, &to_screen);
                     drew = true;
                     p0 = c.end;
                 }
+                n += nib.finish(&mut builder);
+                segs += n;
+                n_pts += n;
                 if !drew {
                     continue;
                 }
@@ -2109,15 +2232,27 @@ fn paint_scene(
         // The hovered — or pinned — edge draws on top, brighter and thicker.
         if let Some(ei) = hovered_edge.or(focused_edge) {
             if let Some(e) = model.edges.get(ei as usize) {
-                let mut builder = PathBuilder::stroke(px((stroke_w * 2.0).max(2.0)));
-                builder.move_to(to_screen(e.start.x, e.start.y));
-                let mut p0 = e.start;
-                for c in &e.curves {
-                    flatten_cubic(&mut builder, p0, c, k, curve_tol, &to_screen);
-                    p0 = c.end;
-                }
-                if let Ok(path) = builder.build() {
-                    window.paint_path(path, edge_color(&th, e.group).opacity(1.0));
+                // Twice: a wide stroke in the background colour, then the
+                // edge itself on top. Lanes run side by side for whole
+                // columns, and a brighter line among thirty of its own colour
+                // is still hard to follow; the casing cuts it clear of its
+                // neighbours and of everything it crosses.
+                let w = (stroke_w * 2.0).max(2.5);
+                let mut color = edge_color(&th, e.group).opacity(1.0);
+                color.l = (color.l + 0.18).min(0.92);
+                for (width, color) in [(w + 5.0, th.bg.opacity(0.9)), (w, color)] {
+                    let mut builder = PathBuilder::stroke(px(width));
+                    let mut nib = Pen::new();
+                    nib.move_to(&mut builder, to_screen(e.start.x, e.start.y));
+                    let mut p0 = e.start;
+                    for c in &e.curves {
+                        flatten_cubic(&mut nib, &mut builder, p0, c, k, curve_tol, &to_screen);
+                        p0 = c.end;
+                    }
+                    nib.finish(&mut builder);
+                    if let Ok(path) = builder.build() {
+                        window.paint_path(path, color);
+                    }
                 }
             }
         }
@@ -2140,10 +2275,19 @@ fn paint_scene(
     let mut italic_font = mono(FontWeight::NORMAL);
     italic_font.style = gpui::FontStyle::Italic;
     let text_system = window.text_system().clone();
-    // Text is shaped at a quantized zoom (√2/4 ladder, ~9% steps) so that a
-    // continuous zoom gesture hits the text system's layout cache instead of
-    // re-shaping every visible glyph run each frame.
-    let kt = 2f32.powf((k.log2() * 8.0).round() / 8.0);
+    // Text is shaped at a quantized zoom so that a continuous zoom gesture
+    // hits the text system's layout cache instead of re-shaping every
+    // visible glyph run each frame.
+    //
+    // Glyphs come from the ladder; where they sit does not. The cards scale
+    // continuously, so a line laid out at the ladder size is the wrong
+    // width for its card between steps, and through a zoom it swelled and
+    // shrank against the card edge by half a step each way. `paint_baseline`
+    // spreads the glyphs by `k / kt` instead, so every line is exactly as
+    // wide as the zoom says and only the letterforms step — a fraction of a
+    // pixel in glyph size, where the width error was several pixels a row.
+    const TEXT_STEPS: f32 = 16.0;
+    let kt = 2f32.powf((k.log2() * TEXT_STEPS).round() / TEXT_STEPS);
     let mut text_errors = 0usize;
     // GRAVIZ_PERF=1 reports what a frame actually costs.
     let probe = PROBE.with(|p| p.get());
@@ -2162,6 +2306,7 @@ fn paint_scene(
                 + std::time::Duration::from_secs_f32(TEXT_BUDGET_AT.with(|v| *v) / 1000.0)
         }))
     });
+    TEXT_STRETCH.with(|c| c.set(k / kt));
     TEXT_DEFERRED.with(|f| f.set(false));
     TEXT_SKIPPED.with(|c| c.set(0));
     SHAPE_NS.with(|c| c.set(0.0));
@@ -2787,6 +2932,7 @@ struct TextCache {
     prev: std::collections::HashMap<Rc<LineKey>, gpui::ShapedLine>,
 }
 
+
 /// Entry ceiling before the generations rotate. A viewport holds well under a
 /// thousand lines, so this is many screens' worth of panning.
 const TEXT_CACHE_CAP: usize = 4096;
@@ -2798,6 +2944,9 @@ thread_local! {
         std::cell::RefCell::new(TextCache::default());
     /// When text work has to stop this frame, and whether it did.
     static TEXT_DEADLINE: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+    /// True zoom over the zoom the text was shaped at: how far apart to set
+    /// the glyphs so the line comes out at its true width.
+    static TEXT_STRETCH: Cell<f32> = const { Cell::new(1.0) };
     /// Camera of the previous frame, to tell motion from rest.
     static LAST_VIEW: Cell<(f32, f32, f32)> = const { Cell::new((f32::NAN, 0.0, 0.0)) };
     static TEXT_DEFERRED: Cell<bool> = const { Cell::new(false) };
@@ -2904,19 +3053,49 @@ fn paint_baseline(
         SHAPE_NS.with(|c| c.set(c.get() + d));
         d
     });
-    let line_height = line.ascent + line.descent;
-    let r = line.paint(
-        point(px(x), px(baseline) - line.ascent),
-        line_height,
-        TextAlign::Left,
-        None,
-        window,
-        cx,
-    );
+    let stretch = TEXT_STRETCH.with(|c| c.get());
+    let mut failed = false;
+    if (stretch - 1.0).abs() < 1e-4 {
+        let line_height = line.ascent + line.descent;
+        failed = line
+            .paint(
+                point(px(x), px(baseline) - line.ascent),
+                line_height,
+                TextAlign::Left,
+                None,
+                window,
+                cx,
+            )
+            .is_err();
+    } else {
+        // The same glyphs `ShapedLine::paint` would draw, each moved to where
+        // it belongs at the true zoom.
+        for run in &line.runs {
+            for g in &run.glyphs {
+                let at = point(px(x) + g.position.x * stretch, px(baseline) + g.position.y);
+                let r = if g.is_emoji {
+                    window.paint_emoji(at, run.font_id, g.id, line.font_size)
+                } else {
+                    window.paint_glyph(at, run.font_id, g.id, line.font_size, color)
+                };
+                failed |= r.is_err();
+            }
+        }
+        if let Some(c) = strike {
+            window.paint_quad(gpui::fill(
+                Bounds::new(
+                    point(px(x), px(baseline) - line.ascent * 0.25),
+                    size(line.width * stretch, px(0.75)),
+                ),
+                c,
+            ));
+        }
+    }
+    let _ = cx;
     if let (Some(t), Some(shaped)) = (t, t_shaped) {
         GLYPH_NS.with(|c| c.set(c.get() + t.elapsed().as_secs_f32() - shaped));
     }
-    r.is_err() as usize
+    failed as usize
 }
 
 #[cfg(test)]
