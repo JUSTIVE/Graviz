@@ -1,0 +1,43 @@
+[package]
+name = "graviz"
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.97"
+
+[dependencies]
+# Longbridge's Native Shell (https://nsh.dev): the app's chrome is native
+# AppKit views. The graph is not — see src/graph.
+nsh-core = { version = "0.6.1", features = ["svg"] }
+nsh-platform-macos = { version = "0.6.1", default-features = false, features = ["svg"] }
+graviz-core = { path = "../gpui-app/core" }
+# The graph canvas draws itself on the GPU inside an NSView: nsh's own
+# canvas replays through CoreGraphics, which measured 212ms a frame with the
+# whole GitHub schema in view.
+wgpu = "30"
+lyon = "1"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
+raw-window-handle = "0.6"
+serde_json = "1"
+anyhow = "1"
+# Glyph outlines for the graph's text; the distance fields are made here.
+fontdue = "0.9"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+# The window capturing itself (GRAVIZ_SELFSHOT), for checking the look.
+core-graphics = "0.24"
+core-foundation = "0.10"
+image = { version = "0.25", default-features = false, features = ["png"] }
+objc2-foundation = { version = "0.3.2", features = ["NSRunLoop", "NSGeometry", "NSObject", "NSThread"] }
+objc2-app-kit = { version = "0.3.2", features = ["NSView", "NSResponder", "NSEvent", "NSWindow", "NSTrackingArea", "NSScreen", "objc2-quartz-core"] }
+objc2-quartz-core = { version = "0.3.2", features = ["CADisplayLink", "CAFrameRateRange", "CALayer"] }
