@@ -10,11 +10,11 @@
 //!    **virtual-node expansion of every multi-rank edge in either
 //!    direction**, barycenter ordering + transpose refinement over real
 //!    *and* virtual nodes, median y-relaxation
-//! 3. edges become smooth curves routed **through their virtual-node
-//!    waypoints** (a Catmull-Rom spline), so long edges follow the lanes the
-//!    ordering carved out instead of slicing across the whole picture; the
-//!    waypoint chain is relaxed and simplified first, which both straightens
-//!    the route and cuts what the renderer has to flatten each frame
+//! 3. edges are routed **in the lanes their virtual nodes hold**: level
+//!    across each column, in the slot the ordering gave them between two
+//!    cards, changing height only in the gaps between columns — so no edge
+//!    runs through a card it is not attached to. Runs of lanes are then
+//!    straightened into level lines where that is cheap
 //! 4. components shelf-packed (first-fit decreasing height), singletons in a
 //!    grid
 
@@ -133,8 +133,19 @@ const VIRTUAL_W: f32 = 8.0;
 /// Virtual nodes are lanes, not boxes: giving them height would inflate every
 /// rank they pass through (thousands of them on a dense schema).
 const VIRTUAL_H: f32 = 0.0;
-/// Vertical gap between two lanes sharing a rank.
+/// Vertical gap between two lanes sharing a rank, for the spline router.
 const VIRTUAL_SEP: f32 = 2.0;
+/// The same for the lane router, where parallel edges run side by side for
+/// whole columns and have to stay separate lines: at 2 a bundle fuses into a
+/// solid band, at 6 each edge can be followed by eye. Measured cost on the
+/// GitHub schema, 2 to 6: drawing 16% taller, edges 3% longer.
+const LANE_PITCH: f32 = 6.0;
+/// A link between two lanes is straightened only when they already sit within
+/// this of each other. Without a limit every edge is level end to end, but
+/// level lanes pin the cards of far-apart columns into one vertical order and
+/// the drawing grows fivefold (22k to 97k tall). At 200 the bends halve for
+/// 10% more height; at 800 it is already 75% taller.
+const STRAIGHTEN_REACH: f32 = 200.0;
 
 /// A parent type and the variants that should line up in the column directly
 /// to its right — a union and its members.
@@ -227,7 +238,12 @@ pub fn layout(
     let mut singleton_ids: Vec<u32> = Vec::new();
     let mut comps: Vec<CompLayout> = Vec::new();
     // Waypoints per directed global-node pair, component-local until packing.
-    let mut routes: HashMap<(u32, u32), Vec<Point>> = HashMap::new();
+    let mut routes: HashMap<(u32, u32), Route> = HashMap::new();
+    // The column each node sits in, as (left, right) x. Cards are centred in
+    // their column, so a narrow card has column to either side of it that a
+    // wider neighbour above or below occupies.
+    let mut cols: Vec<(f32, f32)> = vec![(0.0, 0.0); n];
+    let lanes = lanes_on();
     // Which component owns each route, so packing can translate them.
     let mut route_comp: HashMap<(u32, u32), usize> = HashMap::new();
 
@@ -260,8 +276,9 @@ pub fn layout(
             &comp_clusters,
             config,
             &mut positions,
-            |pair, waypoints| {
-                routes.insert(pair, waypoints);
+            &mut cols,
+            |pair, route| {
+                routes.insert(pair, route);
                 route_comp.insert(pair, comp_index);
             },
         );
@@ -310,12 +327,14 @@ pub fn layout(
         for &v in &c.members {
             positions[v as usize].x += ox;
             positions[v as usize].y += oy;
+            cols[v as usize].0 += ox;
+            cols[v as usize].1 += ox;
         }
         packed_w = packed_w.max(ox + c.w);
     }
     for (pair, waypoints) in routes.iter_mut() {
         let (ox, oy) = comp_offset[route_comp[pair]];
-        for p in waypoints.iter_mut() {
+        for p in waypoints.pts.iter_mut() {
             p.x += ox;
             p.y += oy;
         }
@@ -338,6 +357,7 @@ pub fn layout(
                 row_h = 0.0;
             }
             positions[v as usize] = Point { x, y };
+            cols[v as usize] = (x, x + nd.w);
             x += nd.w + config.node_sep;
             row_h = row_h.max(nd.h);
             packed_w = packed_w.max(x);
@@ -347,21 +367,37 @@ pub fn layout(
 
     // ---- edge paths: port → waypoints → target, Catmull-Rom smoothed ----
     let mut edge_paths = Vec::with_capacity(edges.len());
-    for (ei, e) in edges.iter().enumerate() {
+    let mut all_knots: Vec<Vec<Point>> = Vec::with_capacity(edges.len());
+    for e in edges.iter() {
         let sp = positions[e.from as usize];
         let sn = nodes[e.from as usize];
         let tp = positions[e.to as usize];
         let tn = nodes[e.to as usize];
         let port_y = e.from_port_y.clamp(8.0, (sn.h - 8.0).max(8.0));
-        let waypoints = routes.get(&(e.from, e.to)).map(|v| v.as_slice()).unwrap_or(&[]);
+        let route = routes.get(&(e.from, e.to));
+        let waypoints = route.map(|r| r.pts.as_slice()).unwrap_or(&[]);
         let (start, end) = anchor_points(sp, sn, tp, tn, port_y, waypoints);
-        let mut knots: Vec<Point> = Vec::with_capacity(waypoints.len() + 2);
+        let mut knots: Vec<Point> = Vec::with_capacity(waypoints.len() + 4);
         knots.push(start);
-        knots.extend_from_slice(waypoints);
-        knots.push(end);
-        smooth_chain(&mut knots);
-        simplify(&mut knots, 3.0);
-        let curves = spline(&knots);
+        if lanes {
+            knots.push(Point { x: cols[e.from as usize].1, y: start.y });
+            knots.extend_from_slice(waypoints);
+            knots.push(Point { x: cols[e.to as usize].0, y: end.y });
+            knots.push(end);
+        } else {
+            knots.extend_from_slice(waypoints);
+            knots.push(end);
+            smooth_chain(&mut knots);
+            simplify(&mut knots, 3.0);
+        }
+        all_knots.push(knots);
+    }
+    if lanes {
+        spread_bends(&mut all_knots);
+    }
+    for (ei, knots) in all_knots.iter().enumerate() {
+        let start = knots[0];
+        let curves = if lanes { lane_path(knots, config.rank_sep) } else { spline(knots) };
         edge_paths.push(EdgePath {
             edge_index: ei as u32,
             start,
@@ -665,6 +701,39 @@ pub fn layout(
                 shared_len / shared_n.max(1) as f32
             );
         }
+        let segs: usize = edge_paths.iter().map(|p| p.curves.len()).sum();
+        let bends: usize = edge_paths
+            .iter()
+            .map(|p| {
+                let mut from = p.start;
+                let mut n = 0;
+                for c in &p.curves {
+                    if (c.end.y - from.y).abs() > 0.5 {
+                        n += 1;
+                    }
+                    from = c.end;
+                }
+                n
+            })
+            .sum();
+        eprintln!("segments: {segs} cubics, {bends} of them bends");
+        // What the reader's eye actually travels: the drawn length of every
+        // edge, bends and detours included, next to the straight-line total
+        // it could not do better than; and the box it all sits in.
+        let drawn: f64 = edge_paths
+            .iter()
+            .map(|p| p.points.windows(2).map(|w| (w[1].x - w[0].x).hypot(w[1].y - w[0].y) as f64).sum::<f64>())
+            .sum();
+        eprintln!(
+            "extent: drawn edge length {:.0} total ({:.0}/edge, {:.2}x the straight-line {:.0}), box {:.0}x{:.0} = {:.1}M px²",
+            drawn,
+            drawn / edges.len().max(1) as f64,
+            drawn / (total_len as f64).max(1.0),
+            total_len,
+            packed_w,
+            packed_h,
+            packed_w as f64 * packed_h as f64 / 1e6
+        );
         let n_edges = edges.len().max(1) as f32;
         eprintln!(
             "layout: {} nodes, {} edges, routed {}, avg len {:.0} = {:.1}% of the diagonal (dx {:.0} dy {:.0}), longest {:.0}, backward {}, crossings {} ({:.2}/edge), tangles {} ({:.1} per edge), to-leaf {} avg {:.0} (dx {:.0} dy {:.0}), same-col {}, union gap {:.0} col {}/{} tight {}/{}",
@@ -701,6 +770,150 @@ pub fn layout(
         edges: edge_paths,
         width: packed_w,
         height: packed_h,
+    }
+}
+
+/// The lanes an edge travels in between its two cards.
+struct Route {
+    /// With lane routing: where the edge enters and leaves each column it
+    /// crosses, in travel order. Without: one point per column.
+    pts: Vec<Point>,
+}
+
+/// A/B switch while the two routers are being compared.
+fn lanes_on() -> bool {
+    std::env::var("GRAVIZ_ROUTE").map(|v| v != "old").unwrap_or(true)
+}
+
+/// Build an edge from knots that already keep it clear of the cards.
+///
+/// Inside a column the edge runs level, in the slot the ordering gave it
+/// between two cards; every change of height happens in the gap between
+/// columns, where there is nothing to hit. A spline through one point per
+/// column, which this replaces, cut the corner on each change of height and
+/// went straight through whatever card sat next to its lane.
+///
+/// Three shapes, picked from the knots alone: level knots are a line, a
+/// change of height across a gap is an S with both ends level, and two knots
+/// stacked on the same x are a U — a back edge turning round, first out of
+/// the right of its source and last into the left of its target.
+fn lane_path(knots: &[Point], gap: f32) -> Vec<CubicSeg> {
+    let mut out: Vec<CubicSeg> = Vec::with_capacity(knots.len());
+    let mut prev_line = false;
+    let mut turns = 0;
+    for w in knots.windows(2) {
+        let (p, q) = (w[0], w[1]);
+        let (dx, dy) = (q.x - p.x, q.y - p.y);
+        if dy.abs() < 0.5 {
+            if dx.abs() < 0.5 {
+                continue;
+            }
+            if prev_line {
+                // One line, however many columns it crosses.
+                let last = out.len() - 1;
+                let from = Point {
+                    x: (3.0 * out[last].c1.x - out[last].end.x) / 2.0,
+                    y: out[last].end.y,
+                };
+                out[last] = line_seg(from, Point { x: q.x, y: from.y });
+            } else {
+                out.push(line_seg(p, Point { x: q.x, y: p.y }));
+            }
+            prev_line = true;
+            continue;
+        }
+        prev_line = false;
+        if dx.abs() < 1.0 {
+            let dir = if turns == 0 { 1.0 } else { -1.0 };
+            turns += 1;
+            let d = (dy.abs() * 0.5).clamp(16.0, gap * 0.7) * dir;
+            out.push(CubicSeg {
+                c1: Point { x: p.x + d, y: p.y },
+                c2: Point { x: q.x + d, y: q.y },
+                end: q,
+            });
+        } else {
+            let pull = dx / 2.0;
+            out.push(CubicSeg {
+                c1: Point { x: p.x + pull, y: p.y },
+                c2: Point { x: q.x - pull, y: q.y },
+                end: q,
+            });
+        }
+    }
+    out
+}
+
+/// Give every bend in a gap its own place to turn.
+///
+/// All the edges that change height between two columns used to do it across
+/// the full width of the gap, so their steep middles lay on top of one
+/// another and a bundle stepping down together drew as one fat stroke. Here
+/// each bend takes half the gap and they are staggered across the rest, in
+/// the order that keeps a bundle nested: of edges heading down, the lowest
+/// turns first, so none has to cross a neighbour that is still running
+/// level; heading up, the highest.
+fn spread_bends(all: &mut [Vec<Point>]) {
+    // (gap, heading down) -> (height it leaves from, edge, knot index)
+    let mut gaps: HashMap<(u32, u32, bool), Vec<(f32, u32, u32)>> = HashMap::new();
+    for (e, knots) in all.iter().enumerate() {
+        for (i, w) in knots.windows(2).enumerate() {
+            let (p, q) = (w[0], w[1]);
+            if (q.y - p.y).abs() >= 0.5 && (q.x - p.x).abs() >= 40.0 {
+                gaps.entry((p.x.to_bits(), q.x.to_bits(), q.y > p.y))
+                    .or_default()
+                    .push((p.y, e as u32, i as u32));
+            }
+        }
+    }
+    let mut turn: Vec<Vec<(u32, f32)>> = vec![Vec::new(); all.len()];
+    for (key, mut bends) in gaps {
+        let down = key.2;
+        bends.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        if down {
+            bends.reverse();
+        }
+        // Turns sit a lane pitch apart, as many as fit in the half of the
+        // gap the bends leave free. A busy gap has far more bends than that,
+        // and spreading them evenly anyway packs them into a solid slab;
+        // there, neighbours share a turn and the gap reads as a few lines.
+        let n = bends.len();
+        let gap = (f32::from_bits(key.1) - f32::from_bits(key.0)).abs();
+        let slots = ((gap * 0.5 / LANE_PITCH) as usize).max(1);
+        let lead = slots.saturating_sub(n) as f32 / 2.0;
+        for (k, &(_, e, i)) in bends.iter().enumerate() {
+            let slot = if n <= slots { k } else { k * slots / n };
+            turn[e as usize].push((i, (slot as f32 + 0.5 + lead) / slots as f32));
+        }
+    }
+    for (knots, mut turns) in all.iter_mut().zip(turn) {
+        if turns.is_empty() {
+            continue;
+        }
+        turns.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mut out = Vec::with_capacity(knots.len() + turns.len() * 2);
+        let mut next = turns.iter().peekable();
+        for (i, w) in knots.windows(2).enumerate() {
+            out.push(w[0]);
+            if let Some(&&(_, t)) = next.peek().filter(|&&&(at, _)| at as usize == i) {
+                next.next();
+                let (p, q) = (w[0], w[1]);
+                let dx = q.x - p.x;
+                let from = p.x + dx * 0.5 * t;
+                out.push(Point { x: from, y: p.y });
+                out.push(Point { x: from + dx * 0.5, y: q.y });
+            }
+        }
+        out.push(*knots.last().unwrap());
+        *knots = out;
+    }
+}
+
+fn line_seg(p: Point, q: Point) -> CubicSeg {
+    CubicSeg {
+        c1: Point { x: p.x + (q.x - p.x) / 3.0, y: p.y + (q.y - p.y) / 3.0 },
+        c2: Point { x: p.x + (q.x - p.x) * 2.0 / 3.0, y: p.y + (q.y - p.y) * 2.0 / 3.0 },
+        end: q,
     }
 }
 
@@ -884,8 +1097,10 @@ fn layout_component(
     clusters: &[Cluster],
     config: &LayoutConfig,
     positions: &mut [Point],
-    mut emit_route: impl FnMut((u32, u32), Vec<Point>),
+    cols: &mut [(f32, f32)],
+    mut emit_route: impl FnMut((u32, u32), Route),
 ) -> (f32, f32) {
+    let lanes = lanes_on();
     let m = comp.len();
     let mut local_of = HashMap::with_capacity(m);
     for (i, &v) in comp.iter().enumerate() {
@@ -928,54 +1143,99 @@ fn layout_component(
         .filter_map(|(k, mut v)| median(&mut v).map(|m| (k, m)))
         .collect();
 
-    // ---- cycle break: DFS, reverse back edges ----
+    // ---- cycle break: Eades-Lin-Smyth ordering, reverse what points back ----
+    // Put the nodes in a line — sinks peeled to the back, sources to the
+    // front, and when neither is left the node that is most nearly a source —
+    // and reverse every edge that points backwards along it.
+    //
+    // This replaced reversing the back edges of a depth-first search. DFS
+    // dives down one long path before it looks sideways, and every edge it
+    // reverses then spans that whole path: on the GitHub schema, 72 columns
+    // and 431 back edges. This gives 44 columns and 237, and edges 17%
+    // shorter (6069 to 5014). The price is 10% more edge-edge crossings
+    // (170 to 188 per edge): the same edges in two thirds of the width.
+    // Orienting by breadth-first depth was also measured: fewer columns
+    // still, but 1648 back edges, each a loop around both of its cards.
+    //
     // acyclic keeps the pair's ORIGINAL orientation alongside the DAG one.
-    let mut acyclic: Vec<((u32, u32), bool)> = Vec::with_capacity(pairs.len());
+    let mut acyclic: Vec<((u32, u32), bool)>;
     {
-        let mut fwd: Vec<Vec<u32>> = vec![Vec::new(); m];
+        let mut outs: Vec<Vec<u32>> = vec![Vec::new(); m];
+        let mut ins: Vec<Vec<u32>> = vec![Vec::new(); m];
         for &(a, b) in &pairs {
-            fwd[a as usize].push(b);
+            outs[a as usize].push(b);
+            ins[b as usize].push(a);
         }
-        #[derive(Clone, Copy, PartialEq)]
-        enum Mark {
-            White,
-            Gray,
-            Black,
-        }
-        let mut mark = vec![Mark::White; m];
-        let mut starts: Vec<u32> = (0..m as u32).collect();
-        starts.sort_by_key(|&v| {
-            let gid = comp[v as usize] as usize;
-            let root = is_root[gid];
-            let has_in = pairs.iter().any(|&(_, b)| b == v);
-            (!root as u8, has_in as u8)
-        });
-        let mut stack: Vec<(u32, usize)> = Vec::new();
-        for &s in &starts {
-            if mark[s as usize] != Mark::White {
-                continue;
+        let mut ord = vec![0u32; m];
+        let mut od: Vec<i32> = outs.iter().map(|v| v.len() as i32).collect();
+        let mut id: Vec<i32> = ins.iter().map(|v| v.len() as i32).collect();
+        let mut gone = vec![false; m];
+        let (mut front, mut back) = (0u32, m as u32);
+        let mut left = m;
+        let take = |v: usize, od: &mut Vec<i32>, id: &mut Vec<i32>, gone: &mut Vec<bool>| {
+            gone[v] = true;
+            for &w in &outs[v] {
+                id[w as usize] -= 1;
             }
-            mark[s as usize] = Mark::Gray;
-            stack.push((s, 0));
-            while let Some(&mut (v, ref mut i)) = stack.last_mut() {
-                if *i < fwd[v as usize].len() {
-                    let w = fwd[v as usize][*i];
-                    *i += 1;
-                    match mark[w as usize] {
-                        Mark::White => {
-                            acyclic.push(((v, w), false));
-                            mark[w as usize] = Mark::Gray;
-                            stack.push((w, 0));
-                        }
-                        Mark::Gray => acyclic.push(((w, v), true)), // reversed
-                        Mark::Black => acyclic.push(((v, w), false)),
+            for &w in &ins[v] {
+                od[w as usize] -= 1;
+            }
+        };
+        // The schema's entry points lead, whatever refers back to them.
+        for v in 0..m {
+            if is_root[comp[v] as usize] {
+                take(v, &mut od, &mut id, &mut gone);
+                ord[v] = front;
+                front += 1;
+                left -= 1;
+            }
+        }
+        while left > 0 {
+            let mut moved = true;
+            while moved {
+                moved = false;
+                for v in 0..m {
+                    if !gone[v] && od[v] == 0 {
+                        take(v, &mut od, &mut id, &mut gone);
+                        back -= 1;
+                        ord[v] = back;
+                        left -= 1;
+                        moved = true;
                     }
-                } else {
-                    mark[v as usize] = Mark::Black;
-                    stack.pop();
+                }
+                for v in 0..m {
+                    if !gone[v] && id[v] == 0 {
+                        take(v, &mut od, &mut id, &mut gone);
+                        ord[v] = front;
+                        front += 1;
+                        left -= 1;
+                        moved = true;
+                    }
                 }
             }
+            // Lowest index wins a tie, so the same schema always lays out
+            // the same way.
+            let Some(v) = (0..m)
+                .filter(|&v| !gone[v])
+                .max_by_key(|&v| (od[v] - id[v], std::cmp::Reverse(v)))
+            else {
+                break;
+            };
+            take(v, &mut od, &mut id, &mut gone);
+            ord[v] = front;
+            front += 1;
+            left -= 1;
         }
+        acyclic = pairs
+            .iter()
+            .map(|&(a, b)| {
+                if ord[a as usize] < ord[b as usize] {
+                    ((a, b), false)
+                } else {
+                    ((b, a), true)
+                }
+            })
+            .collect();
     }
     acyclic.sort_unstable_by_key(|&(p, _)| p);
     acyclic.dedup_by_key(|&mut (p, _)| p);
@@ -1033,6 +1293,8 @@ fn layout_component(
         // Near-square, which also measured as the edge-length optimum: a
         // wider drawing lengthens every edge's horizontal run, a taller one
         // its vertical run.
+        // Re-measured against drawn edge length with lane routing: half
+        // this cap draws 39% more edge, three times it 3% more.
         let cap = (total_h * (avg_w + config.rank_sep)).sqrt().max(2000.0);
         // Each node's atomic unit: itself, or a shared id if it belongs to a
         // cluster that is now sitting in one column. Splitting a rank must
@@ -1425,6 +1687,80 @@ fn layout_component(
         }
     }
 
+    // ---- turn-round lanes for back edges ----
+    // A back edge leaves the right of its source and has to end up at the
+    // left of a target that sits to the left of it, so it crosses both of
+    // their columns on the way. Give it a slot in each, right beside the
+    // card, on the side its route continues from. Added after ordering: the
+    // slot belongs next to its card, which is not something crossing
+    // reduction can be told.
+    let mut back_pairs: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+    if lanes {
+        // Read off the ranks rather than the cycle breaker's list: when two
+        // types refer to each other only one direction survives in the DAG,
+        // and the other is a back edge all the same. It rides its twin's
+        // lanes, the two drawn as one line.
+        for &(s, t) in &pairs {
+            if rank[s as usize] < rank[t as usize] && !chains.contains_key(&(s, t)) {
+                if let Some(mut twin) = chains.get(&(t, s)).cloned() {
+                    twin.reverse();
+                    chains.insert((s, t), twin);
+                }
+            }
+        }
+        for &(b, a) in &pairs {
+            if rank[b as usize] <= rank[a as usize] {
+                continue;
+            }
+            // a is the target (lower rank), b the source.
+            let pair = (b, a);
+            let chain = chains.remove(&pair).unwrap_or_else(|| {
+                let mut twin = chains.get(&(a, b)).cloned().unwrap_or_default();
+                twin.reverse();
+                twin
+            });
+            let frac = |v: u32, ranks: &Vec<Vec<u32>>, xnodes: &Vec<XNode>| {
+                let bucket = &ranks[xnodes[v as usize].rank as usize];
+                bucket.iter().position(|&x| x == v).unwrap_or(0) as f32 / bucket.len().max(1) as f32
+            };
+            let mut beside = |card: u32,
+                              toward: u32,
+                              xnodes: &mut Vec<XNode>,
+                              ranks: &mut Vec<Vec<u32>>| {
+                let below = frac(toward, ranks, xnodes) > frac(card, ranks, xnodes);
+                let r = xnodes[card as usize].rank;
+                let id = xnodes.len() as u32;
+                xnodes.push(XNode { real: None, rank: r, w: VIRTUAL_W, h: VIRTUAL_H });
+                xout.push(Vec::new());
+                xin.push(Vec::new());
+                pout.push(Vec::new());
+                pin.push(Vec::new());
+                let bucket = &mut ranks[r as usize];
+                let at = bucket.iter().position(|&x| x == card).unwrap_or(0);
+                bucket.insert(if below { at + 1 } else { at }, id);
+                id
+            };
+            let lb = beside(b, chain.first().copied().unwrap_or(a), &mut xnodes, &mut ranks);
+            let la = beside(a, chain.last().copied().unwrap_or(b), &mut xnodes, &mut ranks);
+            // Wired low rank to high, like every other ordering edge.
+            let (near_a, near_b) = (
+                chain.last().copied().unwrap_or(lb),
+                chain.first().copied().unwrap_or(la),
+            );
+            push_edge(&mut xout, &mut xin, &mut pout, &mut pin, la, near_a, 0.0, 0.0);
+            if !chain.is_empty() {
+                push_edge(&mut xout, &mut xin, &mut pout, &mut pin, near_b, lb, 0.0, 0.0);
+            }
+            let mut full = Vec::with_capacity(chain.len() + 2);
+            full.push(lb);
+            full.extend(chain);
+            full.push(la);
+            chains.insert(pair, full);
+            back_pairs.insert(pair);
+        }
+    }
+    let xn = xnodes.len();
+
     let nranks = ranks.len();
     let mut xrank = vec![0usize; xn];
     for (ri, bucket) in ranks.iter().enumerate() {
@@ -1441,7 +1777,10 @@ fn layout_component(
     // ---- x per rank: cumulative max width ----
     let mut rank_x = vec![0.0f32; nranks];
     let mut rank_w = vec![0.0f32; nranks];
-    let mut x_cursor = 0.0f32;
+    // A turn-round bulges into the gap beside its column; the outermost
+    // columns have no gap on their far side, so leave one.
+    let turn_pad = if back_pairs.is_empty() { 0.0 } else { config.rank_sep * 0.6 };
+    let mut x_cursor = turn_pad;
     for ri in 0..nranks {
         let w = ranks[ri]
             .iter()
@@ -1451,10 +1790,11 @@ fn layout_component(
         rank_w[ri] = w;
         x_cursor += w + config.rank_sep;
     }
-    let comp_w = if nranks > 0 { x_cursor - config.rank_sep } else { 0.0 };
+    let comp_w = if nranks > 0 { x_cursor - config.rank_sep + turn_pad } else { 0.0 };
 
     // ---- y: stack, then median relaxation preserving order ----
-    let sep_of = |x: &XNode| if x.real.is_some() { config.node_sep } else { VIRTUAL_SEP };
+    let vsep = if lanes { LANE_PITCH } else { VIRTUAL_SEP };
+    let sep_of = |x: &XNode| if x.real.is_some() { config.node_sep } else { vsep };
     let mut y = vec![0.0f32; xn];
     for rank_nodes in ranks.iter().take(nranks) {
         let mut cursor = 0.0f32;
@@ -1472,7 +1812,11 @@ fn layout_component(
     // ~5% and halves the drawing's height, but packs the cards so tightly
     // that edges cross 42% more cards and 28% more edges. Complexity is
     // crossings first, length second.
-    relax_y(&ranks, &xnodes, &xin, &xout, &pin, &pout, &sep_of, &mut y, 6);
+    relax_y(&ranks, &xnodes, &xin, &xout, &pin, &pout, &sep_of, &mut y, 6, lanes);
+
+    if lanes {
+        straighten(&ranks, &xnodes, &xout, &sep_of, &mut y);
+    }
 
     if timing {
         eprintln!("  stage coords    {:>6.1}ms", t_stage.elapsed().as_secs_f32() * 1000.0);
@@ -1493,18 +1837,26 @@ fn layout_component(
         xpos[i] = p;
         if let Some(real) = x.real {
             positions[comp[real as usize] as usize] = p;
+            cols[comp[real as usize] as usize] = (rank_x[ri], rank_x[ri] + rank_w[ri]);
         }
     }
     for ((la, lb), chain) in chains {
-        let waypoints: Vec<Point> = chain
-            .iter()
-            .map(|&id| {
-                let p = xpos[id as usize];
-                let x = &xnodes[id as usize];
-                Point { x: p.x + x.w / 2.0, y: p.y + x.h / 2.0 }
-            })
-            .collect();
-        emit_route((comp[la as usize], comp[lb as usize]), waypoints);
+        let back = back_pairs.contains(&(la, lb));
+        let mut pts: Vec<Point> = Vec::with_capacity(chain.len() * 2);
+        for &id in &chain {
+            let p = xpos[id as usize];
+            let x = &xnodes[id as usize];
+            if lanes {
+                let ri = xrank[id as usize];
+                let (l, r) = (rank_x[ri], rank_x[ri] + rank_w[ri]);
+                let (first, second) = if back { (r, l) } else { (l, r) };
+                pts.push(Point { x: first, y: p.y });
+                pts.push(Point { x: second, y: p.y });
+            } else {
+                pts.push(Point { x: p.x + x.w / 2.0, y: p.y + x.h / 2.0 });
+            }
+        }
+        emit_route((comp[la as usize], comp[lb as usize]), Route { pts });
     }
     if timing {
         eprintln!("  stage emit      {:>6.1}ms", t_stage.elapsed().as_secs_f32() * 1000.0);
@@ -1624,6 +1976,7 @@ fn relax_y(
     sep_of: &impl Fn(&XNode) -> f32,
     y: &mut [f32],
     yiters: usize,
+    follow: bool,
 ) {
     let nranks = ranks.len();
     for iter in 0..yiters {
@@ -1638,10 +1991,24 @@ fn relax_y(
             for &v in rank_nodes {
                 let vi = v as usize;
                 let mut centers: Vec<f32> = Vec::new();
+                // A lane follows one neighbour, not the middle of two: the
+                // one it has just been placed against in this sweep. Splitting
+                // the difference puts a step at every column; following keeps
+                // the run level and leaves one bend where it has to give way.
+                let lane = follow && xnodes[vi].real.is_none();
+                let from_in = iter % 2 == 0;
+                let (take_in, take_out) = if !lane {
+                    (usize::MAX, usize::MAX)
+                } else if (from_in && !xin[vi].is_empty()) || xout[vi].is_empty() {
+                    (usize::MAX, 0)
+                } else {
+                    (0, usize::MAX)
+                };
                 for (&u, &(own, other)) in xin[vi]
                     .iter()
                     .zip(pin[vi].iter())
-                    .chain(xout[vi].iter().zip(pout[vi].iter()))
+                    .take(take_in)
+                    .chain(xout[vi].iter().zip(pout[vi].iter()).take(take_out))
                 {
                     // The edge is straight when the two points it touches
                     // share a y: `y[u] + other == y[v] + own`. Solve that for
@@ -1656,7 +2023,17 @@ fn relax_y(
                 // minimises total edge length. The mean (L2) was measured —
                 // it pulls outliers in and shortens edges 5%, but costs 27%
                 // more edges cutting across cards and 14% more crossings.
-                let d = median(&mut centers)
+                // With lane routing a card takes the mean instead. The case
+                // against it was all card crossings, and lanes cannot cross
+                // a card wherever it sits; what is left is the gain — 0.7%
+                // less drawn edge and a 6% smaller drawing. Re-sorting each
+                // column by these heights and relaxing again was also tried,
+                // to stop lanes detouring round cards: 10% more edge.
+                let d = if follow && !lane && !centers.is_empty() {
+                    Some(centers.iter().sum::<f32>() / centers.len() as f32)
+                } else {
+                    median(&mut centers)
+                }
                     .map(|m| m - xnodes[vi].h / 2.0)
                     .unwrap_or(y[vi]);
                 desired.push(d);
@@ -1704,6 +2081,143 @@ fn relax_y(
                 offset += x.h + sep_of(x);
             }
         }
+    }
+}
+
+/// Put each run of lanes at one height, so a long edge is a level line with
+/// a bend at either end rather than a step at every column.
+///
+/// `relax_y` places one rank at a time, and a lane has no reason to land at
+/// the height its predecessor did. Here consecutive lanes of an edge are
+/// tied into a block that moves as one. Not every pair can be: two edges
+/// that swap places between two ranks cannot both go straight through the
+/// swap. Per pair of ranks the links kept are a longest increasing
+/// subsequence — the most links that do not cross one another — and because
+/// kept links never cross, "sits above" between blocks has no cycles and the
+/// blocks can be placed in one pass each way.
+///
+/// Each block asks for the median height its lanes already had. One pass
+/// from the top gives every block the highest spot at or below its wish
+/// that clears what is above it; one from the bottom the mirror image. Both
+/// satisfy every spacing constraint, so their midpoint does too, and it
+/// errs evenly instead of drifting one way.
+fn straighten(
+    ranks: &[Vec<u32>],
+    xnodes: &[XNode],
+    xout: &[Vec<u32>],
+    sep_of: &impl Fn(&XNode) -> f32,
+    y: &mut [f32],
+) {
+    let reach = STRAIGHTEN_REACH;
+    let xn = xnodes.len();
+    let mut pos = vec![0u32; xn];
+    for bucket in ranks {
+        for (i, &v) in bucket.iter().enumerate() {
+            pos[v as usize] = i as u32;
+        }
+    }
+    // ---- which lane-to-lane links stay straight ----
+    let mut next: Vec<Option<u32>> = vec![None; xn];
+    let mut has_prev = vec![false; xn];
+    for bucket in ranks {
+        // (lane, its continuation), in rank order.
+        let cand: Vec<(u32, u32)> = bucket
+            .iter()
+            .filter(|&&u| xnodes[u as usize].real.is_none())
+            .filter_map(|&u| {
+                xout[u as usize]
+                    .iter()
+                    .copied()
+                    .find(|&w| {
+                        xnodes[w as usize].real.is_none()
+                            && xnodes[w as usize].rank == xnodes[u as usize].rank + 1
+                            && (y[w as usize] - y[u as usize]).abs() <= reach
+                    })
+                    .map(|w| (u, w))
+            })
+            .collect();
+        // Longest strictly increasing subsequence of continuation slots.
+        let mut tails: Vec<usize> = Vec::new();
+        let mut back: Vec<Option<usize>> = vec![None; cand.len()];
+        for (i, &(_, w)) in cand.iter().enumerate() {
+            let key = pos[w as usize];
+            let at = tails.partition_point(|&t| pos[cand[t].1 as usize] < key);
+            back[i] = if at > 0 { Some(tails[at - 1]) } else { None };
+            if at == tails.len() {
+                tails.push(i);
+            } else {
+                tails[at] = i;
+            }
+        }
+        let mut cur = tails.last().copied();
+        while let Some(i) = cur {
+            let (u, w) = cand[i];
+            next[u as usize] = Some(w);
+            has_prev[w as usize] = true;
+            cur = back[i];
+        }
+    }
+    // ---- blocks ----
+    let mut block = vec![u32::MAX; xn];
+    let mut wish: Vec<f32> = Vec::new();
+    for (v, &continues) in has_prev.iter().enumerate() {
+        if continues {
+            continue;
+        }
+        let id = wish.len() as u32;
+        let mut ys: Vec<f32> = Vec::new();
+        let mut cur = Some(v as u32);
+        while let Some(u) = cur {
+            block[u as usize] = id;
+            ys.push(y[u as usize]);
+            cur = next[u as usize];
+        }
+        wish.push(median(&mut ys).unwrap_or(0.0));
+    }
+    let nb = wish.len();
+    // ---- "sits above" between blocks, with the room each needs ----
+    let mut below: Vec<Vec<(u32, f32)>> = vec![Vec::new(); nb];
+    let mut waiting = vec![0u32; nb];
+    for bucket in ranks {
+        for w in bucket.windows(2) {
+            let up = &xnodes[w[0] as usize];
+            let (a, b) = (block[w[0] as usize], block[w[1] as usize]);
+            below[a as usize].push((b, up.h + sep_of(up)));
+            waiting[b as usize] += 1;
+        }
+    }
+    let mut order: Vec<u32> = (0..nb as u32).filter(|&b| waiting[b as usize] == 0).collect();
+    let mut head = 0;
+    while head < order.len() {
+        let a = order[head];
+        head += 1;
+        for &(b, _) in &below[a as usize] {
+            waiting[b as usize] -= 1;
+            if waiting[b as usize] == 0 {
+                order.push(b);
+            }
+        }
+    }
+    if order.len() != nb {
+        // Cannot happen while kept links do not cross; if it ever does, the
+        // relaxed heights are still a valid drawing.
+        return;
+    }
+    let mut lo = wish.clone();
+    for &a in &order {
+        for &(b, gap) in &below[a as usize] {
+            lo[b as usize] = lo[b as usize].max(lo[a as usize] + gap);
+        }
+    }
+    let mut hi = wish;
+    for &a in order.iter().rev() {
+        for &(b, gap) in &below[a as usize] {
+            hi[a as usize] = hi[a as usize].min(hi[b as usize] - gap);
+        }
+    }
+    for v in 0..xn {
+        let b = block[v] as usize;
+        y[v] = (lo[b] + hi[b]) / 2.0;
     }
 }
 
@@ -1986,6 +2500,39 @@ mod tests {
                 q.x > p.x && q.x < p.x + 100.0 && q.y > p.y && q.y < p.y + 40.0
             });
             assert!(!inside, "long edge cuts through node {mid} at {p:?}: {:?}", long.points);
+        }
+    }
+
+    #[test]
+    fn no_edge_runs_through_a_card_it_is_not_attached_to() {
+        // Long edges, a cycle, a pair that refer to each other, and cards of
+        // very different widths sharing columns: every way an edge used to
+        // end up on top of somebody else's card.
+        let mut nodes = Vec::new();
+        for i in 0..24u32 {
+            nodes.push(node(80.0 + (i % 5) as f32 * 90.0, 30.0 + (i % 4) as f32 * 50.0));
+        }
+        let mut edges = Vec::new();
+        for i in 0..24u32 {
+            for step in [1u32, 2, 5, 11] {
+                if (i * 7 + step) % 3 != 0 {
+                    edges.push(edge(i, (i + step) % 24));
+                }
+            }
+        }
+        edges.push(edge(3, 2));
+        edges.push(edge(2, 3));
+        let r = layout(&nodes, &edges, &[0], &[], &LayoutConfig::default());
+        for (k, e) in edges.iter().enumerate() {
+            for (i, (p, n)) in r.positions.iter().zip(nodes.iter()).enumerate() {
+                if i as u32 == e.from || i as u32 == e.to {
+                    continue;
+                }
+                let inside = r.edges[k].points.iter().any(|q| {
+                    q.x > p.x + 1.0 && q.x < p.x + n.w - 1.0 && q.y > p.y + 1.0 && q.y < p.y + n.h - 1.0
+                });
+                assert!(!inside, "edge {}→{} runs through card {i}", e.from, e.to);
+            }
         }
     }
 
