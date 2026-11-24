@@ -19,6 +19,8 @@
 
 use std::collections::HashMap;
 
+use ab_glyph::{Font as _, FontVec, PxScale, ScaleFont as _};
+
 use crate::{model, theme::Color};
 
 /// Pixels per em the fields are made at.
@@ -69,13 +71,15 @@ struct Glyph {
     advance: f32,
 }
 
-struct Loaded {
-    /// The face asked for, then the fallbacks for what it lacks.
-    fonts: Vec<fontdue::Font>,
-}
-
 pub struct Fonts {
-    faces: HashMap<Face, Loaded>,
+    faces: HashMap<Face, FontVec>,
+    /// What the faces lack (Hangul, the rest of CJK, everything else Arial
+    /// Unicode covers), shared by every face and read only once a character
+    /// needs them (with fontdue, which laid out every glyph of a font as it
+    /// loaded it, these two held 2.4 GB while each face kept a copy).
+    /// One slot per fallback file, filled the first time a character gets
+    /// that far down the list (Hangul never needs Arial Unicode).
+    fallbacks: Vec<(&'static str, Option<Option<FontVec>>)>,
     /// Keyed by size in quarter device pixels; 0 is the distance field.
     glyphs: HashMap<(Face, char, u16), Glyph>,
     /// Device pixels per point, set by the view before a frame is painted.
@@ -87,24 +91,56 @@ pub struct Fonts {
     shelf: u32,
 }
 
-fn load(path: &str, index: u32) -> Option<fontdue::Font> {
+/// A face read from `path` (`index` in a collection). ab_glyph reads each
+/// outline when it is drawn, so a font costs its file and no more.
+fn load(path: &str, index: u32) -> Option<FontVec> {
     let bytes = std::fs::read(path).ok()?;
-    fontdue::Font::from_bytes(
-        bytes,
-        fontdue::FontSettings { collection_index: index, scale: FIELD_PX * SUPER as f32, ..Default::default() },
-    )
-    .ok()
+    FontVec::try_from_vec_and_index(bytes, index).ok()
+}
+
+fn covers(font: &FontVec, c: char) -> bool {
+    font.glyph_id(c).0 != 0
+}
+
+/// A rasterized glyph: its ink box in pixels, `xmin` / `ymin` from the pen
+/// and the baseline (y up), and its advance.
+struct Metrics {
+    width: usize,
+    height: usize,
+    xmin: i32,
+    ymin: i32,
+    advance_width: f32,
+}
+
+/// `c` drawn `px` to the em: rows of coverage from the top.
+fn rasterize(font: &FontVec, c: char, px: f32) -> (Metrics, Vec<u8>) {
+    // ab_glyph's scale is the line height (ascent - descent); fontdue's,
+    // which the layout was tuned on, is the em.
+    let scale = PxScale::from(px * font.height_unscaled() / font.units_per_em().unwrap_or(1000.0));
+    let scaled = font.as_scaled(scale);
+    let id = font.glyph_id(c);
+    let advance_width = scaled.h_advance(id);
+    let empty = (Metrics { width: 0, height: 0, xmin: 0, ymin: 0, advance_width }, Vec::new());
+    let Some(outlined) = font.outline_glyph(id.with_scale_and_position(scale, ab_glyph::point(0.0, 0.0))) else {
+        return empty;
+    };
+    let b = outlined.px_bounds();
+    let (width, height) = (b.width() as usize, b.height() as usize);
+    if width == 0 || height == 0 {
+        return empty;
+    }
+    let mut coverage = vec![0u8; width * height];
+    outlined.draw(|x, y, v| {
+        let i = y as usize * width + x as usize;
+        if i < coverage.len() {
+            coverage[i] = (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+        }
+    });
+    (Metrics { width, height, xmin: b.min.x as i32, ymin: -(b.max.y as i32), advance_width }, coverage)
 }
 
 impl Fonts {
     pub fn new() -> Self {
-        // What Menlo and Helvetica Neue lack: Hangul and the rest of CJK,
-        // then everything else Arial Unicode covers.
-        let fallbacks = || {
-            [("/System/Library/Fonts/AppleSDGothicNeo.ttc", 0), ("/Library/Fonts/Arial Unicode.ttf", 0)]
-                .into_iter()
-                .filter_map(|(p, i)| load(p, i))
-        };
         let mut faces = HashMap::new();
         for (face, path, index) in [
             (Face::Mono, "/System/Library/Fonts/Menlo.ttc", 0),
@@ -112,14 +148,16 @@ impl Fonts {
             (Face::MonoItalic, "/System/Library/Fonts/Menlo.ttc", 2),
             (Face::Sans, "/System/Library/Fonts/HelveticaNeue.ttc", 0),
         ] {
-            let fonts: Vec<fontdue::Font> = load(path, index).into_iter().chain(fallbacks()).collect();
-            if fonts.is_empty() {
-                eprintln!("graph: no font for {face:?} ({path})");
+            match load(path, index) {
+                Some(font) => {
+                    faces.insert(face, font);
+                }
+                None => eprintln!("graph: no font for {face:?} ({path})"),
             }
-            faces.insert(face, Loaded { fonts });
         }
         Self {
             faces,
+            fallbacks: vec![("/System/Library/Fonts/AppleSDGothicNeo.ttc", None), ("/Library/Fonts/Arial Unicode.ttf", None)],
             glyphs: HashMap::new(),
             scale: 2.0,
             pixels: vec![0; (ATLAS * ATLAS) as usize],
@@ -127,6 +165,26 @@ impl Fonts {
             cursor: (1, 1),
             shelf: 0,
         }
+    }
+
+    /// The font that draws `c` in `face`: the face itself, else the first
+    /// fallback that has it (loading them the first time one is needed),
+    /// else the face's missing-glyph box.
+    fn font_for(&mut self, face: Face, c: char) -> Option<&FontVec> {
+        let has = self.faces.get(&face).is_some_and(|f| covers(f, c));
+        let mut pick = None;
+        if !has && !c.is_ascii() {
+            for (i, (path, slot)) in self.fallbacks.iter_mut().enumerate() {
+                let font = slot.get_or_insert_with(|| load(path, 0));
+                if font.as_ref().is_some_and(|f| covers(f, c)) {
+                    pick = Some(i);
+                    break;
+                }
+            }
+        }
+        let this = &*self;
+        let fallback = pick.and_then(|i| this.fallbacks[i].1.as_ref().and_then(Option::as_ref));
+        fallback.or(this.faces.get(&face))
     }
 
     /// The glyph for `c` drawn `device_px` tall: `step` 0 is the field.
@@ -167,11 +225,8 @@ impl Fonts {
     fn make_bitmap(&mut self, face: Face, c: char, step: u16) -> Glyph {
         let empty = Glyph { uv: [0.0; 4], left: 0.0, bottom: 0.0, w: 0.0, h: 0.0, advance: 0.5 };
         let px = step as f32 / SIZE_STEP;
-        let Some(loaded) = self.faces.get(&face) else { return empty };
-        let Some(font) = loaded.fonts.iter().find(|f| f.lookup_glyph_index(c) != 0).or(loaded.fonts.first()) else {
-            return empty;
-        };
-        let (m, coverage) = font.rasterize(c, px);
+        let Some(font) = self.font_for(face, c) else { return empty };
+        let (m, coverage) = rasterize(font, c, px);
         let advance = m.advance_width / px;
         if m.width == 0 || m.height == 0 {
             return Glyph { advance, ..empty };
@@ -196,12 +251,9 @@ impl Fonts {
 
     fn make(&mut self, face: Face, c: char) -> Glyph {
         let empty = Glyph { uv: [0.0; 4], left: 0.0, bottom: 0.0, w: 0.0, h: 0.0, advance: 0.5 };
-        let Some(loaded) = self.faces.get(&face) else { return empty };
-        let Some(font) = loaded.fonts.iter().find(|f| f.lookup_glyph_index(c) != 0).or(loaded.fonts.first()) else {
-            return empty;
-        };
+        let Some(font) = self.font_for(face, c) else { return empty };
         let big = FIELD_PX * SUPER as f32;
-        let (m, coverage) = font.rasterize(c, big);
+        let (m, coverage) = rasterize(font, c, big);
         let advance = m.advance_width / big;
         if m.width == 0 || m.height == 0 {
             return Glyph { advance, ..empty };
@@ -270,11 +322,15 @@ impl Fonts {
         let baseline = if step == 0 { baseline } else { (baseline * self.scale).round() / self.scale };
         for c in text.chars() {
             let g = self.glyph(face, c, step);
-            let cell = if face == Face::Sans { g.advance * size } else { model::mono_w(c.encode_utf8(&mut [0; 4]), size) };
+            // Mono rows keep ASCII on the layout's grid; what comes from a
+            // fallback (Hangul, CJK) takes its own advance, as CoreText sets
+            // it in the gpui app. The layout's two cells for a wide
+            // character are an upper bound, so the text still fits.
+            let natural = face == Face::Sans || !c.is_ascii();
+            let cell = if natural { g.advance * size } else { model::mono_w(c.encode_utf8(&mut [0; 4]), size) };
             if g.w > 0.0 {
-                // Centre a glyph narrower or wider than its cell, as a
-                // fallback font's are.
-                let shift = if face == Face::Sans { 0.0 } else { (cell - g.advance * size) / 2.0 };
+                // Centre a glyph narrower or wider than its cell.
+                let shift = if natural { 0.0 } else { (cell - g.advance * size) / 2.0 };
                 out.push(GlyphInstance {
                     rect: [pen + shift + g.left * draw, baseline - (g.bottom + g.h) * draw, g.w * draw, g.h * draw],
                     uv: g.uv,

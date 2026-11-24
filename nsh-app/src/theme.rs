@@ -178,3 +178,32 @@ impl Theme {
         self
     }
 }
+
+/// The theme now: the Metro ground and accent (tracked, so a closure that
+/// reads it follows a change of either).
+pub fn current() -> Theme {
+    let t = nsh_metro::Theme::get();
+    let accent = color_of(t.accent.color());
+    match t.mode {
+        nsh_metro::Mode::Dark => Theme::dark(accent),
+        nsh_metro::Mode::Light => Theme::light(accent),
+    }
+}
+
+/// An nsh colour as ours.
+pub fn color_of(c: nsh_core::prelude::Hsla) -> Color {
+    let r = nsh_core::prelude::Rgba::from(c);
+    Color { r: r.r, g: r.g, b: r.b, a: r.a }
+}
+
+/// The accent picked in Settings, by name, else cobalt.
+pub fn accent_from_name(name: &str) -> nsh_metro::Accent {
+    nsh_metro::Accent::ALL.into_iter().find(|a| a.name() == name).unwrap_or(nsh_metro::Accent::Cobalt)
+}
+
+/// `0xRRGGBB` of an accent, for the graph view's prop.
+pub fn accent_hex(a: nsh_metro::Accent) -> u32 {
+    let c = color_of(a.color());
+    let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
+    (b(c.r) << 16) | (b(c.g) << 8) | b(c.b)
+}

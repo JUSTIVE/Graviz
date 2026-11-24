@@ -199,8 +199,11 @@ fn glyph_fs(in: Out) -> @location(0) vec4<f32> {
     let d = textureSample(atlas, atlas_sampler, in.uv).r;
     let w = max(fwidth(d), 0.0001);
     // Small glyphs are plain coverage, made at the size they are drawn.
-    let field = clamp((d - 0.5) / w + 0.5, 0.0, 1.0);
-    let a = mix(field, d, in.kind) * in.color.a;
+    // CoreText thickens glyphs as it smooths them, and gpui draws through
+    // it; a slightly lower threshold and a gamma on coverage put the same
+    // weight on the canvas.
+    let field = clamp((d - 0.47) / w + 0.5, 0.0, 1.0);
+    let a = mix(field, pow(d, 0.78), in.kind) * in.color.a;
     return vec4<f32>(in.color.rgb * a, a);
 }
 ";
@@ -629,7 +632,10 @@ impl Gpu {
                 ..Default::default()
             });
             pass.set_bind_group(0, &self.bind, &[]);
-            if let Some(edges) = self.edges.iter().find(|m| cam.k <= m.max_zoom).or(self.edges.last()) {
+            let mesh = self.edges.iter().find(|m| cam.k <= m.max_zoom).or(self.edges.last());
+            // A slice with no edges (an orphan tab of loose types) has
+            // empty meshes, which wgpu cannot bind.
+            if let Some(edges) = mesh.filter(|m| m.index_count > 0) {
                 pass.set_pipeline(&self.edge_pipeline);
                 pass.set_vertex_buffer(0, edges.vertices.slice(..));
                 pass.set_index_buffer(edges.indices.slice(..), wgpu::IndexFormat::Uint32);
@@ -659,9 +665,11 @@ impl Gpu {
 }
 
 fn style_buffer(device: &wgpu::Device, styles: &[EdgeStyle]) -> wgpu::Buffer {
+    let stand_in = [EdgeStyle::zeroed()];
     device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("edge styles"),
-        contents: bytemuck::cast_slice(styles),
+        // A storage binding cannot be empty: one unused style stands in.
+        contents: bytemuck::cast_slice(if styles.is_empty() { &stand_in } else { styles }),
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     })
 }

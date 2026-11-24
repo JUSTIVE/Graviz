@@ -153,6 +153,23 @@ fn fill(out: &mut Vec<RectInstance>, x: f32, y: f32, w: f32, h: f32, c: Color) {
 }
 
 /// A rectangle's outline, `t` wide, inside its bounds.
+/// A dashed ring like gpui's `BorderStyle::Dashed`: dashes twice the
+/// stroke long, with gaps as long.
+fn dashed_outline(out: &mut Vec<RectInstance>, x: f32, y: f32, w: f32, h: f32, t: f32, c: Color) {
+    let dash = (2.0 * t).max(1.0);
+    let run = |out: &mut Vec<RectInstance>, len: f32, mut put: Box<dyn FnMut(&mut Vec<RectInstance>, f32, f32)>| {
+        let mut a = 0.0;
+        while a < len {
+            put(out, a, dash.min(len - a));
+            a += 2.0 * dash;
+        }
+    };
+    run(out, w, Box::new(move |o, a, l| fill(o, x + a, y, l, t, c)));
+    run(out, w, Box::new(move |o, a, l| fill(o, x + a, y + h - t, l, t, c)));
+    run(out, h, Box::new(move |o, a, l| fill(o, x, y + a, t, l, c)));
+    run(out, h, Box::new(move |o, a, l| fill(o, x + w - t, y + a, t, l, c)));
+}
+
 fn outline(out: &mut Vec<RectInstance>, x: f32, y: f32, w: f32, h: f32, t: f32, c: Color) {
     fill(out, x, y, w, t, c);
     fill(out, x, y + h - t, w, t, c);
@@ -326,7 +343,7 @@ pub fn paint(
         local(rects, 0.0, 0.0, card.w, card.h, th.card_bg.opacity(dim));
         if card.is_overlay {
             let t = (2.0 * k).clamp(0.5, 3.0);
-            outline(rects, sx(pos.x), sy(pos.y), card.w * k, card.h * k, t, th.overlay_green.opacity(dim));
+            dashed_outline(rects, sx(pos.x), sy(pos.y), card.w * k, card.h * k, t, th.overlay_green.opacity(dim));
         }
         local(rects, 0.0, 0.0, card.w, card.header_h, kind_c.opacity(dim));
 

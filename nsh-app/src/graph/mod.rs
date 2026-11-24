@@ -13,6 +13,7 @@
 //! view, on the main thread, takes it by that id when its `model` prop
 //! changes. Nothing else crosses between the two but small JSON.
 
+pub mod canvas;
 mod gpu;
 mod paint;
 mod text;
@@ -26,6 +27,7 @@ use std::{
     },
 };
 
+pub use paint::LOD_ROWS;
 pub use view::register;
 
 use crate::model::Model;

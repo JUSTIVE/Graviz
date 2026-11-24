@@ -10,6 +10,11 @@ rust-version = "1.97"
 nsh-core = { version = "0.6.1", features = ["svg"] }
 nsh-platform-macos = { version = "0.6.1", default-features = false, features = ["svg"] }
 graviz-core = { path = "../gpui-app/core" }
+# The Windows Phone "Metro" design system on nsh: the chrome around the graph.
+nsh-metro = { git = "https://github.com/JUSTIVE/nsh-metro", rev = "49db8aa" }
+serde = { version = "1", features = ["derive"] }
+# The update check: one blocking GET to GitHub's API, off the main thread.
+ureq = { version = "2", features = ["json"] }
 # The graph canvas draws itself on the GPU inside an NSView: nsh's own
 # canvas replays through CoreGraphics, which measured 212ms a frame with the
 # whole GitHub schema in view.
@@ -21,7 +26,7 @@ raw-window-handle = "0.6"
 serde_json = "1"
 anyhow = "1"
 # Glyph outlines for the graph's text; the distance fields are made here.
-fontdue = "0.9"
+ab_glyph = "0.2"
 
 [profile.dev]
 opt-level = 1
@@ -39,5 +44,5 @@ core-graphics = "0.24"
 core-foundation = "0.10"
 image = { version = "0.25", default-features = false, features = ["png"] }
 objc2-foundation = { version = "0.3.2", features = ["NSRunLoop", "NSGeometry", "NSObject", "NSThread"] }
-objc2-app-kit = { version = "0.3.2", features = ["NSView", "NSResponder", "NSEvent", "NSWindow", "NSTrackingArea", "NSScreen", "objc2-quartz-core"] }
+objc2-app-kit = { version = "0.3.2", features = ["NSView", "NSResponder", "NSEvent", "NSWindow", "NSWindowScripting", "NSTrackingArea", "NSScreen", "NSCursor", "NSGraphics", "NSApplication", "NSRunningApplication", "objc2-quartz-core"] }
 objc2-quartz-core = { version = "0.3.2", features = ["CADisplayLink", "CAFrameRateRange", "CALayer"] }
