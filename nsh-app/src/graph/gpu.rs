@@ -210,6 +210,9 @@ fn glyph_fs(in: Out) -> @location(0) vec4<f32> {
 
 const SAMPLES: u32 = 4;
 
+/// The narrowest an edge is drawn, in device pixels.
+const EDGE_MIN_DEVICE_PX: f32 = 2.0;
+
 /// The edges flattened to one tolerance.
 struct EdgeMesh {
     /// The zoom this mesh is fine enough for, and coarser.
@@ -507,28 +510,27 @@ impl Gpu {
     /// on the camera.
     pub fn set_model(&mut self, model: &Model) {
         let t = std::time::Instant::now();
-        let paths: Vec<Path> = model
-            .edges
-            .iter()
-            .map(|e| {
-                let mut b = Path::builder();
-                b.begin(point(e.start.x, e.start.y));
-                for c in &e.curves {
-                    b.cubic_bezier_to(point(c.c1.x, c.c1.y), point(c.c2.x, c.c2.y), point(c.end.x, c.end.y));
-                }
-                b.end(false);
-                b.build()
-            })
-            .collect();
         let mut tess = StrokeTessellator::new();
         self.edges.clear();
         let mut counts = Vec::new();
+        let mut segments = Vec::new();
         for max_zoom in EDGE_LODS {
             let mut geometry: VertexBuffers<EdgeVertex, u32> = VertexBuffers::new();
+            // Flattened here, for this ceiling, so lyon only joins lines.
             let options = StrokeOptions::default().with_line_width(2.0).with_tolerance(CURVE_TOL / max_zoom);
-            for (i, path) in paths.iter().enumerate() {
+            let mut lines = 0;
+            for (i, e) in model.edges.iter().enumerate() {
+                let polyline = lane_polyline(e, max_zoom);
+                lines += polyline.len().saturating_sub(1);
+                let mut b = Path::builder();
+                b.begin(point(polyline[0][0], polyline[0][1]));
+                for p in &polyline[1..] {
+                    b.line_to(point(p[0], p[1]));
+                }
+                b.end(false);
+                let path = b.build();
                 let _ = tess.tessellate_path(
-                    path,
+                    &path,
                     &options,
                     &mut BuffersBuilder::new(&mut geometry, |v: StrokeVertex| EdgeVertex {
                         pos: v.position_on_path().to_array(),
@@ -538,6 +540,7 @@ impl Gpu {
                 );
             }
             counts.push(geometry.indices.len() / 3);
+            segments.push(lines);
             let buffer = |label, contents: &[u8], usage| {
                 self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents, usage })
             };
@@ -550,8 +553,8 @@ impl Gpu {
         }
         if std::env::var("GRAVIZ_PERF").is_ok() {
             eprintln!(
-                "gpu: {} edges as {counts:?} triangles, built in {:.1}ms",
-                paths.len(),
+                "gpu: {} edges as {segments:?} segments, {counts:?} triangles, built in {:.1}ms",
+                model.edges.len(),
                 t.elapsed().as_secs_f32() * 1000.0
             );
         }
@@ -578,7 +581,11 @@ impl Gpu {
             scale: [cam.k * 2.0 / w, -cam.k * 2.0 / h],
             offset: [cam.x * 2.0 / w - 1.0, 1.0 - cam.y * 2.0 / h],
             screen_scale: [2.0 / w, -2.0 / h],
-            half_width: frame.edge_half_width / cam.k,
+            // At least two device pixels wide: a thinner line straddles a
+            // pixel boundary under MSAA and lands as two half-lit pixels,
+            // which reads as a faded edge (gpui's rasteriser keeps one fully
+            // lit pixel instead).
+            half_width: frame.edge_half_width.max(EDGE_MIN_DEVICE_PX / 2.0 / scale) / cam.k,
             atlas: ATLAS as f32,
         };
         self.queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
@@ -707,4 +714,90 @@ fn msaa_view(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> wgpu
             view_formats: &[],
         })
         .create_view(&Default::default())
+}
+
+/// How far, in screen pixels at the mesh's zoom ceiling, a dropped vertex
+/// may sit from the line drawn in its place (the gpui canvas's `PEN_TOL`).
+const PEN_TOL: f32 = 0.3;
+
+/// Segments that keep one cubic within `tol` screen points of its chords at
+/// zoom `k` (the gpui canvas's `cubic_steps`). A lane's bend is a tall S
+/// half a gap wide; when the box round its control points is thinner than
+/// the tolerance on screen, it is one line.
+fn cubic_steps(p0: graviz_core::layout::Point, c: &graviz_core::layout::CubicSeg, k: f32, tol: f32) -> usize {
+    let w = p0.x.max(c.c1.x).max(c.c2.x).max(c.end.x) - p0.x.min(c.c1.x).min(c.c2.x).min(c.end.x);
+    let h = p0.y.max(c.c1.y).max(c.c2.y).max(c.end.y) - p0.y.min(c.c1.y).min(c.c2.y).min(c.end.y);
+    if w.min(h) * k <= tol {
+        return 1;
+    }
+    let d0x = (p0.x - 2.0 * c.c1.x + c.c2.x) * k;
+    let d0y = (p0.y - 2.0 * c.c1.y + c.c2.y) * k;
+    let d1x = (c.c1.x - 2.0 * c.c2.x + c.end.x) * k;
+    let d1y = (c.c1.y - 2.0 * c.c2.y + c.end.y) * k;
+    let m = (d0x * d0x + d0y * d0y).max(d1x * d1x + d1y * d1y).sqrt();
+    ((0.75 * m / tol).sqrt().ceil() as usize).clamp(1, 24)
+}
+
+/// An edge as the polyline its mesh for zoom ceiling `k` strokes.
+///
+/// A lane-routed edge is level runs joined by short bends, and a run that
+/// shifts by one lane pitch is three cubics in the world and one straight
+/// line on screen at low zoom. Flattening per cubic cannot go below one
+/// segment each, so the cubics are flattened here and a sleeve then drops
+/// every vertex within `PEN_TOL` of the line kept in its place (the gpui
+/// canvas's `Pen`): from the last vertex kept, each candidate narrows a
+/// wedge of directions that pass near everything dropped so far.
+fn lane_polyline(e: &crate::model::EdgeVisual, k: f32) -> Vec<[f32; 2]> {
+    let tol = PEN_TOL / k;
+    let mut out = vec![[e.start.x, e.start.y]];
+    let mut anchor = (e.start.x, e.start.y);
+    let mut pending: Option<(f32, f32)> = None;
+    let (mut reach, mut left, mut right) = (0.0f32, (0.0f32, 0.0f32), (0.0f32, 0.0f32));
+    let cross = |a: (f32, f32), b: (f32, f32)| a.0 * b.1 - a.1 * b.0;
+    let mut p0 = e.start;
+    for c in &e.curves {
+        let n = cubic_steps(p0, c, k, CURVE_TOL);
+        for i in 1..=n {
+            let t = i as f32 / n as f32;
+            let u = 1.0 - t;
+            let (a, b, cc, d) = (u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t);
+            let p = (a * p0.x + b * c.c1.x + cc * c.c2.x + d * c.end.x, a * p0.y + b * c.c1.y + cc * c.c2.y + d * c.end.y);
+            loop {
+                let v = (p.0 - anchor.0, p.1 - anchor.1);
+                let len = (v.0 * v.0 + v.1 * v.1).sqrt();
+                if len < 1e-3 / k {
+                    break;
+                }
+                let perp = (-v.1 / len * tol, v.0 / len * tol);
+                let (l, r) = ((v.0 + perp.0, v.1 + perp.1), (v.0 - perp.0, v.1 - perp.1));
+                let Some(kept) = pending else {
+                    pending = Some(p);
+                    (reach, left, right) = (len, l, r);
+                    break;
+                };
+                if len >= reach && cross(v, left) >= 0.0 && cross(right, v) >= 0.0 {
+                    pending = Some(p);
+                    reach = len;
+                    if cross(left, l) < 0.0 {
+                        left = l;
+                    }
+                    if cross(right, r) > 0.0 {
+                        right = r;
+                    }
+                    break;
+                }
+                out.push([kept.0, kept.1]);
+                anchor = kept;
+                pending = None;
+            }
+        }
+        p0 = c.end;
+    }
+    if let Some(kept) = pending {
+        out.push([kept.0, kept.1]);
+    }
+    if out.len() == 1 {
+        out.push([p0.x, p0.y]);
+    }
+    out
 }

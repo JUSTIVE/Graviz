@@ -25,8 +25,11 @@ pub fn header(store: Store) -> impl IntoElement {
         .w_full()
         .relative()
         .bg(c(|t| t.bg))
-        // Behind everything: the strip a drag moves and a double click zooms.
-        .child(native("graviz.titlestrip").absolute().inset_0())
+        // The strip a drag moves and a double click zooms (nsh's own drag
+        // region: the native strip below only hides the system's bar, and
+        // the labels over it would keep a press from ever reaching it).
+        .window_drag(true)
+        .child(native("graviz.titlestrip").absolute().inset_0().pointer_events(PointerEvents::None))
         .child(
             view()
                 .absolute()

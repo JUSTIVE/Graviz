@@ -64,6 +64,9 @@ pub struct State {
     context: RefCell<Option<ComponentContext>>,
     bench: RefCell<Option<Bench>>,
     perf: RefCell<Perf>,
+    /// Where input put the camera, and when (event time, seconds). Frames
+    /// draw the camera interpolated along it a step behind, see `trailed`.
+    trail: RefCell<std::collections::VecDeque<(f64, Camera)>>,
 }
 
 /// The perf panel's numbers: an EMA of the frame's cost and an FPS history
@@ -122,8 +125,10 @@ define_class!(
         }
 
         #[unsafe(method(tick:))]
-        fn tick(&self, _link: &CADisplayLink) {
-            self.frame();
+        fn tick(&self, link: &CADisplayLink) {
+            let t = Instant::now();
+            let rendered = self.frame(link.timestamp());
+            framelog::tick(t, rendered);
         }
 
         #[unsafe(method(scrollWheel:))]
@@ -136,14 +141,14 @@ define_class!(
             }
             let at = self.location(event);
             let mods = mods(event);
-            self.apply(|c| c.scroll(at, dx, dy, mods));
+            self.input(event, |c| c.scroll(at, dx, dy, mods));
         }
 
         #[unsafe(method(magnifyWithEvent:))]
         fn magnify(&self, event: &NSEvent) {
             let at = self.location(event);
             let by = event.magnification() as f32;
-            self.apply(|c| c.magnify(at, by));
+            self.input(event, |c| c.magnify(at, by));
         }
 
         #[unsafe(method(mouseDown:))]
@@ -156,7 +161,7 @@ define_class!(
         #[unsafe(method(mouseDragged:))]
         fn mouse_dragged(&self, event: &NSEvent) {
             let at = self.location(event);
-            self.apply(|c| c.mouse_move(at));
+            self.input(event, |c| c.mouse_move(at));
             if self.ivars().canvas.borrow().dragging() {
                 self.confine_cursor(at);
             }
@@ -221,6 +226,7 @@ impl GraphView {
             context: RefCell::new(None),
             bench: RefCell::new(bench),
             perf: RefCell::new(Perf::default()),
+            trail: RefCell::new(std::collections::VecDeque::new()),
         });
         // SAFETY: NSView's designated initializer with no frame.
         let this: Retained<Self> = unsafe { msg_send![super(this), init] };
@@ -249,13 +255,71 @@ impl GraphView {
     }
 
     fn emit(&self, name: &str, data: serde_json::Value) {
+        let _span = framelog::Span::new(framelog::Kind::Emit);
         if let Some(cx) = self.ivars().context.borrow().as_ref() {
             cx.emit(name, data);
         }
     }
 
+    /// `apply` for an event that may move the camera: the move is kept on
+    /// the trail with the event's own time.
+    fn input(&self, event: &NSEvent, f: impl FnOnce(&mut Canvas) -> Changes) {
+        let before = self.ivars().canvas.borrow().cam;
+        self.apply(f);
+        let after = self.ivars().canvas.borrow().cam;
+        if after == before || self.ivars().bench.borrow().is_some() {
+            return;
+        }
+        let at = event.timestamp();
+        let mut trail = self.ivars().trail.borrow_mut();
+        if trail.back().is_none_or(|&(t, _)| at - t > TRAIL_GAP) {
+            // A new gesture starts where the camera stood one input step ago.
+            trail.clear();
+            trail.push_back((at - TRAIL_STEP, before));
+        }
+        trail.push_back((at, after));
+    }
+
+    /// The camera to draw for the vsync at `now`.
+    ///
+    /// Input and the display run on clocks of their own: a drag's events
+    /// come every 8ms or so and the refreshes every 8.33ms, so some frames
+    /// get two events and some none. Drawn as they land, the motion stalls
+    /// a frame and then jumps two, and a slow pan judders though every frame
+    /// costs under a millisecond. So frames draw where the trail of input
+    /// cameras says the camera was one input step before this vsync,
+    /// interpolated, which is evenly spaced whatever the event timing; it
+    /// costs that one step of latency. Past the trail's end the camera is
+    /// the canvas's own.
+    fn trailed(&self, now: f64, actual: Camera) -> (Camera, bool) {
+        let mut trail = self.ivars().trail.borrow_mut();
+        let Some(&(last_t, last)) = trail.back() else { return (actual, false) };
+        // One input step: the recent spacing of the events.
+        let n = trail.len().min(6);
+        let span = last_t - trail[trail.len() - n].0;
+        let step = if n > 1 { (span / (n - 1) as f64).clamp(TRAIL_MIN, TRAIL_MAX) } else { TRAIL_STEP };
+        let at = now - step;
+        if at >= last_t || last != actual {
+            // Caught up, or something else moved the camera since.
+            trail.clear();
+            return (actual, false);
+        }
+        while trail.len() > 2 && trail[1].0 <= at {
+            trail.pop_front();
+        }
+        let (t0, a) = trail[0];
+        let Some(&(t1, b)) = trail.get(1) else { return (actual, false) };
+        if at <= t0 {
+            return (a, true);
+        }
+        let u = ((at - t0) / (t1 - t0).max(1e-6)) as f32;
+        let lerp = |p: f32, q: f32| p + (q - p) * u;
+        (Camera { k: lerp(a.k, b.k), x: lerp(a.x, b.x), y: lerp(a.y, b.y) }, true)
+    }
+
     /// Runs `f` on the canvas, then redraws and tells the app what changed.
     fn apply(&self, f: impl FnOnce(&mut Canvas) -> Changes) {
+        let _span = framelog::Span::new(framelog::Kind::Apply);
         let c = {
             let mut canvas = self.ivars().canvas.borrow_mut();
             let mut c = f(&mut canvas);
@@ -406,12 +470,14 @@ impl GraphView {
         Camera { k, x: vw / 2.0 - cx * k, y: vh / 2.0 - cy * k }
     }
 
-    fn frame(&self) {
+    /// Draws if anything changed; says whether it did. `now` is the
+    /// display link's time for this vsync.
+    fn frame(&self, now: f64) -> bool {
         let state = self.ivars();
         let b = self.bounds();
         let (vw, vh) = (b.size.width as f32, b.size.height as f32);
         if vw <= 0.0 {
-            return;
+            return false;
         }
         let active = self.window().is_some_and(|w| w.isKeyWindow());
         self.apply(|c| {
@@ -422,7 +488,7 @@ impl GraphView {
             }
             ch
         });
-        let Some(model) = state.canvas.borrow().model.clone() else { return };
+        let Some(model) = state.canvas.borrow().model.clone() else { return false };
         let benching = {
             let mut bench = state.bench.borrow_mut();
             if let Some(bench) = bench.as_mut() {
@@ -443,18 +509,24 @@ impl GraphView {
                 false
             }
         };
-        if !benching && !state.dirty.replace(false) {
-            return;
+        let (shown, trailing) = if benching {
+            (state.canvas.borrow().cam, false)
+        } else {
+            self.trailed(now, state.canvas.borrow().cam)
+        };
+        if !benching && !state.dirty.replace(false) && !trailing {
+            return false;
+        }
+        if trailing {
+            // The next vsync has another step of the trail to draw.
+            state.dirty.set(true);
         }
         let mut gpu = state.gpu.borrow_mut();
-        let Some(gpu) = gpu.as_mut() else { return };
+        let Some(gpu) = gpu.as_mut() else { return false };
         let (pw, ph) = self.pixels();
         gpu.resize(pw, ph);
         let t = Instant::now();
-        let (cam, view) = {
-            let c = state.canvas.borrow();
-            (c.cam, c.view_state())
-        };
+        let (cam, view) = (shown, state.canvas.borrow().view_state());
         let theme = state.theme.get();
         // Edge styles depend on the state, not the camera or the ripple.
         let styled = ViewState { ripple: None, hover: None, ..view };
@@ -475,7 +547,9 @@ impl GraphView {
         }
         drop(frame);
         drop(fonts);
+        framelog::render(painted, ms);
         self.sample_perf(ms, cam.k);
+        true
     }
 
     /// Feeds the perf panel: the cost EMA, the frame-interval FPS, and a
@@ -505,6 +579,14 @@ impl GraphView {
         }
     }
 }
+
+/// The input step assumed when a gesture starts, and the range the measured
+/// one is held to (seconds).
+const TRAIL_STEP: f64 = 1.0 / 120.0;
+const TRAIL_MIN: f64 = 0.004;
+const TRAIL_MAX: f64 = 0.02;
+/// A pause this long between camera-moving events starts a new gesture.
+const TRAIL_GAP: f64 = 0.1;
 
 /// An interval this long means a refresh went by without a frame. The link
 /// ticks every 8.33ms give or take scheduling, so the line sits between one
@@ -630,4 +712,131 @@ pub fn register(components: &Components) {
             Box::new(Graph { view })
         }),
     );
+}
+
+/// `GRAVIZ_FRAMELOG=1`: once a second, what the main thread spent its time
+/// on while the canvas was live, for frame drops a scripted sweep does not
+/// show (input handling, the app's reaction to the canvas's events).
+mod framelog {
+    use std::cell::RefCell;
+    use std::time::Instant;
+
+    #[derive(Clone, Copy)]
+    pub enum Kind {
+        Apply,
+        Emit,
+    }
+
+    #[derive(Default)]
+    struct Log {
+        since: Option<Instant>,
+        last_tick: Option<Instant>,
+        ticks: u32,
+        rendered: u32,
+        late: u32,
+        max_gap: f32,
+        apply_ms: f32,
+        apply_max: f32,
+        emit_ms: f32,
+        emit_max: f32,
+        emits: u32,
+        paint_ms: f32,
+        render_ms: f32,
+        render_max: f32,
+        depth: u32,
+    }
+
+    thread_local! {
+        static ON: bool = std::env::var("GRAVIZ_FRAMELOG").is_ok();
+        static LOG: RefCell<Log> = RefCell::new(Log::default());
+    }
+
+    fn on() -> bool {
+        ON.with(|o| *o)
+    }
+
+    pub struct Span(Option<(Kind, Instant, bool)>);
+
+    impl Span {
+        pub fn new(kind: Kind) -> Self {
+            if !on() {
+                return Span(None);
+            }
+            // Only the outermost span of a kind counts, so a nested emit is
+            // not added twice.
+            let outer = LOG.with(|l| {
+                let mut l = l.borrow_mut();
+                l.depth += 1;
+                l.depth == 1 || matches!(kind, Kind::Emit)
+            });
+            Span(Some((kind, Instant::now(), outer)))
+        }
+    }
+
+    impl Drop for Span {
+        fn drop(&mut self) {
+            let Some((kind, t, outer)) = self.0 else { return };
+            let ms = t.elapsed().as_secs_f32() * 1000.0;
+            LOG.with(|l| {
+                let mut l = l.borrow_mut();
+                l.depth -= 1;
+                if !outer {
+                    return;
+                }
+                match kind {
+                    Kind::Apply => {
+                        l.apply_ms += ms;
+                        l.apply_max = l.apply_max.max(ms);
+                    }
+                    Kind::Emit => {
+                        l.emit_ms += ms;
+                        l.emit_max = l.emit_max.max(ms);
+                        l.emits += 1;
+                    }
+                }
+            });
+        }
+    }
+
+    pub fn render(paint: f32, total: f32) {
+        if !on() {
+            return;
+        }
+        LOG.with(|l| {
+            let mut l = l.borrow_mut();
+            l.paint_ms += paint;
+            l.render_ms += total;
+            l.render_max = l.render_max.max(total);
+        });
+    }
+
+    pub fn tick(start: Instant, rendered: bool) {
+        if !on() {
+            return;
+        }
+        LOG.with(|l| {
+            let mut l = l.borrow_mut();
+            let since = *l.since.get_or_insert(start);
+            if let Some(prev) = l.last_tick.replace(start) {
+                let gap = (start - prev).as_secs_f32() * 1000.0;
+                l.max_gap = l.max_gap.max(gap);
+                if gap > 10.5 {
+                    l.late += 1;
+                }
+            }
+            l.ticks += 1;
+            l.rendered += rendered as u32;
+            if (start - since).as_secs_f32() >= 1.0 {
+                if l.rendered > 0 {
+                    eprintln!(
+                        "framelog: ticks {} rendered {} late {} max-gap {:.1}ms | render {:.1}ms (max {:.1}, paint {:.1}) | apply {:.1}ms (max {:.1}) | emit {}x {:.1}ms (max {:.1})",
+                        l.ticks, l.rendered, l.late, l.max_gap, l.render_ms, l.render_max, l.paint_ms,
+                        l.apply_ms, l.apply_max, l.emits, l.emit_ms, l.emit_max
+                    );
+                }
+                *l = Log { last_tick: l.last_tick, ..Log::default() };
+                l.since = Some(start);
+            }
+        });
+    }
 }
