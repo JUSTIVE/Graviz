@@ -111,6 +111,9 @@ pub struct Store {
     pub recents: Signal<Vec<RecentEntry>>,
     pub recents_open: Signal<bool>,
     pub landing_error: Signal<Option<String>>,
+    /// A short notice across the top of the canvas (a hot reload), and
+    /// which one it is, so an older one's timer does not clear a newer.
+    pub toast: Signal<Option<(u64, String, String)>>,
     pub warnings: Signal<Vec<String>>,
     pub draft: Signal<String>,
     pub draft_name: Signal<Option<String>>,
@@ -170,6 +173,7 @@ impl Store {
             recents: signal(config::recents()),
             recents_open: signal(std::env::var("GRAVIZ_RECENTS").is_ok()),
             landing_error: signal(None),
+            toast: signal(None),
             warnings: signal(Vec::new()),
             draft: signal(String::new()),
             draft_name: signal(None),
@@ -300,18 +304,23 @@ impl Store {
 
     /// Re-reads the schema file (and re-applies the overlay). Hot reload,
     /// the relay toggle, and the overlay's apply and clear all land here.
-    pub fn reload_from_disk(&self) {
-        let Some(doc) = self.doc.get_untracked() else { return };
+    pub fn reload_from_disk(&self) -> bool {
+        let Some(doc) = self.doc.get_untracked() else { return false };
         if doc.path.as_os_str() == "(pasted)" {
             // A pasted schema has no file to re-read; re-run what was pasted.
             let sdl = self.draft.get_untracked();
             let hide_relay = self.settings.get_untracked().hide_relay;
             let overlay = self.overlay.get_untracked().applied;
-            match loader::load_sdl(&sdl, doc.name.clone(), overlay.as_deref(), hide_relay) {
-                Ok(loaded) => self.reloaded(doc, loaded),
-                Err(e) => self.overlay.update(|o| o.error = Some(format!("{e:#}"))),
-            }
-            return;
+            return match loader::load_sdl(&sdl, doc.name.clone(), overlay.as_deref(), hide_relay) {
+                Ok(loaded) => {
+                    self.reloaded(doc, loaded);
+                    true
+                }
+                Err(e) => {
+                    self.overlay.update(|o| o.error = Some(format!("{e:#}")));
+                    false
+                }
+            };
         }
         let hide_relay = self.settings.get_untracked().hide_relay;
         let overlay = self.overlay.get_untracked().applied;
@@ -319,9 +328,26 @@ impl Store {
             Ok(loaded) => {
                 eprintln!("reloaded {}", doc.path.display());
                 self.reloaded(doc, loaded);
+                true
             }
-            Err(e) => self.overlay.update(|o| o.error = Some(format!("{e:#}"))),
+            Err(e) => {
+                self.overlay.update(|o| o.error = Some(format!("{e:#}")));
+                false
+            }
         }
+    }
+
+    /// Shows `title` and `message` across the top of the canvas for a few
+    /// seconds.
+    pub fn notify(&self, title: impl Into<String>, message: impl Into<String>) {
+        let id = self.toast.get_untracked().map_or(1, |(id, _, _)| id + 1);
+        self.toast.set(Some((id, title.into(), message.into())));
+        let toast = self.toast;
+        let _ = set_timeout(std::time::Duration::from_millis(2500), move || {
+            if toast.get_untracked().is_some_and(|(at, _, _)| at == id) {
+                toast.set(None);
+            }
+        });
     }
 
     fn reloaded(&self, doc: Doc, loaded: loader::LoadedSchema) {

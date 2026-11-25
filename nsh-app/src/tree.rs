@@ -582,7 +582,11 @@ fn type_row(tree: Tree, m: &Model, card: u32, chips: &[S]) -> impl IntoElement {
                 .child(metro(label.to_string(), 9.0).text_color(move || if selected() { rgb(0xffffff).into() } else { th().text_muted.hsla() })),
         );
     }
-    view()
+    let name = c_.name.to_string();
+    let menu = nsh_metro::context_menu()
+        .item("show in graph", move || tree.select_card(card, None))
+        .item("copy name", move || set_clipboard(name.clone()));
+    let row = view()
         .w_full()
         .h(px(LIST_ROW_H))
         .flex_row()
@@ -604,7 +608,8 @@ fn type_row(tree: Tree, m: &Model, card: u32, chips: &[S]) -> impl IntoElement {
         .child(mono(c_.name.to_string(), 12.0).flex_1().min_w(px(0.)).truncate().text_color(move || {
             if selected() { rgb(0xffffff).into() } else { th().text.hsla() }
         }))
-        .child(chip_row)
+        .child(chip_row);
+    nsh_metro::with_context_menu(row, menu)
 }
 
 fn bounded_list(rows: usize) -> Scroll {

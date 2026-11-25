@@ -19,8 +19,6 @@ use crate::{
     ui::{Glyph, bar_button, c, glyph, icon, kind_badge, metro, mono, small_check, th},
 };
 
-/// Sidebar pivot header size: Metro's pivot type, scaled to a 340pt column.
-const PIVOT_PX: f32 = 24.0;
 /// How long the sidebar takes to open or close.
 const SIDEBAR_MS: f32 = 300.0;
 
@@ -34,8 +32,8 @@ pub fn watch_schema(store: Store) {
         }
         let cur = loader::fingerprint(&doc.path);
         let prev = last.get();
-        if prev != 0 && cur != prev {
-            store.reload_from_disk();
+        if prev != 0 && cur != prev && store.reload_from_disk() {
+            store.notify("schema reloaded", doc.name.to_string());
         }
         last.replace(cur);
     });
@@ -78,7 +76,15 @@ pub fn page(store: Store) -> impl IntoElement {
                         .child(investigate_card(store, inset))
                         .child(recent_panel(store))
                         .child(when(move || !sidebar_open() && settled.get(), move || expand_button(store)))
-                        .child(canvas_overlays(store)),
+                        .child(canvas_overlays(store))
+                        .child(dynamic(move || match store.toast.get() {
+                            Some((_, title, message)) => nsh_metro::toast(title)
+                                .message(message)
+                                .icon(Icon::Refresh)
+                                .on_click(move || store.toast.set(None))
+                                .into_element(),
+                            None => view().into_element(),
+                        })),
                 )
                 .child(dock(store)),
         )
@@ -88,23 +94,39 @@ pub fn page(store: Store) -> impl IntoElement {
 /* ---------------- sidebar ---------------- */
 
 fn sidebar(store: Store, open: impl Fn() -> bool + Copy + 'static, width: impl Fn() -> f32 + Copy + 'static) -> impl IntoElement {
-    // Metro pivot order: the selected header leads and the rest follow it,
-    // wrapping; whatever runs past the column's edge is clipped.
-    let headers = dynamic(move || {
+    // The modes as a Metro pivot: the selected header leads, the rest follow
+    // it, a swipe or a tap on a header changes pane. A mode with nothing in
+    // it has no header (gpui showed it faded and unclickable).
+    let body = dynamic(move || {
         let Some(doc) = store.doc.get() else { return view().into_element() };
-        let current = store.mode.get();
-        let mut modes = vec![(Mode::Reachable, None), (Mode::Orphaned, Some(doc.orphan_count))];
-        if doc.deprecated_count > 0 {
-            modes.push((Mode::Deprecated, Some(doc.deprecated_count)));
+        let mut modes = vec![(Mode::Reachable, None)];
+        for (mode, count) in [(Mode::Orphaned, doc.orphan_count), (Mode::Deprecated, doc.deprecated_count)] {
+            if count > 0 {
+                modes.push((mode, Some(count)));
+            }
         }
-        if let Some(at) = modes.iter().position(|(m, _)| *m == current) {
-            modes.rotate_left(at);
-        }
-        let mut row = view().flex_1().min_w(px(0.)).overflow_hidden().flex_row().items_end().gap(px(16.0));
-        for (mode, count) in modes {
-            row = row.child(mode_tab(store, mode, count, mode == current));
-        }
-        row.into_element()
+        let headers: Vec<String> =
+            modes.iter().map(|&(m, n)| format!("{}{}", mode_word(m), n.map(superscript).unwrap_or_default())).collect();
+        let list: Vec<Mode> = modes.iter().map(|&(m, _)| m).collect();
+        let at = {
+            let list = list.clone();
+            move || list.iter().position(|m| *m == store.mode.get()).unwrap_or(0)
+        };
+        let pick = list.clone();
+        nsh_metro::pivot(headers, at)
+            .panes(list.into_iter().map(|mode| {
+                move || match mode {
+                    Mode::Reachable => tree::page(store).into_element(),
+                    Mode::Orphaned => panels::orphans(store).into_element(),
+                    Mode::Deprecated => panels::deprecated(store).into_element(),
+                }
+            }))
+            .on_select(move |ix| {
+                if let Some(&mode) = pick.get(ix) {
+                    store.set_mode(mode);
+                }
+            })
+            .into_element()
     });
     view()
         .h_full()
@@ -120,70 +142,38 @@ fn sidebar(store: Store, open: impl Fn() -> bool + Copy + 'static, width: impl F
                 .w(move || px(width()))
                 .h_full()
                 .flex_none()
+                .relative()
+                .child(body)
+                // Over the end of the header row, which runs off the column.
                 .child(
                     view()
-                        .flex_none()
-                        .flex_row()
+                        .absolute()
+                        .top(px(18.0))
+                        .right(px(6.0))
+                        .size(px(36.0))
                         .items_center()
-                        .pl(px(12.0))
-                        .pt(px(6.0))
-                        .pb(px(4.0))
-                        .child(headers)
-                        .child(
-                            view()
-                                .flex_none()
-                                .size(px(36.0))
-                                .items_center()
-                                .justify_center()
-                                .cursor(Cursor::Pointer)
-                                .hover(|s| s.bg(th().hover_bg.hsla()))
-                                .on_press(move || store.set_settings(|s| s.sidebar_open = false))
-                                .child(glyph(Glyph::PanelLeftClose, 16.0, c(|t| t.text_muted))),
-                        ),
-                )
-                .child(view().flex_1().min_h(px(0.)).child(dynamic(move || match store.mode.get() {
-                    Mode::Reachable => tree::page(store).into_element(),
-                    Mode::Orphaned => panels::orphans(store).into_element(),
-                    Mode::Deprecated => panels::deprecated(store).into_element(),
-                }))),
+                        .justify_center()
+                        .bg(c(|t| t.panel))
+                        .cursor(Cursor::Pointer)
+                        .hover(|s| s.bg(th().hover_bg.hsla()))
+                        .on_press(move || store.set_settings(|s| s.sidebar_open = false))
+                        .child(glyph(Glyph::PanelLeftClose, 16.0, c(|t| t.text_muted))),
+                ),
         )
 }
 
-/// One sidebar mode as a pivot header: a lowercase light word, foreground
-/// when active and subtle otherwise, its count a small superscript.
-fn mode_tab(store: Store, mode: Mode, count: Option<usize>, active: bool) -> impl IntoElement {
-    let disabled = matches!(count, Some(0));
-    let word = match mode {
+fn mode_word(mode: Mode) -> &'static str {
+    match mode {
         Mode::Reachable => "reachable",
         Mode::Orphaned => "orphaned",
         Mode::Deprecated => "deprecated",
-    };
-    let fg = move || {
-        let t = th();
-        if disabled {
-            t.text_faint.hsla()
-        } else if active {
-            t.text.hsla()
-        } else {
-            t.text_muted.hsla()
-        }
-    };
-    let mut el = view()
-        .flex_none()
-        .flex_row()
-        .items_start()
-        .child(metro(word, PIVOT_PX).line_height(px(PIVOT_PX * 1.25)).font_weight(LIGHT).text_color(fg).hover(move |s| {
-            if !disabled && !active { s.text_color(th().text.hsla()) } else { s }
-        }));
-    if let Some(c_) = count.filter(|c| *c > 0) {
-        el = el.child(metro(c_.to_string(), 11.0).ml(px(2.0)).mt(px(3.0)).line_height(px(12.0)).font_weight(SEMIBOLD).text_color(
-            move || if active { th().accent.hsla() } else { th().text_muted.hsla() },
-        ));
     }
-    if !disabled {
-        el = el.cursor(Cursor::Pointer).on_press(move || store.set_mode(mode));
-    }
-    el
+}
+
+/// `14` as `¹⁴`, the count beside a pivot header.
+fn superscript(n: usize) -> String {
+    const DIGITS: [char; 10] = ['⁰', '¹', '²', '³', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹'];
+    n.to_string().chars().map(|d| DIGITS[d.to_digit(10).unwrap_or(0) as usize]).collect()
 }
 
 /// The sidebar's right edge, dragged to resize it.
